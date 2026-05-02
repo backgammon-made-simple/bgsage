@@ -34,3 +34,13 @@ It offers both Python and C++ interfaces for:
 * Cube action analytics: given a list of checker positions and the cube information, it returns you cubeful equity information about the three states (ND, D/T, and D/P), cubeless equity, and the cubeless probabilities - for a pre-roll position.
 * Game plan classification: given a list of checkers, it returns the optimal game plans of the player and the opponent.
 * Game utilities (flip a board, etc).
+
+## How Does it Compare to XG?
+
+eXtreme Gammon (XG) is a commercial backgammon analysis application that uses its own proprietary bot engine. That XG bot engine is not directly exposed via API for non-commercial use - just the Windows desktop application. XG is an important standard for backgammon bot analysis strength and speed.
+
+The most direct way to compare the Open Sage bot engine against XG's would be to play many thousands, or tens of thousands, of head to head games to pick the signal out of the dice noise. Unfortunately, since XG has no API, this must be done by hand, which would take too long.
+
+Another slightly more indirect way is to have XG analyze Open Sage's play. The approach: run many separate money games where the Open Sage bot plays itself; for each game, write out the list of plays to a file that XG can import; when those files are written, use XG's Batch Analyze function to analyze them (at World Class level, which corresponds roughly to XG Roller + evaluation strength) and write out per-game XG files next to the text files; then pull the XG analytics out of those files to see how XG scores Open Sage's decisions. CLAUDE.md has details on which scripts to use for this.
+
+The result: Open Sage, using 3-ply evaluation strength, scored a PR of 0.39 across 200 money games. That is very close to identical play. In addition, when examining individual positions where Open Sage and XG are different, it is unclear whether Open Sage or XG is actually correct - there are examples of both - which suggests that Open Sage and XG are performing comparably on this aggregate basis.

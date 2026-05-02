@@ -43,6 +43,8 @@ python/bgsage/               # Python package
   data.py                   # .bm file loading, training data parsing
   gnubg.py                  # GNUbg CLI wrapper for reference evaluation
   matchinfo.py              # Match play take points, dead cube take points, gammon prices
+  text_export.py            # Galaxy/XG-compatible text export + move notation
+  xg_compare.py             # Parse XG .xg files; compute per-game PR stats vs XG
 scripts/                     # Training & benchmarking scripts
 tests/                       # Python tests
 models/                      # Production weights (5 files per model stage)
@@ -605,6 +607,100 @@ python scripts/eval_position.py checker --checkers "..." --dice 3 1
 # Side-by-side checker play analysis (match play)
 python scripts/eval_position.py checker --checkers "..." --dice 3 1 --match 5 --score 3 0
 ```
+
+## Comparing Sage to XG via .xg Files
+
+The goal is to benchmark Sage's evaluations against XG (eXtreme Gammon),
+historically considered the strongest backgammon engine. There are two
+natural approaches:
+
+1. **Head-to-head play** — Sage and XG play thousands of games against
+   each other; tally points. XG has no API, so feeding moves between the
+   two engines is a manual click-through ritual. Even at one game a minute,
+   reaching a meaningful sample size takes far too long to be practical.
+
+2. **Sage plays itself; XG scores it** — Sage plays both sides of many
+   games, each game is exported as text, and XG's *Batch Analyze* feature
+   scores the lot in a single pass. The Performance Rating (PR = equity
+   error per decision × 500) measures how often Sage's chosen moves and
+   cube actions deviate from XG's recommendations. Batch Analyze can chew
+   through hundreds of files without intervention, so this is what we use.
+
+### Workflow
+
+Three steps; the middle one is manual because it goes through XG's GUI.
+
+**1. Generate Sage-vs-Sage transcripts** with
+[scripts/run_sage_vs_sage_games.py](scripts/run_sage_vs_sage_games.py):
+
+```bash
+# 200 games at 3-ply, 6 parallel worker processes
+python bgsage/scripts/run_sage_vs_sage_games.py 1 200 --level 3P --workers 6
+```
+
+```python
+# Or in code:
+from run_sage_vs_sage_games import run_sage_vs_sage_games
+
+run_sage_vs_sage_games(
+    initial_seed=1,    # game i uses seed (initial_seed + i)
+    n_games=200,       # number of games to play
+    level="3P",        # 1P/2P/3P/4P (N-ply) or 1T/2T/3T (truncated rollout)
+    workers=6,         # parallel processes; pass 1 for serial
+    out_dir=None,      # defaults to <project_root>/logs/sage_vs_sage
+)
+```
+
+This writes `seed_<N>.txt` per game in the output directory. Each
+transcript is a single money game (Jacoby + Beaver on, both sides
+labelled "Sage") in Backgammon Galaxy / XG-import compatible text format.
+With `workers > 1`, each worker process pre-loads its own analyzer at
+`parallel_threads=1` so 6 workers × 1 thread don't oversubscribe the CPU.
+
+**2. Run XG's Batch Analyze on the .txt folder** (manual):
+
+Open XG → File → Batch Analyze → point it at the folder of .txt files.
+**Critical:** check **"Save Games after analyze"** — without this, XG
+prints summary stats but writes no per-game files, and step 3 has nothing
+to read. When Batch Analyze finishes, the folder contains a matching
+`seed_<N>.xg` next to each `seed_<N>.txt`.
+
+**3. Aggregate PR stats** with
+[scripts/aggregate_xg_pr.py](scripts/aggregate_xg_pr.py):
+
+```bash
+python bgsage/scripts/aggregate_xg_pr.py [folder] [--pattern '*.xg']
+```
+
+For each .xg, the script parses turns via
+`bgsage.xg_compare.parse_xg_game`, applies XG-style decision filters
+(skip forced moves and trivial cube positions), and computes per-player
+error totals + decision counts. It prints:
+
+- Per-game total PR: `(P1_err + P2_err) / (P1_dec + P2_dec) * 500`.
+- Across-games per-game PR mean / std dev / SEM.
+- Aggregate PR computed from summed errors and summed decisions
+  (weighted by decision count rather than equally per game).
+
+### Public API (`bgsage.xg_compare`)
+
+The .xg parser and PR aggregation are exposed for ad-hoc scripting:
+
+```python
+from bgsage.xg_compare import parse_xg_game, compute_game_pr_stats
+
+with open("seed_8.xg", "rb") as f:
+    turns = parse_xg_game(f.read())
+stats = compute_game_pr_stats(turns)
+# stats: {user_err, user_dec, bot_err, bot_dec, total_err, total_dec, pr}
+```
+
+`parse_xg_game` returns a list of turn dicts (`cube_action`,
+`cube_analysis`, `checker_analysis`, `board_before`, `board_after`,
+`dice`, ...). `compute_game_pr_stats` then calls `apply_decision_flags`
+(also exposed) to populate `is_cube_decision` / `is_checker_decision`
+plus the error fields, and aggregates them into the totals dict above.
+The .xg file MUST contain exactly one game; `ValueError` otherwise.
 
 ## Building
 
