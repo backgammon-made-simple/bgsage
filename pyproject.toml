@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "bgsage"
-version = "0.1.20260421.1"
+version = "0.5.20260502"
 description = "Open Sage bot engine — a neural-network backgammon engine"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
