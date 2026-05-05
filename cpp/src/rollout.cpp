@@ -471,11 +471,27 @@ std::array<float, NUM_OUTPUTS> RolloutStrategy::best_move_probs_for_candidates(
         return strat.evaluate_probs(candidates[0], board);
     }
 
-    // Fast batch path when using base_ (1-ply) strategy directly.
-    if (&strat == base_.get()) {
+    // Fast batch path when using base_ (1-ply) or base_bearoff_ (1-ply
+    // wrapped with the bearoff DB) directly. For base_bearoff_, use base_'s
+    // optimized batch to find the best candidate, then override that
+    // candidate's probs with the exact DB lookup if it lives in the bearoff
+    // range. This preserves the GamePlanStrategy batch fast path while
+    // making VR DB-aware: at bearoff positions, the returned `best_probs`
+    // are deterministically equal to the DB result, so VR luck = (actual −
+    // mean) cancels exactly across the 21 rolls when all reachable post-
+    // move states share the same DB cubeless probabilities.
+    const bool is_base = (&strat == base_.get());
+    const bool is_base_bearoff = (base_bearoff_ && &strat == base_bearoff_.get());
+    if (is_base || is_base_bearoff) {
         std::array<float, NUM_OUTPUTS> best_probs{};
         int idx = base_->batch_evaluate_candidates_best_prob(
             candidates, board, nullptr, &best_probs);
+        if (is_base_bearoff && bearoff_db_ &&
+            idx >= 0 && idx < static_cast<int>(candidates.size()) &&
+            bearoff_db_->is_bearoff(candidates[idx])) {
+            best_probs = bearoff_db_->lookup_probs(candidates[idx],
+                                                    /*post_move=*/true);
+        }
         if (best_index) *best_index = idx;
         return best_probs;
     }
@@ -594,9 +610,11 @@ void RolloutStrategy::populate_move1_cache_entry(
     const Board move1_board = flip(move0_chosen);
     entry.race = is_race(move1_board);
 
-    // Move1 uses 1-ply (base_) for move selection. The VR averaging over many
-    // trials makes higher-ply move selection unnecessary here.
-    const auto& current_strat = *base_;
+    // Move1 uses 1-ply for move selection. The VR averaging over many trials
+    // makes higher-ply move selection unnecessary here. When the bearoff DB
+    // is set, use the DB-wrapped 1-ply (base_bearoff_) so move-1 evaluations
+    // are DB-exact at bearoff positions.
+    const auto& current_strat = base_bearoff_ ? *base_bearoff_ : *base_;
     const bool using_base = true;
 
     const Board opp_board = flip(move1_board);
@@ -604,11 +622,14 @@ void RolloutStrategy::populate_move1_cache_entry(
     // as fallback). When cube strategy is N-ply or rollout, the trial code
     // bypasses these cached probs and calls cube_decision_nply or
     // cubeful_cube_decision directly.
-    // Use bearoff DB for exact probs when available.
+    // Use bearoff DB for exact probs when available. For non-bearoff,
+    // use base_bearoff_ if set so any 1-ply leaves that happen to be
+    // bearoff are evaluated exactly.
     if (bearoff_db_ && bearoff_db_->is_bearoff(move1_board)) {
         entry.mover_probs = bearoff_db_->lookup_probs(move1_board);
     } else {
-        entry.mover_probs = invert_probs(base_->evaluate_probs(opp_board, opp_board));
+        const Strategy& mover_strat = base_bearoff_ ? *base_bearoff_ : *base_;
+        entry.mover_probs = invert_probs(mover_strat.evaluate_probs(opp_board, opp_board));
     }
     {
         auto [pp, op] = pip_counts(move1_board);
@@ -624,7 +645,7 @@ void RolloutStrategy::populate_move1_cache_entry(
 
         int best_idx = -1;
         entry.roll_best_probs[second_roll] = best_move_probs_for_candidates(
-            move1_board, candidates, *base_, &best_idx);
+            move1_board, candidates, current_strat, &best_idx);
         entry.best_candidate_idx[second_roll] = best_idx;
 
         Board chosen;
@@ -636,7 +657,7 @@ void RolloutStrategy::populate_move1_cache_entry(
             if (best_idx >= 0 && best_idx < static_cast<int>(candidates.size())) {
                 chosen = candidates[best_idx];
             } else {
-                chosen = candidates[base_->best_move_index(candidates, move1_board)];
+                chosen = candidates[current_strat.best_move_index(candidates, move1_board)];
             }
         } else {
             chosen = candidates[current_strat.best_move_index(candidates, move1_board)];
@@ -653,7 +674,7 @@ void RolloutStrategy::populate_move1_cache_entry(
                    chosen == candidates[best_idx]) {
             entry.actual_probs[second_roll] = entry.roll_best_probs[second_roll];
         } else {
-            entry.actual_probs[second_roll] = base_->evaluate_probs(chosen, move1_board);
+            entry.actual_probs[second_roll] = current_strat.evaluate_probs(chosen, move1_board);
         }
     }
 
@@ -1008,7 +1029,9 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
             if (all_done) {
                 // All branches D/P'd — use 1-ply pre-roll cubeless probs
                 Board opp_board_early = flip(board);
-                auto opp_probs_early = base_->evaluate_probs(opp_board_early, opp_board_early);
+                const Strategy& early_strat =
+                    base_bearoff_ ? *base_bearoff_ : *base_;
+                auto opp_probs_early = early_strat.evaluate_probs(opp_board_early, opp_board_early);
                 auto early_probs = invert_probs(opp_probs_early);
                 std::array<float, NUM_OUTPUTS> sp_probs;
                 if (is_sp_turn) {
@@ -1099,11 +1122,18 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 cl_mean_probs = move1_entry->cl_mean_probs;
                 cl_mean_eq = move1_entry->cl_mean_eq;
             } else {
-                // Evaluate all 21 rolls at 1-ply (fast batch path via base_)
+                // Evaluate all 21 rolls at 1-ply. Use base_bearoff_ when the
+                // bearoff DB is set so the VR mean is DB-exact for bearoff
+                // candidates. This is essential at low trial counts: with
+                // unwrapped NN the VR luck = (NN_actual − NN_mean) is finite
+                // even though the DB outcome is deterministic, and the move-1+
+                // luck doesn't fully sum to zero unless the trial count
+                // stratifies all the way to that move.
+                const Strategy& vr_base = base_bearoff_ ? *base_bearoff_ : *base_;
                 for (size_t i = 0; i < ALL_ROLLS.size(); ++i) {
                     int idx = -1;
                     roll_best_probs[i] = best_move_probs_for_candidates(
-                        board, move_candidates[i], *base_, &idx);
+                        board, move_candidates[i], vr_base, &idx);
                     best_candidate_idx[i] = idx;
                 }
 
@@ -1220,12 +1250,16 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 // Decision also used 1-ply — reuse VR's stored probs
                 actual_probs = roll_best_probs[actual_idx];
             } else {
-                // Decision used N-ply — evaluate chosen at 1-ply for VR
+                // Decision used N-ply — evaluate chosen at 1-ply for VR.
+                // Use base_bearoff_ when the bearoff DB is set so the VR
+                // actual is DB-exact at bearoff (matching the VR mean above).
                 GameResult r = check_game_over(chosen);
                 if (r != GameResult::NOT_OVER) {
                     actual_probs = terminal_probs(r);
                 } else {
-                    actual_probs = base_->evaluate_probs(chosen, board);
+                    const Strategy& vr_base =
+                        base_bearoff_ ? *base_bearoff_ : *base_;
+                    actual_probs = vr_base.evaluate_probs(chosen, board);
                 }
             }
 

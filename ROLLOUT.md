@@ -239,8 +239,8 @@ else:
 
 ### VR Decoupling from Decision Strategy
 
-VR always uses 1-ply (the base NN strategy) for both the mean and actual
-evaluations, regardless of the decision strategy's ply level. This is critical:
+VR always uses 1-ply for both the mean and actual evaluations, regardless of
+the decision strategy's ply level. This is critical:
 
 - Move selection during trials may use 2-ply, 3-ply, or truncated rollout
   evaluation to pick the best move.
@@ -249,6 +249,18 @@ evaluations, regardless of the decision strategy's ply level. This is critical:
   evaluated at the same depth.
 - This eliminates ~90% of the N-ply evaluations that would be needed if VR used
   the decision strategy's ply level.
+
+When the bearoff database is loaded, the 1-ply evaluator used for VR is the
+DB-aware variant: at any bearoff position encountered during VR mean or VR
+actual evaluation, the exact DB probabilities are used in place of the NN
+output. Both sides of the luck difference use the same DB-aware evaluator, so
+the bias-cancellation property still holds. Crucially, when the per-trial
+trajectory enters the bearoff range and all reachable post-move states share
+the same DB cubeless probabilities (e.g. a "saved-gammon" state where the
+loser already has at least one checker borne off), VR luck at every move from
+that point on is deterministically zero — not just zero in expectation. This
+is what lets stratified-dice rollouts converge to the exact value at low trial
+counts on positions whose outcome becomes deterministic after a few half-moves.
 
 ### VR Result Construction
 
@@ -986,17 +998,39 @@ strategies for the entire game.
 
 ### Bearoff Database Integration
 
-When the bearoff database is loaded:
-- **Bearoff positions as input:** If the starting position is a bearoff position,
-  exact cubeless probabilities are returned immediately (no simulation needed).
-- **During trials:** Bearoff positions that arise during play are evaluated
-  exactly via the database, bypassing NN evaluation.
-- **At truncation:** If the truncation position is a bearoff, the database
-  provides exact evaluation.
+When the bearoff database is loaded, every 1-ply evaluation that the rollout
+performs goes through a DB-aware variant of the base strategy
+(`base_bearoff_`): if the position being evaluated is in the bearoff range,
+the DB returns exact cubeless probabilities; otherwise the call falls through
+to the underlying NN. Specifically, the DB-aware base is used at:
 
-The bearoff database is propagated to all internal strategies (checker, late
-checker, truncation, inner rollouts) so that their N-ply evaluations also use
-exact bearoff probs at leaf nodes.
+- **VR mean** at every half-move (`best_move_probs_for_candidates` over all 21
+  rolls). The fast batch path uses the underlying NN's optimized batch to find
+  the best candidate, then overrides that candidate's probabilities with the
+  DB lookup if it is bearoff — keeping batch performance for non-bearoff
+  positions while making the VR mean DB-exact in the bearoff range.
+- **VR actual** at every half-move when the chosen move's probabilities are
+  evaluated for luck computation (the N-ply decision path).
+- **Move-1 cache prefill** for both `mover_probs` and `roll_best_probs`.
+- **Early-termination cubeless probabilities** when all branches D/P at the
+  same half-move.
+- **Cube decisions** during trials (1-ply Janowski path uses `mover_probs`
+  populated from the DB directly when the current board is bearoff).
+
+Other bearoff-DB use points:
+
+- **Bearoff positions as input:** If the starting position is a bearoff
+  position, every per-trial evaluation hits the DB directly, so the rollout
+  returns exact results (the simulation still runs, but VR luck is
+  deterministically zero so the trial-mean is the exact value).
+- **At truncation:** Cubeless truncation evaluation uses the truncation
+  strategy with the DB wired through; cubeful N-ply truncation
+  (`cubeful_equity_nply_multi`) uses `base_bearoff_` so its 1-ply leaves are
+  DB-exact.
+
+The bearoff database is also propagated to all internal strategies (checker,
+late checker, truncation, inner rollouts for cube decisions) so that their
+N-ply evaluations use exact bearoff probs at leaf nodes.
 
 ### Move Filter for N-ply Cube Decisions
 
