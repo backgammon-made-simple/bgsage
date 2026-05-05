@@ -1920,6 +1920,64 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         }, "Evaluate board via rollout, returns probs, equity, std_error, prob_std_errors, scalar_vr_equity/se",
            py::arg("board"), py::arg("pre_move_board"),
            py::arg("progress") = py::none())
+        .def("cubeful_evaluate_board", [](RolloutStrategy& self,
+                                           const std::vector<int>& board_vec,
+                                           const std::vector<int>& /*pre_move_board*/,
+                                           int cube_value,
+                                           CubeOwner owner,
+                                           int away1,
+                                           int away2,
+                                           bool is_crawford,
+                                           float cube_x_override,
+                                           bool jacoby,
+                                           bool beaver,
+                                           int max_cube_value,
+                                           py::object progress_callback) {
+            auto b = list_to_board(board_vec);
+            CubeInfo ci{cube_value, owner, {away1, away2, is_crawford},
+                        cube_x_override, jacoby, beaver, max_cube_value};
+
+            RolloutProgressCallback cpp_progress;
+            if (!progress_callback.is_none()) {
+                cpp_progress = [cb = progress_callback](int completed, int total) {
+                    py::gil_scoped_acquire acquire;
+                    cb(completed, total);
+                };
+            }
+
+            RolloutStrategy::CubefulPositionResult cpr;
+            {
+                py::gil_scoped_release release;
+                cpr = self.cubeful_rollout_position(b, ci, cpp_progress);
+            }
+
+            const auto& cl = cpr.cubeless;
+            py::dict result;
+            // Cubeless (same as evaluate_board)
+            result["probs"] = cl.mean_probs;
+            result["equity"] = cl.equity;
+            result["std_error"] = cl.std_error;
+            result["prob_std_errors"] = cl.prob_std_errors;
+            result["scalar_vr_equity"] = cl.scalar_vr_equity;
+            result["scalar_vr_se"] = cl.scalar_vr_se;
+            // Cubeful (rollout-native, VR-adjusted)
+            result["cubeful_equity"] = cpr.cubeful_equity;
+            result["cubeful_se"] = cpr.cubeful_se;
+            return result;
+        }, "Evaluate post-move board via rollout with rollout-native cubeful equity. "
+           "Returns cubeless probs/equity AND cubeful_equity/cubeful_se from a "
+           "single set of trials (single-branch cubeful VR rollout).",
+           py::arg("board"), py::arg("pre_move_board"),
+           py::arg("cube_value") = 1,
+           py::arg("owner"),
+           py::arg("away1") = 0,
+           py::arg("away2") = 0,
+           py::arg("is_crawford") = false,
+           py::arg("cube_x_override") = -1.0f,
+           py::arg("jacoby") = true,
+           py::arg("beaver") = true,
+           py::arg("max_cube_value") = 0,
+           py::arg("progress") = py::none())
         .def("cube_decision", [](RolloutStrategy& self,
                                   const std::vector<int>& checkers,
                                   int cube_value,

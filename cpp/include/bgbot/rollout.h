@@ -164,6 +164,37 @@ public:
         const CubeInfo& cube,
         RolloutProgressCallback progress = nullptr) const;
 
+    // Result of a cubeful position rollout (single-branch, for checker play).
+    struct CubefulPositionResult {
+        double cubeful_equity = 0.0;   // Cubeful equity (basis cube units, mover perspective)
+        double cubeful_se = 0.0;       // Standard error of cubeful equity
+        RolloutResult cubeless;         // Cubeless probs/equity from same trials
+    };
+
+    // Cubeful rollout for a post-move position (single-branch). Used to
+    // evaluate checker play candidates with VR-adjusted cubeful equity that
+    // correctly accounts for cube actions during trial games.
+    //
+    // `post_move_board` is from the perspective of the player who just moved
+    // (i.e. the position right before the opponent rolls). `cube` is from the
+    // same perspective. The returned cubeful_equity is in basis-cube units
+    // (divide actual points by `cube.cube_value` to get the per-cube-1 value).
+    //
+    // Internally, this runs the same trial loop as `cubeful_cube_decision`
+    // with `n_branches = 1` and `start_post_move = true`. VR luck is tracked
+    // per-trial in basis-cube space (using cl2cf at 1-ply for the VR mean and
+    // actual). Cube decisions during trials use the configured cube_eval_config
+    // (1-ply Janowski / N-ply cubeful / inner truncated rollout). At trial end
+    // (terminal, D/P, or truncation), the per-trial cubeful value is
+    // VR-corrected and aggregated.
+    //
+    // Cubeless probs/equity from the same trial games are also returned, so
+    // the caller does not need a separate rollout.
+    CubefulPositionResult cubeful_rollout_position(
+        const Board& post_move_board,
+        const CubeInfo& cube,
+        RolloutProgressCallback progress = nullptr) const;
+
     const RolloutConfig& config() const { return config_; }
 
     // Bearoff DB: when set, positions in the DB are evaluated exactly.

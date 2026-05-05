@@ -746,6 +746,19 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
     if (start_post_move) {
         board = flip(start_board);
         sp_parity_offset = 1;
+        // Flip each branch's cube perspective: when start_post_move=true, the
+        // input cube is from the post-move mover's (SP's) perspective, but
+        // the trial loop maintains branches[b].cube in the *current mover's*
+        // perspective. After the board flip above, the current mover (at move 0)
+        // is the opponent, so each branch's cube must be flipped to match.
+        // Phase 6's per-move flip then keeps it in sync for subsequent moves.
+        for (int b = 0; b < n_branches; ++b) {
+            branches[b].cube.owner = flip_owner(branches[b].cube.owner);
+            if (is_match) {
+                std::swap(branches[b].cube.match.away1,
+                          branches[b].cube.match.away2);
+            }
+        }
     } else {
         board = start_board;
         sp_parity_offset = 0;
@@ -1877,6 +1890,211 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
     result.cubeless.scalar_vr_equity = mean_cl;
     result.cubeless.scalar_vr_se = result.cubeless.std_error;
 
+    return result;
+}
+
+// ======================== Cubeful Position Rollout (single-branch) =========
+//
+// Like cubeful_cube_decision but for a post-move board with a single cube
+// state. Used by checker play to compute VR-adjusted cubeful equity natively
+// during trials (rather than bolting on N-ply cubeful afterwards on the
+// rollout's cubeless probs).
+//
+// VR math is identical to the per-branch cubeful VR already implemented in
+// run_trial_unified: per-move 1-ply Janowski VR mean + actual in basis-cube
+// SP-perspective units, accumulated across the trial, subtracted from the
+// terminal/truncation/DP value.
+
+RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position(
+    const Board& post_move_board,
+    const CubeInfo& cube,
+    RolloutProgressCallback progress) const
+{
+    rollout_profile::reset();
+
+    // Clear thread-local N-ply cache (same rationale as run_trials_parallel).
+    MultiPlyStrategy::get_cache().clear();
+
+    const int n_trials = config_.n_trials;
+    const int max_moves = (config_.truncation_depth > 0)
+        ? config_.truncation_depth + 10 : 200;
+
+    // Ensure stratified dice are generated
+    if (cached_dice_.empty() || cached_max_moves_ != max_moves) {
+        cached_dice_.clear();
+        cached_max_moves_ = max_moves;
+        generate_stratified_dice(n_trials, max_moves, config_.seed, cached_dice_);
+    }
+    const auto& all_dice = cached_dice_;
+
+    // Single branch template. `cube` is from the post-move mover's (SP's)
+    // perspective; run_trial_unified's start_post_move=true entry block flips
+    // the cube to opp's perspective at trial start (since the board itself is
+    // flipped to opp's perspective). basis_cube preserves the input cube value
+    // so all per-trial equities are in basis-cube units.
+    CubefulBranch tmpl{};
+    tmpl.cube = cube;
+    tmpl.basis_cube = cube.cube_value;
+
+    // Per-trial results
+    struct CubefulTrialResult {
+        double cubeful_equity;
+        TrialResult cubeless;
+    };
+    std::vector<CubefulTrialResult> trial_results(n_trials);
+
+    int n_threads = rollout_thread_count(n_trials);
+
+    Move0Cache move0_cache;
+    Move1Cache move1_cache;
+    const bool uses_move1_cache =
+        (config_.truncation_depth == 0) || (config_.truncation_depth > 1);
+
+    // For start_post_move=true, run_trial_unified flips the board internally.
+    // The move0/move1 caches are keyed off the *flipped* (post-flip) board, so
+    // we prefill them on flip(post_move_board) — same convention as the
+    // cubeless run_trials_parallel path.
+    const Board prefill_board = flip(post_move_board);
+
+    const int report_interval = progress ? std::max(1, n_trials / 100) : 0;
+
+    if (n_threads == 1) {
+        prefill_move0_cache(prefill_board, move0_cache, 1, nullptr);
+        if (uses_move1_cache) {
+            for (int i = 0; i < Move0Cache::N_ROLLS; ++i) {
+                populate_move1_cache_entry(move0_cache, i, move1_cache.entries[i]);
+                move1_cache.state[i].store(2, std::memory_order_release);
+            }
+        }
+        for (int t = 0; t < n_trials; ++t) {
+            CubefulBranch branches[1] = {tmpl};
+            trial_results[t].cubeless = run_trial_unified(
+                post_move_board, /*start_post_move=*/true,
+                branches, 1, all_dice[t].data(), max_moves,
+                &move0_cache, &move1_cache);
+            trial_results[t].cubeful_equity = branches[0].final_equity;
+            if (report_interval && ((t + 1) % report_interval == 0 || t + 1 == n_trials)) {
+                progress(t + 1, n_trials);
+            }
+        }
+    } else {
+        if (!shared_pos_cache_) {
+            shared_pos_cache_ = std::make_unique<SharedPosCache>();
+        }
+        if (shared_pos_cache_->inserts.load(std::memory_order_relaxed) >=
+            (SharedPosCache::CAPACITY * 3) / 4) {
+            shared_pos_cache_->clear();
+        }
+        SharedPosCache* shared_cache = shared_pos_cache_.get();
+        std::atomic<int> next_roll{0};
+        std::atomic<int> next_trial{0};
+        std::atomic<int> completed_trials{0};
+
+        const Strategy* m0_strat = checker_strat_.get();
+
+        multipy_parallel_run(n_threads, [&]() {
+            MultiPlyStrategy::get_cache().clear();
+            MultiPlyStrategy::set_shared_cache(shared_cache);
+
+            // Combined move0 + move1 prefill per roll (work-stealing)
+            int r;
+            while ((r = next_roll.fetch_add(1, std::memory_order_relaxed)) < 21) {
+                thread_local std::vector<Board> candidates;
+                candidates.clear();
+                const auto& roll = ALL_ROLLS[r];
+                possible_boards(prefill_board, roll.d1, roll.d2, candidates);
+                Board chosen;
+                if (candidates.empty()) {
+                    chosen = prefill_board;
+                } else if (candidates.size() == 1) {
+                    chosen = candidates[0];
+                } else {
+                    chosen = candidates[m0_strat->best_move_index(
+                        candidates, prefill_board)];
+                }
+                move0_cache.chosen[r] = chosen;
+                move0_cache.state[r].store(2, std::memory_order_release);
+
+                if (uses_move1_cache) {
+                    populate_move1_cache_entry(move0_cache, r, move1_cache.entries[r]);
+                    move1_cache.state[r].store(2, std::memory_order_release);
+                }
+            }
+
+            // Trials (work-stealing)
+            int start;
+            while ((start = next_trial.fetch_add(kTrialChunkSize, std::memory_order_relaxed))
+                   < n_trials) {
+                if (config_.cancel_flag &&
+                    config_.cancel_flag->load(std::memory_order_relaxed)) {
+                    break;
+                }
+                int end = std::min(start + kTrialChunkSize, n_trials);
+                for (int t = start; t < end; ++t) {
+                    CubefulBranch branches[1] = {tmpl};
+                    trial_results[t].cubeless = run_trial_unified(
+                        post_move_board, /*start_post_move=*/true,
+                        branches, 1, all_dice[t].data(), max_moves,
+                        &move0_cache, &move1_cache);
+                    trial_results[t].cubeful_equity = branches[0].final_equity;
+                }
+                if (report_interval) {
+                    int done = completed_trials.fetch_add(end - start, std::memory_order_relaxed) + (end - start);
+                    if (done % report_interval < kTrialChunkSize || done >= n_trials) {
+                        progress(std::min(done, n_trials), n_trials);
+                    }
+                }
+            }
+
+            MultiPlyStrategy::set_shared_cache(nullptr);
+        });
+
+        if (is_cancelled()) {
+            throw RolloutCancelled();
+        }
+    }
+
+    // Aggregate
+    double sum_cf = 0, sum_cf_sq = 0;
+    std::array<double, NUM_OUTPUTS> sum_probs = {0,0,0,0,0};
+    std::array<double, NUM_OUTPUTS> sum_probs_sq = {0,0,0,0,0};
+    double sum_cl_eq = 0, sum_cl_eq_sq = 0;
+
+    for (int t = 0; t < n_trials; ++t) {
+        double cf = trial_results[t].cubeful_equity;
+        sum_cf += cf;
+        sum_cf_sq += cf * cf;
+        for (int k = 0; k < NUM_OUTPUTS; ++k) {
+            double v = trial_results[t].cubeless.probs[k];
+            sum_probs[k] += v;
+            sum_probs_sq[k] += v * v;
+        }
+        double eq = trial_results[t].cubeless.equity;
+        sum_cl_eq += eq;
+        sum_cl_eq_sq += eq * eq;
+    }
+
+    CubefulPositionResult result;
+    result.cubeful_equity = sum_cf / n_trials;
+    double var_cf = (sum_cf_sq / n_trials) - (result.cubeful_equity * result.cubeful_equity);
+    if (var_cf < 0) var_cf = 0;
+    result.cubeful_se = std::sqrt(var_cf / n_trials);
+
+    for (int k = 0; k < NUM_OUTPUTS; ++k) {
+        result.cubeless.mean_probs[k] = static_cast<float>(sum_probs[k] / n_trials);
+        double mean_k = sum_probs[k] / n_trials;
+        double var_k = (sum_probs_sq[k] / n_trials) - (mean_k * mean_k);
+        if (var_k < 0) var_k = 0;
+        result.cubeless.prob_std_errors[k] = static_cast<float>(std::sqrt(var_k / n_trials));
+    }
+    result.cubeless.equity = sum_cl_eq / n_trials;
+    double var_cl = (sum_cl_eq_sq / n_trials) - (result.cubeless.equity * result.cubeless.equity);
+    if (var_cl < 0) var_cl = 0;
+    result.cubeless.std_error = std::sqrt(var_cl / n_trials);
+    result.cubeless.scalar_vr_equity = result.cubeless.equity;
+    result.cubeless.scalar_vr_se = result.cubeless.std_error;
+
+    rollout_profile::print();
     return result;
 }
 

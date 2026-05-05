@@ -458,6 +458,13 @@ class _RolloutAnalyzer(_CubelessBase):
         n_trials = self._rollout_config["n_trials"]
         results = []
         total_moves = len(survivors)
+        # When cube info is available, use cubeful_evaluate_board so the
+        # rollout produces a VR-adjusted cubeful equity natively from its
+        # trial paths (rather than bolting on cubeful_equity_nply afterwards
+        # on top of the rollout's cubeless probs). Cubeful and cubeless are
+        # computed from the same trial games.
+        owner = resolve_owner(cube_owner) if cube_owner else None
+        use_cubeful_rollout = owner is not None
         for i, (feq, cleq, b, p0) in enumerate(survivors):
             self._check_cancel()
 
@@ -470,7 +477,17 @@ class _RolloutAnalyzer(_CubelessBase):
                     progress_callback(overall, overall_total, results)
 
             try:
-                r = self._rollout_strategy.evaluate_board(b, board, _trial_progress)
+                if use_cubeful_rollout:
+                    r = self._rollout_strategy.cubeful_evaluate_board(
+                        b, board,
+                        cube_value=cube_value, owner=owner,
+                        away1=away1, away2=away2, is_crawford=is_crawford,
+                        jacoby=jacoby, beaver=beaver,
+                        progress=_trial_progress,
+                    )
+                else:
+                    r = self._rollout_strategy.evaluate_board(
+                        b, board, _trial_progress)
             except bgbot_cpp.RolloutCancelled:
                 raise RolloutCancelled()
 
@@ -479,14 +496,20 @@ class _RolloutAnalyzer(_CubelessBase):
             if self._bearoff_db is not None and self._bearoff_db.is_bearoff(b):
                 probs = self._bearoff_db.lookup_probs(b, post_move=True)
 
-            results.append({
+            entry = {
                 "board": b,
-                "equity": r["equity"],
+                "equity": r["equity"],          # cubeless equity
                 "probs": probs,
                 "std_error": r.get("std_error", 0),
                 "prob_std_errors": list(r.get("prob_std_errors", [0] * 5)),
                 "eval_level": "Rollout",
-            })
+            }
+            if use_cubeful_rollout:
+                # Stash the rollout-native cubeful so _CubefulAnalyzer can use
+                # it directly instead of recomputing via cubeful_equity_nply.
+                entry["rollout_cubeful_equity"] = r["cubeful_equity"]
+                entry["rollout_cubeful_se"] = r["cubeful_se"]
+            results.append(entry)
 
         # Non-rolled-out moves: use 3-ply results where available, 1-ply otherwise.
         scored_3ply_map = {tuple(b): (eq, p) for eq, _, b, p in scored_3ply}
@@ -627,15 +650,21 @@ class _CubefulAnalyzer:
             return results
 
         if is_rollout:
-            # Rollout path: all heavy computation is done. Just apply 1-ply
-            # Janowski cubeful equity to each move's probs (instant) and sort.
+            # Rollout path: prefer the rollout's VR-adjusted cubeful equity
+            # (computed natively from trial paths) when the rollout supplied
+            # one. Falls back to N-ply / Janowski cubeful only if the inner
+            # analyzer didn't supply rollout_cubeful_equity (e.g. when no cube
+            # info was passed through).
             for m in results:
                 cubeless_eq = m["equity"]
-                cf_eq = self._cubeful_equity(
-                    m["board"], m["probs"], owner,
-                    cube_value=cube_value, away1=away1, away2=away2,
-                    is_crawford=is_crawford, jacoby=jacoby, beaver=beaver,
-                )
+                if "rollout_cubeful_equity" in m:
+                    cf_eq = m["rollout_cubeful_equity"]
+                else:
+                    cf_eq = self._cubeful_equity(
+                        m["board"], m["probs"], owner,
+                        cube_value=cube_value, away1=away1, away2=away2,
+                        is_crawford=is_crawford, jacoby=jacoby, beaver=beaver,
+                    )
                 m["cubeless_equity"] = cubeless_eq
                 m["equity"] = cf_eq
 
@@ -842,6 +871,7 @@ class BgBotAnalyzer:
                 decision_ply=1,
                 n_threads=parallel_threads,
                 seed=seed,
+                ultra_late_threshold=2,
             )
         elif eval_level == "truncated2":
             inner = _RolloutAnalyzer(
@@ -853,6 +883,7 @@ class BgBotAnalyzer:
                 seed=seed,
                 late_ply=1,
                 late_threshold=2,
+                ultra_late_threshold=2,
             )
         elif eval_level == "truncated3":
             inner = _RolloutAnalyzer(
@@ -864,6 +895,7 @@ class BgBotAnalyzer:
                 seed=seed,
                 late_ply=2,
                 late_threshold=2,
+                ultra_late_threshold=2,
             )
         elif eval_level == "rollout":
             inner = _RolloutAnalyzer(
