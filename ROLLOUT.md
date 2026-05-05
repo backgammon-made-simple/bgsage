@@ -1097,15 +1097,19 @@ applies a richer pipeline that uses the cubeful rollout for each survivor:
 1. **1-ply scoring** (with bearoff DB awareness on bearoff candidates):
    compute cubeless probs and 1-ply Janowski cubeful equity for every
    candidate.
-2. **1-ply filter:** keep top `filter.max_moves` within `filter.threshold`
-   cubeful equity of the best.
-3. **3-ply rescore:** evaluate 1-ply survivors at 3-ply; re-filter with the
-   same TINY preset.
-4. **Cubeful rollout each survivor:** call `cubeful_rollout_position(board,
+2. **TINY filter:** keep top `filter.max_moves` within `filter.threshold`
+   cubeful equity of the best — same gate the N-ply analyzer uses. A min-2
+   rescue grabs the next-best 1-ply candidate when only one survives, so
+   the cubeful sort always has at least two rollout-quality entries.
+3. **Cubeful rollout each survivor:** call `cubeful_rollout_position(board,
    cube)` for each candidate, producing both cubeless probs/equity and
    cubeful equity from the same trial paths (no post-hoc Janowski).
-5. **Sort by cubeful equity:** rank survivors by the rollout-native cubeful
-   equity.
+4. **Sort by cubeful equity:** rank survivors by the rollout-native cubeful
+   equity. Non-survivors keep their 1-ply equity in the result list.
+
+There is no intermediate ply rescore between the 1-ply filter and the
+rollout — the goal is a rollout-quality answer for every move that survived
+the user's TINY filter, not a narrower sub-filter of it.
 
 Thread-local caches are cleared before evaluation to prevent cross-strategy
 contamination.

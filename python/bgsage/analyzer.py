@@ -387,11 +387,6 @@ class _RolloutAnalyzer(_CubelessBase):
             cube_late=cube_late_cfg,
             ultra_late_threshold=ultra_late_threshold,
         )
-        # Create a 3-ply strategy for pre-filtering (accurate move count)
-        self._strategy_3ply = bgbot_cpp.create_multipy(
-            weights.strategy_type, weights.weight_paths_list, weights.hidden_sizes_list,
-            n_plies=3,
-        )
 
     def cancel(self):
         """Request cancellation of in-progress rollout."""
@@ -422,38 +417,25 @@ class _RolloutAnalyzer(_CubelessBase):
             cube_value=cube_value, away1=away1, away2=away2,
             is_crawford=is_crawford, jacoby=jacoby,
         )
-        survivors_1ply, survivor_1ply_set = self._filter_candidates(
+        # TINY filter (top FILTER_MAX_MOVES within FILTER_THRESHOLD of best at
+        # 1-ply) — same gate the N-ply analyzer uses. Every survivor is rolled
+        # out; non-survivors keep their 1-ply equity. No intermediate ply
+        # rescore: the user-facing rollout is meant to give a rollout-quality
+        # answer for the full TINY-filtered candidate set, not a narrower
+        # sub-filter of it.
+        survivors, survivor_set = self._filter_candidates(
             scored_1ply, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
         )
-        # Ensure at least 2 candidates go into the 3-ply rescore so the
-        # cubeful promotion loop won't need surprise extra rollouts.
-        if len(survivors_1ply) < 2 and len(scored_1ply) >= 2:
+        # Ensure at least 2 candidates get rolled out so the cubeful sort
+        # always has at least two rollout-quality entries to compare.
+        if len(survivors) < 2 and len(scored_1ply) >= 2:
             for item in scored_1ply:
-                if tuple(item[2]) not in survivor_1ply_set:
-                    survivors_1ply.append(item)
-                    survivor_1ply_set.add(tuple(item[2]))
-                    if len(survivors_1ply) >= 2:
-                        break
-
-        # 3-ply rescore: re-evaluate 1-ply survivors at 3-ply, then re-filter
-        # to get accurate move count before starting the rollout.
-        self._check_cancel()
-        scored_3ply = []
-        for feq, cleq, b, p in survivors_1ply:
-            r = self._strategy_3ply.evaluate_board(b, board)
-            scored_3ply.append((r["equity"], cleq, b, list(r["probs"])))
-        scored_3ply.sort(key=lambda x: -x[0])
-        survivors, survivor_set = self._filter_candidates(
-            scored_3ply, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
-        )
-        # Maintain the min-2 guarantee after 3-ply filtering too.
-        if len(survivors) < 2 and len(scored_3ply) >= 2:
-            for item in scored_3ply:
                 if tuple(item[2]) not in survivor_set:
                     survivors.append(item)
                     survivor_set.add(tuple(item[2]))
                     if len(survivors) >= 2:
                         break
+        self._check_cancel()
 
         n_trials = self._rollout_config["n_trials"]
         results = []
@@ -511,26 +493,17 @@ class _RolloutAnalyzer(_CubelessBase):
                 entry["rollout_cubeful_se"] = r["cubeful_se"]
             results.append(entry)
 
-        # Non-rolled-out moves: use 3-ply results where available, 1-ply otherwise.
-        scored_3ply_map = {tuple(b): (eq, p) for eq, _, b, p in scored_3ply}
+        # Non-rolled-out moves: keep their 1-ply equity. Mirrors the
+        # _MultiPlyAnalyzer pattern (TINY survivors at the chosen level,
+        # everything else at 1-ply).
         for feq, cleq, b, p in scored_1ply:
-            bkey = tuple(b)
-            if bkey not in survivor_set:
-                eq3, p3 = scored_3ply_map.get(bkey, (None, None))
-                if eq3 is not None:
-                    results.append({
-                        "board": b,
-                        "equity": eq3,
-                        "probs": p3,
-                        "eval_level": "3-ply",
-                    })
-                else:
-                    results.append({
-                        "board": b,
-                        "equity": cleq,
-                        "probs": p,
-                        "eval_level": "1-ply",
-                    })
+            if tuple(b) not in survivor_set:
+                results.append({
+                    "board": b,
+                    "equity": cleq,
+                    "probs": p,
+                    "eval_level": "1-ply",
+                })
 
         return self._finalize_results(results)
 
@@ -931,11 +904,6 @@ class BgBotAnalyzer:
                 bgbot_cpp.multipy_set_bearoff_db(inner._strategy_nply, self._bearoff_db)
             elif isinstance(inner, _RolloutAnalyzer):
                 bgbot_cpp.rollout_set_bearoff_db(inner._rollout_strategy, self._bearoff_db)
-                # The rollout analyzer also keeps an internal 3-ply strategy for
-                # pre-filtering candidates before launching rollouts; that strategy
-                # needs the DB too, otherwise bearoff candidates get NN-noisy
-                # probs in the 3-ply rescore and good moves can be filtered out.
-                bgbot_cpp.multipy_set_bearoff_db(inner._strategy_3ply, self._bearoff_db)
 
         if cubeful:
             self._analyzer = _CubefulAnalyzer(inner)
