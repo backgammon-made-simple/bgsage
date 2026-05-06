@@ -148,7 +148,7 @@ def compute_move_notation(
                     moves[mi:mi + 1] = [(f, mid, True), (mid, t, h)]
                     break
 
-    moves.sort(key=lambda m: -m[0])
+    moves.sort(key=lambda m: (-m[0], -m[1]))
 
     combined: list[tuple[int, int, bool, int]] = []
     for f, t, h in moves:
