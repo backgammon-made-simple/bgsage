@@ -105,12 +105,18 @@ public:
 
         JobState state;
 
+        // Barrier-exit synchronization must go through done_mutex, NOT the
+        // atomic alone: state is on the caller's stack and gets destroyed
+        // when this function returns. If the last worker increments the
+        // atomic without holding the lock, the caller can observe count ==
+        // workers, return, and destroy state while that worker is still
+        // about to enter its lock_guard — use-after-free on done_mutex.
         auto run_chunk = [&](int start) {
             for (int item = start; item < n_items; item += workers) {
                 task_fn(item);
             }
+            std::lock_guard<std::mutex> lock(state.done_mutex);
             if (state.completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 == workers) {
-                std::lock_guard<std::mutex> lock(state.done_mutex);
                 state.done_cv.notify_one();
             }
         };
@@ -121,7 +127,7 @@ public:
 
         run_chunk(0);
 
-        if (state.completed_workers.load(std::memory_order_acquire) != workers) {
+        {
             std::unique_lock<std::mutex> lock(state.done_mutex);
             state.done_cv.wait(lock, [&state, workers]() {
                 return state.completed_workers.load(std::memory_order_acquire) == workers;
@@ -146,10 +152,11 @@ public:
 
         JobState state;
 
+        // See barrier-exit comment in parallel_for above.
         auto run_worker = [&]() {
             fn();
+            std::lock_guard<std::mutex> lock(state.done_mutex);
             if (state.completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 == n_workers) {
-                std::lock_guard<std::mutex> lock(state.done_mutex);
                 state.done_cv.notify_one();
             }
         };
@@ -160,7 +167,7 @@ public:
 
         run_worker();  // caller is worker 0
 
-        if (state.completed_workers.load(std::memory_order_acquire) != n_workers) {
+        {
             std::unique_lock<std::mutex> lock(state.done_mutex);
             state.done_cv.wait(lock, [&state, n_workers]() {
                 return state.completed_workers.load(std::memory_order_acquire) == n_workers;
