@@ -15,6 +15,7 @@ trained, append its results to the tables below.
 | Stage 6 (5-NN, 100h/300h, 244 inputs, per-NN gpw) | 10.09 | 1.00 | +0.624 | 73.1/26.0/0.9 |
 | Stage 7 (17-NN pair, 100h/300h, 244 inputs, per-pair gpw) | 9.76 | 1.00 | — | — |
 | Stage 8 (17-NN pair, 100h/400h, S5 fallback, per-pair gpw) | **9.49** | **1.00** | **+0.633** | 72.8/26.1/1.0 |
+| Stage 9 (19-NN backgame pair, 100h/400h, S8 + 2 backgame NNs) | 9.57 | 1.00 | +0.642 | — |
 
 **Targets:** Contact < 10.5, Race < 0.643, vs PubEval > +0.63
 
@@ -28,11 +29,15 @@ trained, append its results to the tables below.
 | Stage 6 | 1.00 | 5.90 | 8.73 | 9.58 | 11.34 | 6.84 |
 | Stage 7 (pair) | 1.00 | — | — | — | — | — |
 | Stage 8 (pair+S5) | 1.00 | 5.26 | 7.95 | 8.33 | 10.83 | 5.92 |
+| Stage 9 (backgame pair) | 1.00 | 5.25 | 7.96 | 8.35 | 11.53 | 6.19 |
 
 **Note:** Stages 7 and 8 use 17-NN pair strategy (player x opponent game plan), so
 per-plan ERs are not directly comparable to single-plan models. See pair-filtered
 benchmarks below. Stage 8 uses S5 fallback: any pair NN worse than S5 is replaced
-with the corresponding S5 plan weights.
+with the corresponding S5 plan weights. Stage 9 inherits all S8 standard pair
+weights verbatim and adds 2 specialized back game NNs; the Anchoring and Crashed
+regressions vs S8 reflect the new `player_bg` NN underperforming on
+GNUbg-benchmark anch_race positions (see Stage 9 section).
 
 ## Model Details
 
@@ -508,3 +513,130 @@ threads with pair strategy at 3-ply decision depth).
 **Note:** S8 top-100 ERs are not directly comparable to S5/S6/S7 top-100 ERs because
 the top-100 worst positions differ between models (selected by each model's own
 1-ply errors).
+
+## Stage 9 (19-NN Backgame-Aware Pair Strategy, 100h purerace / 400h contact, 2 backgame NNs)
+
+19 NNs: the 17 standard pair NNs from Stage 8 (selected by player × opponent
+game plan), plus 2 specialized back game NNs (`player_bg`, `opponent_bg`) that
+activate when an `(anchoring, racing)` or `(racing, anchoring)` pair also
+satisfies the back game criteria — the player/opponent is behind in pip count
+AND holds ≥2 anchors in the opponent's home board. The 17 standard pair weights
+(including S8's S5-fallback replacements) are inherited verbatim from Stage 8.
+Only the 2 back game NNs are newly trained.
+
+Back game NN training: SL against rolled-out cubeless equities for 93,770
+player/opponent back game positions each. Two iterative rounds — Round 1 uses
+Stage 8 rollouts as targets (1296 trials, 3-ply cubeless decisions, PubEval
+20/15 prefilter, VR), trains 100k steps @ α=3.1 + 250k steps @ α=1.0 from S8
+anchoring-pair fallback weights. Round 2 re-rolls out the training+benchmark
+positions with the Round-1 model and re-trains with the same schedule. The
+re-rollout step reduces the ~22 ER noise in the S8 targets that becomes the
+limiting factor once the back game NN's own ER drops below ~20.
+
+Training scripts: `scripts/run_bg_train.py`, `scripts/run_bg_train2.py`,
+`scripts/run_bg_train_round2.py`. Back game benchmark scorer:
+`scripts/score_backgame_benchmark.py`.
+
+### S9 Standard Benchmarks (1-ply)
+
+Benchmark run: 2026-05-18, 32 threads, RTX 4070S / Windows.
+
+| Benchmark | S9 | S8 (400h) | S5 (400h) |
+|-----------|------|-----------|-----------|
+| PureRace | 1.00 | 1.00 | 0.95 |
+| Racing | 5.25 | 5.26 | 5.74 |
+| Attacking | 7.96 | 7.95 | 8.74 |
+| Priming | 8.35 | 8.33 | 8.59 |
+| Anchoring | 11.53 | 10.83 | 11.06 |
+| **Contact** | **9.57** | **9.49** | **9.87** |
+| Crashed | 6.19 | 5.92 | 6.44 |
+| Race | 1.00 | 1.00 | 0.95 |
+| vs PubEval | +0.642 | +0.633 | +0.633 |
+
+The 17 standard pair weights are identical to S8, so per-plan ERs reflect
+exclusively the impact of routing back game positions to the new `player_bg` /
+`opponent_bg` NNs. The Anchoring regression (+0.70 vs S8) and Crashed
+regression (+0.27 vs S8) are dragged down by the `player_bg` NN underperforming
+the inherited Anchoring fallback weights on GNUbg-benchmark `anch_race`
+positions — see pair-filtered table for details. vs PubEval improves slightly
+(+0.642 vs +0.633), measured by wrapping the strategy in a 1-ply
+MultiPlyStrategy and calling `play_games_multipy_vs_pubeval` (no
+play_games_*_vs_self binding exists for the 19-NN strategy yet, so the
+self-play S/G/B% column is omitted).
+
+### S9 Pair-Filtered Benchmarks vs S5 / S8 (1-ply)
+
+Each pair NN is scored only on benchmark positions matching its (player,
+opponent) game plan pair — including back game routing where applicable. S5
+uses the player's plan NN on the same subset. S8 uses its 17-NN pair strategy
+on the same subset.
+
+| NN | Count | S9 ER | S5 ER | S8 ER | S9-S5 | S9-S8 |
+|----|-------|-------|-------|-------|-------|-------|
+| race_race | 16901 | 7.10 | 7.54 | 7.10 | -0.44 | +0.00 |
+| race_att | 17425 | 4.35 | 4.42 | 4.35 | -0.07 | +0.00 |
+| race_prim | 12514 | 4.48 | 4.48 | 4.48 | +0.00 | +0.00 |
+| race_anch | 25648 | 5.01 | 5.18 | 5.11 | -0.17 | -0.09 |
+| att_race | 15944 | 5.64 | 7.24 | 5.64 | -1.61 | +0.00 |
+| att_att | 10369 | 9.56 | 9.56 | 9.56 | +0.00 | +0.00 |
+| att_prim | 9326 | 7.95 | 7.99 | 7.95 | -0.04 | +0.00 |
+| att_anch | 10088 | 9.99 | 10.29 | 9.99 | -0.30 | +0.00 |
+| prim_race | 20775 | 7.98 | 8.19 | 7.98 | -0.21 | +0.00 |
+| prim_att | 13243 | 9.11 | 9.11 | 9.11 | +0.00 | +0.00 |
+| prim_anch (shared) | 9548 | 8.81 | 8.86 | 8.81 | -0.04 | +0.00 |
+| anch_race | 29037 | 12.46 | 11.50 | 11.26 | +0.96 | +1.20 |
+| anch_att | 16666 | 10.24 | 10.26 | 10.24 | -0.03 | +0.00 |
+| **Weighted avg** | **207484** | **7.94** | **8.03** | **7.78** | **-0.09** | **+0.16** |
+
+11 of 13 standard pair NNs match S8 exactly because S9 inherits S8's weights
+for those pairs. Only `race_anch` and `anch_race` diverge from S8 because
+positions in those pairs can be routed to a back game NN: `opponent_bg`
+improves `race_anch` slightly (-0.09 vs S8), but `player_bg` regresses
+`anch_race` materially (+1.20 vs S8) on GNUbg-benchmark player back game
+positions. The weighted average is slightly worse than S8 (+0.16) because the
+large `anch_race` subset (29,037 positions) dominates.
+
+### S9 Multi-Ply Contact Benchmarks
+
+Full 107,484-scenario contact.bm at 1/2/3-ply; 4-ply on step=21 subsample
+(~5,119 scenarios) due to per-scenario cost. 32-thread multi-ply evaluation.
+
+| Level | S9 Contact ER | S8 Contact ER | S5 Contact ER | S9 Time |
+|-------|--------------|---------------|---------------|---------|
+| 1-ply | 9.57 | 9.49 | 9.87 | 0.8s |
+| 2-ply | **7.99** | 8.44 | 8.42 | 272s |
+| 3-ply | **6.92** | 7.76 | 7.65 | 1,824s |
+| 4-ply (subsample) | **6.41** | 7.66 | — | 845s |
+
+At 1-ply S9 is slightly worse than S8 (+0.08 ER), but at every higher ply S9
+pulls ahead — **−0.45 at 2-ply, −0.84 at 3-ply, −1.25 at 4-ply**. The deeper
+search compensates for the `player_bg` 1-ply weakness, while the back game NN's
+better representation of back game outcomes is amplified by multi-ply
+recursion. The 4-ply subsample (step=21) tracks the 3-ply full-dataset ER
+within sampling variance.
+
+### S9 Top-100 Worst Positions Benchmark
+
+Top-100 worst 1-ply scenarios from 207,484 total (contact + crashed), selected
+using S9 strategy at 1-ply. Benchmark run: 2026-05-18, RTX 4070S / Windows. The
+top-100 split was 21 contact / 79 crashed. N-ply and XG Roller levels run at 4
+threads per documented pair-strategy constraint (segfaults at 8+ threads with
+pair strategy at 3-ply decision depth).
+
+| Strategy | Settings | ER | Time |
+|----------|----------|------|------|
+| 1-ply | — | 460.07 | <1s |
+| 2-ply | TINY filter | 266.40 | <1s |
+| 3-ply | TINY filter | 277.84 | 5.8s |
+| 4-ply | TINY filter | 277.50 | 25.9s |
+| XG Roller | 42t, trunc=5, dp=1 | 272.27 | 67.2s |
+| XG Roller+ | 360t, trunc=7, dp=2, late=1@2 | 257.11 | 527.2s |
+| XG Roller++ | 360t, trunc=5, dp=3, late=2@2 | 249.67 | 1395.7s |
+
+**Note:** S9 top-100 ERs are not directly comparable to S5/S6/S7/S8 top-100 ERs
+because the top-100 worst positions differ between models (selected by each
+model's own 1-ply errors). 2-ply happens to beat 3-ply/4-ply on this top-100
+because the worst-case 1-ply positions are mostly crashed positions where the
+TINY 1-ply prefilter occasionally drops the right move from 3/4-ply rescoring;
+XG Roller++ at 249.67 is the strongest evaluator and matches the expected
+ordering.
