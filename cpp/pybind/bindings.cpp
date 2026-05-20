@@ -53,6 +53,22 @@ static std::vector<int> board_to_list(const Board& b) {
     return std::vector<int>(b.begin(), b.end());
 }
 
+// Scale a standard error in MWC space to equity space by the local slope of
+// mwc2eq around `mean_mwc`. Used wherever rollout aggregates produce per-trial
+// values in MWC for match play (cubeful_evaluate_board, cube_decision rollout
+// bindings) so the reported SE is in the same units as the converted mean.
+// mwc2eq is piecewise linear, so a small numerical derivative is exact within
+// the active segment.
+static float mwc_se_to_eq_se(float mwc_se, float mean_mwc,
+                             int away1, int away2, int cube_value,
+                             bool is_crawford) {
+    float eps = std::max(1e-3f, mwc_se);
+    float eq_plus = mwc2eq(mean_mwc + eps, away1, away2, cube_value, is_crawford);
+    float eq_minus = mwc2eq(mean_mwc - eps, away1, away2, cube_value, is_crawford);
+    float slope = (eq_plus - eq_minus) / (2.0f * eps);
+    return std::abs(slope) * mwc_se;
+}
+
 // Convert a vector of PlayerRollDetail to a Python list of dicts
 static py::list player_rolls_to_list(const std::vector<PlayerRollDetail>& rolls) {
     py::list result;
@@ -1962,9 +1978,26 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             result["prob_std_errors"] = cl.prob_std_errors;
             result["scalar_vr_equity"] = cl.scalar_vr_equity;
             result["scalar_vr_se"] = cl.scalar_vr_se;
-            // Cubeful (rollout-native, VR-adjusted)
-            result["cubeful_equity"] = cpr.cubeful_equity;
-            result["cubeful_se"] = cpr.cubeful_se;
+            // Cubeful (rollout-native, VR-adjusted). For match play,
+            // run_trial_unified stores per-trial cubeful values in MWC space
+            // (terminal/D-P paths set sp_val from cubeless_mwc/dp_mwc; the
+            // N-ply truncation path calls eq2mwc). The aggregated
+            // cpr.cubeful_equity is therefore MWC for match play and must be
+            // converted to equity here to match the N-ply path
+            // (cube.cpp:1494 cubeful_equity_nply applies the same mwc2eq).
+            // Money games are already in basis-cube equity units.
+            float cf_eq = static_cast<float>(cpr.cubeful_equity);
+            float cf_se = static_cast<float>(cpr.cubeful_se);
+            if (!ci.is_money()) {
+                float mean_mwc = cf_eq;
+                cf_eq = mwc2eq(mean_mwc, ci.match.away1, ci.match.away2,
+                               ci.cube_value, ci.match.is_crawford);
+                cf_se = mwc_se_to_eq_se(cf_se, mean_mwc,
+                                        ci.match.away1, ci.match.away2,
+                                        ci.cube_value, ci.match.is_crawford);
+            }
+            result["cubeful_equity"] = cf_eq;
+            result["cubeful_se"] = cf_se;
             return result;
         }, "Evaluate post-move board via rollout with rollout-native cubeful equity. "
            "Returns cubeless probs/equity AND cubeful_equity/cubeful_se from a "
@@ -2017,6 +2050,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             double cl_se = cl.std_error;
 
             float equity_nd, equity_dt, equity_dp;
+            float equity_nd_se, equity_dt_se;
             bool should_double, should_take;
             float optimal_equity;
 
@@ -2044,6 +2078,15 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                 equity_dp = mwc2eq(dp_m, a1, a2, cv, craw);
                 optimal_equity = should_double ? std::min(equity_dt, equity_dp)
                                                : equity_nd;
+
+                // cfr.nd_se / dt_se are in MWC space because the per-trial
+                // cubeful values from run_trial_unified are MWC for match
+                // play. Scale to equity space by the local mwc2eq slope so
+                // the SE matches the units of the converted means.
+                equity_nd_se = mwc_se_to_eq_se(
+                    static_cast<float>(cfr.nd_se), nd_m, a1, a2, cv, craw);
+                equity_dt_se = mwc_se_to_eq_se(
+                    static_cast<float>(cfr.dt_se), dt_m, a1, a2, cv, craw);
             } else {
                 equity_dp = 1.0f;
                 float actual_dt = static_cast<float>(cfr.dt_equity);
@@ -2059,6 +2102,10 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                 should_double = (best_double > equity_nd);
                 should_take = (equity_dt <= equity_dp);
                 optimal_equity = should_double ? best_double : equity_nd;
+
+                // Money-game SE is already in equity-per-basis-cube units.
+                equity_nd_se = static_cast<float>(cfr.nd_se);
+                equity_dt_se = static_cast<float>(cfr.dt_se);
             }
 
             bool is_beaver_result = false;
@@ -2073,9 +2120,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             result["cubeless_equity"] = cl_eq;
             result["cubeless_se"] = cl_se;
             result["equity_nd"] = equity_nd;
-            result["equity_nd_se"] = cfr.nd_se;
+            result["equity_nd_se"] = equity_nd_se;
             result["equity_dt"] = equity_dt;
-            result["equity_dt_se"] = cfr.dt_se;
+            result["equity_dt_se"] = equity_dt_se;
             result["equity_dp"] = equity_dp;
             result["should_double"] = should_double;
             result["should_take"] = should_take;
@@ -2884,6 +2931,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
 
         // Decision logic: match play works in MWC space, money in equity
         float equity_nd, equity_dt, equity_dp;
+        float equity_nd_se, equity_dt_se;
         bool should_double, should_take;
         float optimal_equity;
 
@@ -2916,6 +2964,13 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             equity_dp = mwc2eq(dp_m, a1, a2, cv, craw);
             optimal_equity = should_double ? std::min(equity_dt, equity_dp)
                                            : equity_nd;
+
+            // cfr.nd_se / dt_se are in MWC space; scale to equity by the
+            // local mwc2eq slope so SE matches the units of the means.
+            equity_nd_se = mwc_se_to_eq_se(
+                static_cast<float>(cfr.nd_se), nd_m, a1, a2, cv, craw);
+            equity_dt_se = mwc_se_to_eq_se(
+                static_cast<float>(cfr.dt_se), dt_m, a1, a2, cv, craw);
         } else {
             // Money game: existing logic
             equity_dp = 1.0f;
@@ -2935,6 +2990,10 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             should_double = (best_double > equity_nd);
             should_take = (equity_dt <= equity_dp);
             optimal_equity = should_double ? best_double : equity_nd;
+
+            // Money-game SE is already in equity-per-basis-cube units.
+            equity_nd_se = static_cast<float>(cfr.nd_se);
+            equity_dt_se = static_cast<float>(cfr.dt_se);
         }
 
         // Determine is_beaver for non-money path (always false for match play)
@@ -2950,9 +3009,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         result["cubeless_equity"] = cl_eq;
         result["cubeless_se"] = cl_se;
         result["equity_nd"] = equity_nd;
-        result["equity_nd_se"] = cfr.nd_se;
+        result["equity_nd_se"] = equity_nd_se;
         result["equity_dt"] = equity_dt;
-        result["equity_dt_se"] = cfr.dt_se;
+        result["equity_dt_se"] = equity_dt_se;
         result["equity_dp"] = equity_dp;
         result["should_double"] = should_double;
         result["should_take"] = should_take;
