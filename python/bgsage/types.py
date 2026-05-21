@@ -41,6 +41,21 @@ class Probabilities:
     gammon_loss: float      # P(gammon or backgammon loss)
     backgammon_loss: float  # P(backgammon loss only)
 
+    def __post_init__(self) -> None:
+        # NN outputs and rollout estimates can produce slightly inconsistent
+        # nested probabilities (e.g. P(gammon_win) marginally above P(win))
+        # due to estimation noise. Clamp so downstream callers always see
+        # backgammon ≤ gammon ≤ (win or 1-win).
+        if self.gammon_win > self.win:
+            self.gammon_win = self.win
+        if self.backgammon_win > self.gammon_win:
+            self.backgammon_win = self.gammon_win
+        loss = 1.0 - self.win
+        if self.gammon_loss > loss:
+            self.gammon_loss = loss
+        if self.backgammon_loss > self.gammon_loss:
+            self.backgammon_loss = self.gammon_loss
+
     def to_list(self) -> list[float]:
         return [self.win, self.gammon_win, self.backgammon_win,
                 self.gammon_loss, self.backgammon_loss]
@@ -48,6 +63,25 @@ class Probabilities:
     @classmethod
     def from_list(cls, probs: list[float]) -> Probabilities:
         return cls(*probs[:5])
+
+    @staticmethod
+    def clamp_list(probs: list[float]) -> list[float]:
+        """Return a new 5-element list with the nested-probability invariants enforced.
+
+        Same logic as :meth:`__post_init__`, but operates on a raw list for
+        callers that haven't wrapped their probs in a :class:`Probabilities`.
+        """
+        win, gw, bw, gl, bl = probs[:5]
+        if gw > win:
+            gw = win
+        if bw > gw:
+            bw = gw
+        loss = 1.0 - win
+        if gl > loss:
+            gl = loss
+        if bl > gl:
+            bl = gl
+        return [win, gw, bw, gl, bl]
 
     @property
     def equity(self) -> float:

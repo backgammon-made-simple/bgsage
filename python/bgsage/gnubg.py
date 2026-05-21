@@ -350,8 +350,10 @@ def post_move_analytics(checkers, n_plies=0, timeout=60, jacoby=True):
 
     mover_eq = -opp_result['equity_cubeless']
 
+    probs = Probabilities.clamp_list(
+        [mover_p_win, mover_p_gw, mover_p_bw, mover_p_gl, mover_p_bl])
     return {
-        'probs': [mover_p_win, mover_p_gw, mover_p_bw, mover_p_gl, mover_p_bl],
+        'probs': probs,
         'equity': mover_eq,
     }
 
