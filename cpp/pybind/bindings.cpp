@@ -1971,37 +1971,25 @@ PYBIND11_MODULE(bgbot_cpp, m) {
 
             const auto& cl = cpr.cubeless;
             py::dict result;
-            // Cubeless (same as evaluate_board)
+            // Cubeless from the same rollout (post-move probs/equity in
+            // SP's perspective — cubeful_rollout_position has already
+            // inverted from opp's pre-roll perspective).
             result["probs"] = cl.mean_probs;
             result["equity"] = cl.equity;
             result["std_error"] = cl.std_error;
             result["prob_std_errors"] = cl.prob_std_errors;
             result["scalar_vr_equity"] = cl.scalar_vr_equity;
             result["scalar_vr_se"] = cl.scalar_vr_se;
-            // Cubeful (rollout-native, VR-adjusted). For match play,
-            // run_trial_unified stores per-trial cubeful values in MWC space
-            // (terminal/D-P paths set sp_val from cubeless_mwc/dp_mwc; the
-            // N-ply truncation path calls eq2mwc). The aggregated
-            // cpr.cubeful_equity is therefore MWC for match play and must be
-            // converted to equity here to match the N-ply path
-            // (cube.cpp:1494 cubeful_equity_nply applies the same mwc2eq).
-            // Money games are already in basis-cube equity units.
-            float cf_eq = static_cast<float>(cpr.cubeful_equity);
-            float cf_se = static_cast<float>(cpr.cubeful_se);
-            if (!ci.is_money()) {
-                float mean_mwc = cf_eq;
-                cf_eq = mwc2eq(mean_mwc, ci.match.away1, ci.match.away2,
-                               ci.cube_value, ci.match.is_crawford);
-                cf_se = mwc_se_to_eq_se(cf_se, mean_mwc,
-                                        ci.match.away1, ci.match.away2,
-                                        ci.cube_value, ci.match.is_crawford);
-            }
-            result["cubeful_equity"] = cf_eq;
-            result["cubeful_se"] = cf_se;
+            // Cubeful equity in basis-cube equity units (already converted
+            // from MWC for match play inside cubeful_rollout_position).
+            result["cubeful_equity"] = static_cast<float>(cpr.cubeful_equity);
+            result["cubeful_se"] = static_cast<float>(cpr.cubeful_se);
             return result;
-        }, "Evaluate post-move board via rollout with rollout-native cubeful equity. "
-           "Returns cubeless probs/equity AND cubeful_equity/cubeful_se from a "
-           "single set of trials (single-branch cubeful VR rollout).",
+        }, "Rollout-level cubeful equity of a post-move position, including "
+           "the opponent's optimal cube action at the start of their turn. "
+           "Mirrors the multi-ply cubeful_equity_nply(opp_perspective) pattern "
+           "so checker_play and cube_action stay consistent at the same "
+           "eval level. Returns cubeless probs/equity from the same trials.",
            py::arg("board"), py::arg("pre_move_board"),
            py::arg("cube_value") = 1,
            py::arg("owner"),

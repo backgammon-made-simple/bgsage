@@ -1966,208 +1966,138 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
     return result;
 }
 
-// ======================== Cubeful Position Rollout (single-branch) =========
+// ======================== Cubeful Position Rollout (post-move) =============
 //
-// Like cubeful_cube_decision but for a post-move board with a single cube
-// state. Used by checker play to compute VR-adjusted cubeful equity natively
-// during trials (rather than bolting on N-ply cubeful afterwards on the
-// rollout's cubeless probs).
+// Returns the rollout-level cubeful equity of a post-move position, including
+// the opponent's optimal cube action at the start of their turn. Used by the
+// checker-play analyzer to score candidate moves consistently with the
+// cube-action analyzer at the same eval level (checker_play_cubeful(M) ==
+// -cube_action_optimal_equity(opp_perspective_after_M)).
 //
-// VR math is identical to the per-branch cubeful VR already implemented in
-// run_trial_unified: per-move 1-ply Janowski VR mean + actual in basis-cube
-// SP-perspective units, accumulated across the trial, subtracted from the
-// terminal/truncation/DP value.
+// Implemented as a thin wrapper that flips perspective and delegates to
+// cubeful_cube_decision, then collapses ND/DT/DP into opp's optimal action
+// (the same logic the cube_decision pybind binding uses). All rollout work
+// happens in cubeful_cube_decision; this function only does perspective
+// inversion and the cube-action collapse.
+
+namespace {
+// Scale a standard error in MWC space to equity space by the local slope of
+// mwc2eq around mean_mwc. mwc2eq is piecewise linear, so a small numerical
+// derivative is exact within the active segment.
+inline float mwc_se_to_eq_se(float mwc_se, float mean_mwc,
+                             int away1, int away2, int cube_value,
+                             bool is_crawford) {
+    float eps = std::max(1e-3f, mwc_se);
+    float eq_plus = mwc2eq(mean_mwc + eps, away1, away2, cube_value, is_crawford);
+    float eq_minus = mwc2eq(mean_mwc - eps, away1, away2, cube_value, is_crawford);
+    float slope = (eq_plus - eq_minus) / (2.0f * eps);
+    return std::abs(slope) * mwc_se;
+}
+} // namespace
 
 RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position(
     const Board& post_move_board,
     const CubeInfo& cube,
     RolloutProgressCallback progress) const
 {
-    rollout_profile::reset();
+    // Cubeful equity of a post-move position must include the opponent's
+    // optimal cube action at the start of their turn — otherwise moves that
+    // leave a drop position are scored as if the opponent will not double.
+    // This is the rollout analog of cubeful_equity_nply on the flipped opp
+    // position used by the multi-ply checker-play path.
+    //
+    // Implementation: delegate to cubeful_cube_decision on the opp-perspective
+    // board, then collapse ND/DT/DP into opp's optimal cube action using the
+    // same min-of-double-vs-no-double rule the cube_decision binding applies.
+    // SP's cubeful equity is -opp_optimal (perspective flip); cubeless probs
+    // come from the same trials, inverted to SP's perspective.
 
-    // Clear thread-local N-ply cache (same rationale as run_trials_parallel).
-    MultiPlyStrategy::get_cache().clear();
-
-    const int n_trials = config_.n_trials;
-    const int max_moves = (config_.truncation_depth > 0)
-        ? config_.truncation_depth + 10 : 200;
-
-    // Ensure stratified dice are generated
-    if (cached_dice_.empty() || cached_max_moves_ != max_moves) {
-        cached_dice_.clear();
-        cached_max_moves_ = max_moves;
-        generate_stratified_dice(n_trials, max_moves, config_.seed, cached_dice_);
+    // Flip board and cube to opp's perspective. Cube ownership flips because
+    // "owner" is relative to the player on roll; in match play the away-score
+    // pair also swaps.
+    Board opp_board = flip(post_move_board);
+    CubeInfo opp_cube = cube;
+    opp_cube.owner = flip_owner(opp_cube.owner);
+    if (!opp_cube.is_money()) {
+        std::swap(opp_cube.match.away1, opp_cube.match.away2);
     }
-    const auto& all_dice = cached_dice_;
 
-    // Single branch template. `cube` is from the post-move mover's (SP's)
-    // perspective; run_trial_unified's start_post_move=true entry block flips
-    // the cube to opp's perspective at trial start (since the board itself is
-    // flipped to opp's perspective). basis_cube preserves the input cube value
-    // so all per-trial equities are in basis-cube units.
-    CubefulBranch tmpl{};
-    tmpl.cube = cube;
-    tmpl.basis_cube = cube.cube_value;
+    // Run the two-branch (ND/DT) cube decision rollout from opp's perspective.
+    CubefulRolloutResult cfr = cubeful_cube_decision(opp_board, opp_cube, progress);
 
-    // Per-trial results
-    struct CubefulTrialResult {
-        double cubeful_equity;
-        TrialResult cubeless;
-    };
-    std::vector<CubefulTrialResult> trial_results(n_trials);
+    // Compute opp's optimal cube action equity. Mirrors the logic in the
+    // pybind cube_decision binding so callers see identical optimal_equity
+    // values from cubeful_evaluate_board and cube_decision on the same board.
+    float optimal_equity;
+    double opt_se;
+    bool should_double, should_take;
+    if (opp_cube.is_money()) {
+        float equity_nd = static_cast<float>(cfr.nd_equity);
+        float actual_dt = static_cast<float>(cfr.dt_equity);
+        float equity_dp = 1.0f;
+        float equity_dt = (opp_cube.beaver && actual_dt < 0.0f)
+            ? 2.0f * actual_dt  // Double/Beaver
+            : actual_dt;
+        float best_double = std::min(equity_dt, equity_dp);
+        should_double = (best_double > equity_nd);
+        should_take = (equity_dt <= equity_dp);
+        optimal_equity = should_double ? best_double : equity_nd;
 
-    int n_threads = rollout_thread_count(n_trials);
-
-    Move0Cache move0_cache;
-    Move1Cache move1_cache;
-    const bool uses_move1_cache =
-        (config_.truncation_depth == 0) || (config_.truncation_depth > 1);
-
-    // For start_post_move=true, run_trial_unified flips the board internally.
-    // The move0/move1 caches are keyed off the *flipped* (post-flip) board, so
-    // we prefill them on flip(post_move_board) — same convention as the
-    // cubeless run_trials_parallel path.
-    const Board prefill_board = flip(post_move_board);
-
-    const int report_interval = progress ? std::max(1, n_trials / 100) : 0;
-
-    if (n_threads == 1) {
-        prefill_move0_cache(prefill_board, move0_cache, 1, nullptr);
-        if (uses_move1_cache) {
-            for (int i = 0; i < Move0Cache::N_ROLLS; ++i) {
-                populate_move1_cache_entry(move0_cache, i, move1_cache.entries[i]);
-                move1_cache.state[i].store(2, std::memory_order_release);
-            }
-        }
-        for (int t = 0; t < n_trials; ++t) {
-            CubefulBranch branches[1] = {tmpl};
-            trial_results[t].cubeless = run_trial_unified(
-                post_move_board, /*start_post_move=*/true,
-                branches, 1, all_dice[t].data(), max_moves,
-                &move0_cache, &move1_cache);
-            trial_results[t].cubeful_equity = branches[0].final_equity;
-            if (report_interval && ((t + 1) % report_interval == 0 || t + 1 == n_trials)) {
-                progress(t + 1, n_trials);
-            }
+        // SE of the chosen optimal action. DP equity is exactly +1.0 in money
+        // (no rollout variance), so D/P contributes zero SE.
+        if (should_double && !should_take) {
+            opt_se = 0.0;
+        } else if (should_double) {
+            opt_se = cfr.dt_se;
+        } else {
+            opt_se = cfr.nd_se;
         }
     } else {
-        if (!shared_pos_cache_) {
-            shared_pos_cache_ = std::make_unique<SharedPosCache>();
+        // Match play: work in MWC, convert to equity at the end.
+        int a1 = opp_cube.match.away1, a2 = opp_cube.match.away2;
+        int cv = opp_cube.cube_value;
+        bool craw = opp_cube.match.is_crawford;
+        float nd_m = static_cast<float>(cfr.nd_equity);
+        float dt_m = static_cast<float>(cfr.dt_equity);
+        float dp_m = dp_mwc(a1, a2, cv, craw);
+
+        bool auto_double = (!craw && a1 > 1 && a2 == 1);
+        float best_mwc = std::min(dt_m, dp_m);
+        should_double = auto_double || (best_mwc > nd_m);
+        should_take = (dt_m <= dp_m);
+        float optimal_mwc = should_double ? best_mwc : nd_m;
+        optimal_equity = mwc2eq(optimal_mwc, a1, a2, cv, craw);
+
+        float opt_mwc_se;
+        if (should_double && !should_take) {
+            opt_mwc_se = 0.0f;
+        } else if (should_double) {
+            opt_mwc_se = static_cast<float>(cfr.dt_se);
+        } else {
+            opt_mwc_se = static_cast<float>(cfr.nd_se);
         }
-        if (shared_pos_cache_->inserts.load(std::memory_order_relaxed) >=
-            (SharedPosCache::CAPACITY * 3) / 4) {
-            shared_pos_cache_->clear();
-        }
-        SharedPosCache* shared_cache = shared_pos_cache_.get();
-        std::atomic<int> next_roll{0};
-        std::atomic<int> next_trial{0};
-        std::atomic<int> completed_trials{0};
-
-        const Strategy* m0_strat = checker_strat_.get();
-
-        multipy_parallel_run(n_threads, [&]() {
-            MultiPlyStrategy::get_cache().clear();
-            MultiPlyStrategy::set_shared_cache(shared_cache);
-
-            // Combined move0 + move1 prefill per roll (work-stealing)
-            int r;
-            while ((r = next_roll.fetch_add(1, std::memory_order_relaxed)) < 21) {
-                thread_local std::vector<Board> candidates;
-                candidates.clear();
-                const auto& roll = ALL_ROLLS[r];
-                possible_boards(prefill_board, roll.d1, roll.d2, candidates);
-                Board chosen;
-                if (candidates.empty()) {
-                    chosen = prefill_board;
-                } else if (candidates.size() == 1) {
-                    chosen = candidates[0];
-                } else {
-                    chosen = candidates[m0_strat->best_move_index(
-                        candidates, prefill_board)];
-                }
-                move0_cache.chosen[r] = chosen;
-                move0_cache.state[r].store(2, std::memory_order_release);
-
-                if (uses_move1_cache) {
-                    populate_move1_cache_entry(move0_cache, r, move1_cache.entries[r]);
-                    move1_cache.state[r].store(2, std::memory_order_release);
-                }
-            }
-
-            // Trials (work-stealing)
-            int start;
-            while ((start = next_trial.fetch_add(kTrialChunkSize, std::memory_order_relaxed))
-                   < n_trials) {
-                if (config_.cancel_flag &&
-                    config_.cancel_flag->load(std::memory_order_relaxed)) {
-                    break;
-                }
-                int end = std::min(start + kTrialChunkSize, n_trials);
-                for (int t = start; t < end; ++t) {
-                    CubefulBranch branches[1] = {tmpl};
-                    trial_results[t].cubeless = run_trial_unified(
-                        post_move_board, /*start_post_move=*/true,
-                        branches, 1, all_dice[t].data(), max_moves,
-                        &move0_cache, &move1_cache);
-                    trial_results[t].cubeful_equity = branches[0].final_equity;
-                }
-                if (report_interval) {
-                    int done = completed_trials.fetch_add(end - start, std::memory_order_relaxed) + (end - start);
-                    if (done % report_interval < kTrialChunkSize || done >= n_trials) {
-                        progress(std::min(done, n_trials), n_trials);
-                    }
-                }
-            }
-
-            MultiPlyStrategy::set_shared_cache(nullptr);
-        });
-
-        if (is_cancelled()) {
-            throw RolloutCancelled();
-        }
+        opt_se = mwc_se_to_eq_se(opt_mwc_se, optimal_mwc, a1, a2, cv, craw);
     }
 
-    // Aggregate
-    double sum_cf = 0, sum_cf_sq = 0;
-    std::array<double, NUM_OUTPUTS> sum_probs = {0,0,0,0,0};
-    std::array<double, NUM_OUTPUTS> sum_probs_sq = {0,0,0,0,0};
-    double sum_cl_eq = 0, sum_cl_eq_sq = 0;
-
-    for (int t = 0; t < n_trials; ++t) {
-        double cf = trial_results[t].cubeful_equity;
-        sum_cf += cf;
-        sum_cf_sq += cf * cf;
-        for (int k = 0; k < NUM_OUTPUTS; ++k) {
-            double v = trial_results[t].cubeless.probs[k];
-            sum_probs[k] += v;
-            sum_probs_sq[k] += v * v;
-        }
-        double eq = trial_results[t].cubeless.equity;
-        sum_cl_eq += eq;
-        sum_cl_eq_sq += eq * eq;
-    }
-
+    // Assemble result: SP's cubeful is -opp_optimal; cubeless probs invert.
     CubefulPositionResult result;
-    result.cubeful_equity = sum_cf / n_trials;
-    double var_cf = (sum_cf_sq / n_trials) - (result.cubeful_equity * result.cubeful_equity);
-    if (var_cf < 0) var_cf = 0;
-    result.cubeful_se = std::sqrt(var_cf / n_trials);
+    result.cubeful_equity = -static_cast<double>(optimal_equity);
+    result.cubeful_se = opt_se;
 
-    for (int k = 0; k < NUM_OUTPUTS; ++k) {
-        result.cubeless.mean_probs[k] = static_cast<float>(sum_probs[k] / n_trials);
-        double mean_k = sum_probs[k] / n_trials;
-        double var_k = (sum_probs_sq[k] / n_trials) - (mean_k * mean_k);
-        if (var_k < 0) var_k = 0;
-        result.cubeless.prob_std_errors[k] = static_cast<float>(std::sqrt(var_k / n_trials));
-    }
-    result.cubeless.equity = sum_cl_eq / n_trials;
-    double var_cl = (sum_cl_eq_sq / n_trials) - (result.cubeless.equity * result.cubeless.equity);
-    if (var_cl < 0) var_cl = 0;
-    result.cubeless.std_error = std::sqrt(var_cl / n_trials);
-    result.cubeless.scalar_vr_equity = result.cubeless.equity;
-    result.cubeless.scalar_vr_se = result.cubeless.std_error;
+    // invert_probs swaps gammon/backgammon indices 1<->3, 2<->4 and reflects
+    // P(win); the per-prob SEs use the same swap (var(1-X)=var(X) so index 0
+    // SE is unchanged).
+    result.cubeless.mean_probs = invert_probs(cfr.cubeless.mean_probs);
+    result.cubeless.prob_std_errors[0] = cfr.cubeless.prob_std_errors[0];
+    result.cubeless.prob_std_errors[1] = cfr.cubeless.prob_std_errors[3];
+    result.cubeless.prob_std_errors[2] = cfr.cubeless.prob_std_errors[4];
+    result.cubeless.prob_std_errors[3] = cfr.cubeless.prob_std_errors[1];
+    result.cubeless.prob_std_errors[4] = cfr.cubeless.prob_std_errors[2];
+    result.cubeless.equity = -cfr.cubeless.equity;
+    result.cubeless.std_error = cfr.cubeless.std_error;
+    result.cubeless.scalar_vr_equity = -cfr.cubeless.scalar_vr_equity;
+    result.cubeless.scalar_vr_se = cfr.cubeless.scalar_vr_se;
 
-    rollout_profile::print();
     return result;
 }
 

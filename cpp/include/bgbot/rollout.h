@@ -173,25 +173,23 @@ public:
         RolloutResult cubeless;         // Cubeless probs/equity from same trials
     };
 
-    // Cubeful rollout for a post-move position (single-branch). Used to
-    // evaluate checker play candidates with VR-adjusted cubeful equity that
-    // correctly accounts for cube actions during trial games.
+    // Rollout-level cubeful equity of a post-move position, INCLUDING the
+    // opponent's optimal cube action at the start of their turn. Used by the
+    // checker-play analyzer; mirrors the multi-ply pattern
+    // cubeful_equity_nply(opp_perspective) so that
+    //   checker_play_cubeful_equity(move M) ==
+    //     -cube_action_optimal_equity(opp_perspective_after_M)
+    // at the same eval level.
     //
-    // `post_move_board` is from the perspective of the player who just moved
-    // (i.e. the position right before the opponent rolls). `cube` is from the
-    // same perspective. The returned cubeful_equity is in basis-cube units
-    // (divide actual points by `cube.cube_value` to get the per-cube-1 value).
+    // `post_move_board` is from the just-moved player's (SP's) perspective.
+    // `cube` is also from SP's perspective. The returned cubeful_equity is in
+    // basis-cube units (i.e. per `cube.cube_value`).
     //
-    // Internally, this runs the same trial loop as `cubeful_cube_decision`
-    // with `n_branches = 1` and `start_post_move = true`. VR luck is tracked
-    // per-trial in basis-cube space (using cl2cf at 1-ply for the VR mean and
-    // actual). Cube decisions during trials use the configured cube_eval_config
-    // (1-ply Janowski / N-ply cubeful / inner truncated rollout). At trial end
-    // (terminal, D/P, or truncation), the per-trial cubeful value is
-    // VR-corrected and aggregated.
-    //
-    // Cubeless probs/equity from the same trial games are also returned, so
-    // the caller does not need a separate rollout.
+    // Implementation is a thin wrapper around `cubeful_cube_decision` on the
+    // flipped (opponent's perspective) position: the opp's ND/DT/DP options
+    // are collapsed into the optimal cube action using the same rule the
+    // cube_decision pybind binding applies, then sign-flipped back to SP.
+    // Cubeless probs from the same trials are inverted to SP's perspective.
     CubefulPositionResult cubeful_rollout_position(
         const Board& post_move_board,
         const CubeInfo& cube,

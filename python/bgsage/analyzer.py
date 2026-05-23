@@ -442,11 +442,14 @@ class _RolloutAnalyzer(_CubelessBase):
         n_trials = self._rollout_config["n_trials"]
         results = []
         total_moves = len(survivors)
-        # When cube info is available, use cubeful_evaluate_board so the
-        # rollout produces a VR-adjusted cubeful equity natively from its
-        # trial paths (rather than bolting on cubeful_equity_nply afterwards
-        # on top of the rollout's cubeless probs). Cubeful and cubeless are
-        # computed from the same trial games.
+        # When cube info is present, use cubeful_evaluate_board: the C++
+        # function returns rollout-level cubeful equity that already
+        # incorporates the opponent's optimal cube action at the start of
+        # their turn (it delegates to cubeful_cube_decision on the flipped
+        # opp position and collapses ND/DT/DP into opp's optimal). Cubeless
+        # probs/equity come from the same trials, already inverted to SP's
+        # perspective at the post-move board `b`. No perspective fiddling
+        # needed at the python layer.
         owner = resolve_owner(cube_owner) if cube_owner else None
         use_cubeful_rollout = owner is not None
         for i, (feq, cleq, b, p0) in enumerate(survivors):
@@ -489,8 +492,9 @@ class _RolloutAnalyzer(_CubelessBase):
                 "eval_level": "Rollout",
             }
             if use_cubeful_rollout:
-                # Stash the rollout-native cubeful so _CubefulAnalyzer can use
-                # it directly instead of recomputing via cubeful_equity_nply.
+                # cubeful_evaluate_board returns rollout-level cubeful that
+                # already accounts for opp's optimal cube action — store it
+                # so _CubefulAnalyzer uses it directly instead of recomputing.
                 entry["rollout_cubeful_equity"] = r["cubeful_equity"]
                 entry["rollout_cubeful_se"] = r["cubeful_se"]
             results.append(entry)
@@ -625,11 +629,13 @@ class _CubefulAnalyzer:
             return results
 
         if is_rollout:
-            # Rollout path: prefer the rollout's VR-adjusted cubeful equity
-            # (computed natively from trial paths) when the rollout supplied
-            # one. Falls back to N-ply / Janowski cubeful only if the inner
-            # analyzer didn't supply rollout_cubeful_equity (e.g. when no cube
-            # info was passed through).
+            # Rollout path: survivors carry rollout-level cubeful equity from
+            # cube_decision (set in _RolloutAnalyzer.checker_play_analytics).
+            # Non-survivors fall back to N-ply cubeful_equity_nply at the
+            # rollout's decision_ply — faster than running cube_decision per
+            # candidate, but at a lower ply than the rollout itself, so the
+            # cubeful values may disagree with the rollout-level cube action
+            # (e.g. 3-ply says D/T where 3T says D/P).
             for m in results:
                 cubeless_eq = m["equity"]
                 if "rollout_cubeful_equity" in m:
@@ -644,6 +650,44 @@ class _CubefulAnalyzer:
                 m["equity"] = cf_eq
 
             results.sort(key=lambda x: -x["equity"])
+
+            # Promote non-rollout entries that rank above any rollout entry,
+            # so the top of the displayed list is at rollout-level cubeful and
+            # the symmetry checker_play.best.cubeful == -cube_action.optimal
+            # holds (required for parity with the multi-ply path that uses
+            # cubeful_equity_nply uniformly across survivors and non-survivors).
+            # Pathological positions where many candidates flip cube action
+            # between decision_ply and rollout-level can trigger many extra
+            # rollouts here — that's the cost of getting the displayed best
+            # right at the rollout level.
+            inner_ro = inner  # _RolloutAnalyzer
+            while (results and "rollout_cubeful_equity" not in results[0]):
+                m = results[0]
+                try:
+                    pr = inner_ro._rollout_strategy.cubeful_evaluate_board(
+                        m["board"], m["board"],
+                        cube_value=cube_value, owner=owner,
+                        away1=away1, away2=away2, is_crawford=is_crawford,
+                        jacoby=jacoby, beaver=beaver,
+                    )
+                except bgbot_cpp.RolloutCancelled:
+                    raise RolloutCancelled()
+                probs = list(pr["probs"])
+                if inner_ro._bearoff_db is not None and \
+                        inner_ro._bearoff_db.is_bearoff(m["board"]):
+                    probs = inner_ro._bearoff_db.lookup_probs(
+                        m["board"], post_move=True)
+                m["probs"] = probs
+                m["prob_std_errors"] = list(pr.get("prob_std_errors", [0] * 5))
+                m["cubeless_equity"] = pr["equity"]
+                m["std_error"] = pr.get("std_error") or 0
+                m["equity"] = pr["cubeful_equity"]
+                m["rollout_cubeful_equity"] = pr["cubeful_equity"]
+                m["rollout_cubeful_se"] = pr["cubeful_se"]
+                m["eval_level"] = "Rollout"
+                m.pop("is_1ply_only", None)
+                results.sort(key=lambda x: -x["equity"])
+
             if results:
                 best = results[0]["equity"]
                 for r in results:
