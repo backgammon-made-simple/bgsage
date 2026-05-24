@@ -171,6 +171,23 @@ public:
     int best_move_index(const std::vector<Board>& candidates,
                         const Board& pre_move_board) const override;
 
+    // Cube-aware overrides. When all candidates are bearoff positions, use
+    // exact DB probs and apply cl2cf per cube directly (no NN call). Otherwise
+    // delegate to the wrapped base strategy's cubeful selection.
+    int best_move_index_cubeful(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo& ci,
+        float cube_x) const override;
+
+    void best_move_index_cubeful_multi(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo* cubes,
+        int n_cubes,
+        float cube_x,
+        int* out_indices) const override;
+
     const Strategy& base() const { return *base_; }
     const BearoffDB& db() const { return *db_; }
 

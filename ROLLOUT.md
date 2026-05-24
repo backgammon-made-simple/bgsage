@@ -645,6 +645,32 @@ For each half-move, the move selection strategy is chosen (first match wins):
 2. **Late** (move_num >= `late_threshold`): `checker_late_strat_`.
 3. **Normal**: `checker_strat_`.
 
+### Cube-Aware Selection (`cubeful_trial_moves`)
+
+When `RolloutConfig.cubeful_trial_moves` is true AND the trial has at least
+one active cube branch, the selected strategy's `best_move_index_cubeful_multi`
+is called instead of `best_move_index`. The chosen move is the candidate
+that maximizes CUBEFUL equity (cl2cf) against the active branches' cube
+states, rather than cubeless equity.
+
+- **Single branch** (`cubeful_rollout_position`, used by checker-play
+  analytics): the chosen move is optimal for that branch's cube state.
+  Fully correct.
+- **Two branches** (`cubeful_cube_decision`: ND + DT): the BMI call returns
+  per-branch best indices, but the shared trial board currently uses
+  branches[0]'s pick (an Option B approximation). Per-branch board evolution
+  (Option A) is documented in [CUBEFUL_TRIALS_PLAN.md](CUBEFUL_TRIALS_PLAN.md) §6
+  as a follow-up extension.
+
+When `cubeful_trial_moves` is on, the move0 / move1 caches' `chosen[]` entries
+and the VR best_candidate_idx reuse are bypassed at the actual move-selection
+site (they store cubeless-best moves). Move1Cache's `mover_probs` and
+`roll_best_probs` are still used for cube decisions and VR mean (cube-state-
+independent computations).
+
+Default is false to preserve byte-identical existing behavior for all existing
+benchmarks and cached analytics.
+
 ### Strategy Construction
 
 Strategies are built from `TrialEvalConfig` at `RolloutStrategy` construction:
@@ -1164,6 +1190,7 @@ contamination.
 | `checker_late` | unset | TrialEvalConfig: late-game checker play override |
 | `cube` | unset | TrialEvalConfig: cube decision strategy override |
 | `cube_late` | unset | TrialEvalConfig: late-game cube decision override |
+| `cubeful_trial_moves` | false | When true, trial-level checker moves are picked by cubeful equity (cl2cf) against the branch cube state. See §8 "Cube-Aware Selection". |
 | `cancel_flag` | null | Atomic bool for rollout cancellation |
 
 ### TrialEvalConfig Fields

@@ -1858,7 +1858,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         .def_readwrite("filter", &RolloutConfig::filter)
         .def_readwrite("n_threads", &RolloutConfig::n_threads)
         .def_readwrite("seed", &RolloutConfig::seed)
-        .def_readwrite("ultra_late_threshold", &RolloutConfig::ultra_late_threshold);
+        .def_readwrite("ultra_late_threshold", &RolloutConfig::ultra_late_threshold)
+        .def_readwrite("cubeful_trial_moves", &RolloutConfig::cubeful_trial_moves);
 
     // TrialEvalConfig: per-purpose evaluation config for rollout trials
     py::class_<TrialEvalConfig>(m, "TrialEvalConfig")
@@ -5121,7 +5122,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                                               const TrialEvalConfig& checker_late,
                                               const TrialEvalConfig& cube,
                                               const TrialEvalConfig& cube_late,
-                                              int ultra_late_threshold) {
+                                              int ultra_late_threshold,
+                                              bool cubeful_trial_moves) {
         auto base = make_strategy_from_type(strategy_type, weight_paths, hidden_sizes);
         RolloutConfig rc;
         rc.n_trials = n_trials;
@@ -5139,6 +5141,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         rc.cube = cube;
         rc.cube_late = cube_late;
         rc.ultra_late_threshold = ultra_late_threshold;
+        rc.cubeful_trial_moves = cubeful_trial_moves;
         return std::make_shared<RolloutStrategy>(base, rc);
     }, "Create RolloutStrategy from any base strategy type",
        py::arg("strategy_type"),
@@ -5159,7 +5162,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("checker_late") = TrialEvalConfig{},
        py::arg("cube") = TrialEvalConfig{},
        py::arg("cube_late") = TrialEvalConfig{},
-       py::arg("ultra_late_threshold") = 2);
+       py::arg("ultra_late_threshold") = 2,
+       py::arg("cubeful_trial_moves") = false);
 
     // --- Unified cubeful_equity_nply (accepts any Strategy via shared_ptr) ---
     m.def("cubeful_equity_nply", [](const std::vector<int>& board_vec,

@@ -2,11 +2,14 @@
 // Copyright (C) 2026 Mark Higgins
 #include "bgbot/bearoff.h"
 #include "bgbot/board.h"
+#include "bgbot/cube.h"        // for cl2cf (cube-aware BearoffStrategy)
 #include "bgbot/moves.h"
 #include "bgbot/neural_net.h"
 #include <fstream>
 #include <algorithm>
+#include <limits>
 #include <numeric>
+#include <vector>
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
@@ -834,6 +837,62 @@ int BearoffStrategy::best_move_index(const std::vector<Board>& candidates,
     }
 
     return base_->best_move_index(candidates, pre_move_board);
+}
+
+// ----- Cube-aware overrides -----
+
+int BearoffStrategy::best_move_index_cubeful(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo& ci,
+    float cube_x) const
+{
+    int out = 0;
+    best_move_index_cubeful_multi(candidates, pre_move_board, &ci, 1, cube_x, &out);
+    return out;
+}
+
+void BearoffStrategy::best_move_index_cubeful_multi(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo* cubes,
+    int n_cubes,
+    float cube_x,
+    int* out_indices) const
+{
+    if (candidates.empty()) return;
+
+    bool all_bearoff = true;
+    for (const auto& c : candidates) {
+        if (!db_->is_bearoff(c)) { all_bearoff = false; break; }
+    }
+
+    if (!all_bearoff) {
+        base_->best_move_index_cubeful_multi(candidates, pre_move_board,
+                                              cubes, n_cubes, cube_x, out_indices);
+        return;
+    }
+
+    // All bearoff: look up exact probs once per candidate, then loop cl2cf
+    // per cube state. No NN call needed.
+    const int n = static_cast<int>(candidates.size());
+    std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
+    for (int i = 0; i < n; ++i) {
+        probs_per[i] = db_->lookup_probs(candidates[i], /*post_move=*/true);
+    }
+
+    for (int c = 0; c < n_cubes; ++c) {
+        int best_idx = 0;
+        float best_cf = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n; ++i) {
+            float cf = cl2cf(probs_per[i], cubes[c], cube_x);
+            if (cf > best_cf) {
+                best_cf = cf;
+                best_idx = i;
+            }
+        }
+        out_indices[c] = best_idx;
+    }
 }
 
 } // namespace bgbot

@@ -61,6 +61,16 @@ struct RolloutConfig {
     int late_threshold = 20;     // Half-move index where we switch to late strategies
     int ultra_late_threshold = 2; // Half-move where checker/cube drop to 1-ply (set high to disable)
 
+    // When true, trial-level checker move selection uses CUBEFUL equity
+    // (cl2cf) against the branch's current cube state instead of cubeless
+    // equity. Default false (existing behavior). When on with a single active
+    // cube branch (e.g. cubeful_rollout_position), the chosen move maximizes
+    // cubeful equity for that branch's cube. With multiple branches
+    // (cubeful_cube_decision: ND + DT), the ND branch's cube state currently
+    // drives selection and all branches share the chosen move — see
+    // CUBEFUL_TRIALS_PLAN.md §6 for the future per-branch-board extension.
+    bool cubeful_trial_moves = false;
+
     // Per-purpose evaluation overrides.
     // When is_set(), override the legacy decision_ply / late_ply defaults.
     // When unset: checker inherits decision_ply, cube inherits decision_ply.
@@ -140,6 +150,29 @@ public:
                         bool pre_move_is_race) const override;
     int best_move_index(const std::vector<Board>& candidates,
                         const Board& pre_move_board) const override;
+
+    // Cube-aware overrides: runs the cubeless 1-ply filter to narrow
+    // candidates, then evaluates each survivor with cubeful_rollout_position
+    // for each cube state. cube_x is unused — the inner cubeful rollouts
+    // compute their own per-leaf cube efficiency.
+    //
+    // NOTE: This is expensive (per-candidate per-cube cubeful rollout). The
+    // primary use case is when this RolloutStrategy is the trial-level checker
+    // strategy of an outer rollout (truncated-rollout-within-rollout), where
+    // n_trials is small (e.g. 42-360) and n_threads = 1.
+    int best_move_index_cubeful(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo& ci,
+        float cube_x) const override;
+
+    void best_move_index_cubeful_multi(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo* cubes,
+        int n_cubes,
+        float cube_x,
+        int* out_indices) const override;
 
     // Rollout a single post-move position.
     RolloutResult rollout_position(

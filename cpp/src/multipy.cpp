@@ -3,6 +3,7 @@
 #include "bgbot/multipy.h"
 #include "bgbot/bearoff.h"
 #include "bgbot/board.h"
+#include "bgbot/cube.h"       // for cubeful_equity_nply_multi (cubeful BMI)
 #include "bgbot/moves.h"
 #include "bgbot/encoding.h"
 #include <algorithm>
@@ -819,6 +820,135 @@ int MultiPlyStrategy::best_move_index_impl(
     }
 
     return best_idx;
+}
+
+// ========================== Cube-aware best_move_index ==========================
+//
+// Picks the best candidate(s) by CUBEFUL equity at full N-ply depth, against
+// one or more cube states. The strategy mirrors best_move_index_impl: run the
+// cubeless filter chain to narrow candidates (per decision §12 Q5: filter is
+// cubeless), then evaluate each survivor at N-ply CUBEFUL via
+// cubeful_equity_nply_multi (one call per survivor; that call shares its NN
+// tree across all cube states). For each cube state, return the survivor with
+// the highest cubeful equity.
+//
+// cube_x is unused at N-ply (each Janowski leaf computes its own cube
+// efficiency from its leaf board, which is the correct convention).
+
+void MultiPlyStrategy::best_move_index_cubeful_multi(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo* cubes,
+    int n_cubes,
+    float cube_x,
+    int* out_indices) const
+{
+    (void)cube_x;  // unused at N-ply; cubeful_equity_nply_multi handles leaves
+
+    const int n = static_cast<int>(candidates.size());
+    if (n == 0) return;
+    if (n == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = 0;
+        return;
+    }
+
+    // 1-ply shortcut: delegate to base strategy's cubeful selection (it knows
+    // how to batch evaluate + apply cl2cf per cube).
+    if (n_plies_ == 1) {
+        base_->best_move_index_cubeful_multi(candidates, pre_move_board,
+                                              cubes, n_cubes, cube_x, out_indices);
+        return;
+    }
+
+    // ----- Cubeless filter chain (identical to best_move_index_impl) -----
+    std::vector<int> survivors(n);
+    std::iota(survivors.begin(), survivors.end(), 0);
+    std::vector<double> equities(n);
+
+    for (const auto& step : filter_chain_) {
+        if (static_cast<int>(survivors.size()) <= 1) break;
+
+        if (step.ply == 1) {
+            Strategy* filter_s = filter_strat_ ? filter_strat_.get() : base_.get();
+            filter_s->batch_evaluate_candidates_equity(
+                candidates, pre_move_board, equities.data());
+        } else {
+            for (int idx : survivors) {
+                auto probs = evaluate_probs_nply_impl(
+                    candidates[idx], pre_move_board, step.ply, false);
+                equities[idx] = compute_equity(probs);
+            }
+        }
+
+        std::sort(survivors.begin(), survivors.end(),
+                  [&](int a, int b) { return equities[a] > equities[b]; });
+
+        double best_eq = equities[survivors[0]];
+        int keep = 0;
+        for (int idx : survivors) {
+            if (keep >= step.max_moves) break;
+            if (best_eq - equities[idx] > step.threshold) break;
+            ++keep;
+        }
+        if (keep < 1) keep = 1;
+        survivors.resize(keep);
+    }
+
+    if (survivors.size() == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = survivors[0];
+        return;
+    }
+
+    // ----- Final cubeful evaluation per survivor -----
+    const int n_surv = static_cast<int>(survivors.size());
+    // cf_equities[i][c] = cubeful equity of survivor i under cube state c
+    std::vector<std::vector<float>> cf_equities(n_surv, std::vector<float>(n_cubes));
+
+    auto eval_one = [&](int i) {
+        cubeful_equity_nply_multi(
+            candidates[survivors[i]], cubes, n_cubes,
+            *base_, n_plies_,
+            cf_equities[i].data(),
+            MoveFilters::TINY, 1,           // serial inside; trial-level parallelism is across trials
+            move_prefilter_ ? move_prefilter_.get() : nullptr,
+            /*fTop=*/false);
+    };
+
+    bool use_parallel = parallel_evaluate_ && n_plies_ > 2;
+    if (use_parallel) {
+        int n_threads = std::min<int>(parallel_thread_count(n_plies_), n_surv);
+        if (n_threads > 1) {
+            multipy_parallel_for(n_surv, n_threads, eval_one);
+        } else {
+            for (int i = 0; i < n_surv; ++i) eval_one(i);
+        }
+    } else {
+        for (int i = 0; i < n_surv; ++i) eval_one(i);
+    }
+
+    // For each cube state, pick the survivor with the highest cubeful equity.
+    for (int c = 0; c < n_cubes; ++c) {
+        float best_cf = -std::numeric_limits<float>::infinity();
+        int best_surv_i = 0;
+        for (int i = 0; i < n_surv; ++i) {
+            if (cf_equities[i][c] > best_cf) {
+                best_cf = cf_equities[i][c];
+                best_surv_i = i;
+            }
+        }
+        out_indices[c] = survivors[best_surv_i];
+    }
+}
+
+int MultiPlyStrategy::best_move_index_cubeful(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo& ci,
+    float cube_x) const
+{
+    int out = 0;
+    best_move_index_cubeful_multi(candidates, pre_move_board, &ci, 1, cube_x, &out);
+    return out;
 }
 
 int MultiPlyStrategy::best_move_index(const std::vector<Board>& candidates,

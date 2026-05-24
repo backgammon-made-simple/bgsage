@@ -346,6 +346,7 @@ class _RolloutAnalyzer(_CubelessBase):
         checker=None, checker_late=None,
         cube=None, cube_late=None,
         ultra_late_threshold=9999,
+        cubeful_trial_moves=False,
     ):
         super().__init__(weights)
         requested_threads = n_threads
@@ -388,6 +389,7 @@ class _RolloutAnalyzer(_CubelessBase):
             cube=cube_cfg,
             cube_late=cube_late_cfg,
             ultra_late_threshold=ultra_late_threshold,
+            cubeful_trial_moves=cubeful_trial_moves,
         )
 
     def cancel(self):
@@ -859,11 +861,17 @@ class BgBotAnalyzer:
         cube=None,
         cube_late=None,
         ultra_late_threshold: int = 9999,
+        cubeful_trial_moves: bool = False,
     ):
         if weights is None:
             weights = default_weights()
         self._weights = weights
         self._eval_level = eval_level
+        # Flag-gated cube-aware trial moves (CUBEFUL_TRIALS_PLAN.md). Default
+        # False keeps existing rollout behavior. When True, all rollout-based
+        # eval levels select trial moves by cubeful equity against the trial's
+        # cube state instead of cubeless equity.
+        self._cubeful_trial_moves = bool(cubeful_trial_moves)
 
         # Load bearoff database
         self._bearoff_db = None
@@ -891,6 +899,7 @@ class BgBotAnalyzer:
                 n_threads=parallel_threads,
                 seed=seed,
                 ultra_late_threshold=2,
+                cubeful_trial_moves=self._cubeful_trial_moves,
             )
         elif eval_level == "truncated2":
             inner = _RolloutAnalyzer(
@@ -903,6 +912,7 @@ class BgBotAnalyzer:
                 late_ply=1,
                 late_threshold=2,
                 ultra_late_threshold=2,
+                cubeful_trial_moves=self._cubeful_trial_moves,
             )
         elif eval_level == "truncated3":
             inner = _RolloutAnalyzer(
@@ -915,6 +925,7 @@ class BgBotAnalyzer:
                 late_ply=2,
                 late_threshold=2,
                 ultra_late_threshold=2,
+                cubeful_trial_moves=self._cubeful_trial_moves,
             )
         elif eval_level == "rollout":
             inner = _RolloutAnalyzer(
@@ -931,6 +942,7 @@ class BgBotAnalyzer:
                 cube=cube,
                 cube_late=cube_late,
                 ultra_late_threshold=ultra_late_threshold,
+                cubeful_trial_moves=self._cubeful_trial_moves,
             )
         else:
             raise ValueError(f"Unknown eval_level: {eval_level!r}")
@@ -1081,13 +1093,33 @@ class BgBotAnalyzer:
         if isinstance(inner, _CubefulAnalyzer):
             inner = inner._inner
 
-        # Evaluate the post-move board (NN outputs from mover's perspective)
+        # Evaluate the post-move board (NN outputs from mover's perspective).
+        # When the inner analyzer is a rollout AND cube-aware trial moves is
+        # enabled, route through cubeful_evaluate_board so the trial loop
+        # receives the cube state and selects moves by cubeful equity. The
+        # cubeless probs and cubeful equity both come from the same trials.
+        # Otherwise keep the cubeless-rollout + post-hoc Janowski path so
+        # existing behavior is byte-identical when the flag is off.
+        owner = resolve_owner(cube_owner)
+        use_cubeful_rollout = (
+            isinstance(inner, _RolloutAnalyzer)
+            and self._cubeful_trial_moves
+        )
+
         if isinstance(inner, _MultiPlyAnalyzer):
             r = inner._strategy_nply.evaluate_board(board, board)
             eval_level = f"{inner._n_plies}-ply"
             inner._strategy_nply.clear_cache()
         elif isinstance(inner, _RolloutAnalyzer):
-            r = inner._rollout_strategy.evaluate_board(board, board)
+            if use_cubeful_rollout:
+                r = inner._rollout_strategy.cubeful_evaluate_board(
+                    board, board,
+                    cube_value=cube_value, owner=owner,
+                    away1=away1, away2=away2, is_crawford=is_crawford,
+                    jacoby=jacoby,
+                )
+            else:
+                r = inner._rollout_strategy.evaluate_board(board, board)
             eval_level = "Rollout"
         else:
             r = inner._strategy_1ply.evaluate_board(board, board)
@@ -1096,22 +1128,28 @@ class BgBotAnalyzer:
         probs_list = list(r["probs"])
         cl_eq = r["equity"]
 
-        # Cubeful equity via Janowski
-        owner = resolve_owner(cube_owner)
-        race = bgbot_cpp.is_race(board)
-        pp, op = bgbot_cpp.pip_counts(board)
-        x = bgbot_cpp.cube_efficiency(probs_list, race, pp, op)
-        is_match = away1 > 0 or away2 > 0
-        if is_match:
-            cf_eq = bgbot_cpp.cl2cf(probs_list, cube_value, owner, x,
-                                    away1, away2, is_crawford,
-                                    jacoby=jacoby)
+        if use_cubeful_rollout:
+            # cubeful_evaluate_board returns cubeful_equity in basis-cube
+            # units already (computed from the rollout's own trial paths,
+            # including the opponent's optimal cube action at the start of
+            # their turn). No post-hoc Janowski needed.
+            cf_eq = float(r["cubeful_equity"])
         else:
-            jacoby_active = (
-                jacoby and owner == bgbot_cpp.CubeOwner.CENTERED
-            )
-            cf_eq = bgbot_cpp.cl2cf_money(probs_list, owner, x,
-                                          jacoby_active=jacoby_active)
+            # Cubeful equity via post-hoc Janowski on cubeless probs.
+            race = bgbot_cpp.is_race(board)
+            pp, op = bgbot_cpp.pip_counts(board)
+            x = bgbot_cpp.cube_efficiency(probs_list, race, pp, op)
+            is_match = away1 > 0 or away2 > 0
+            if is_match:
+                cf_eq = bgbot_cpp.cl2cf(probs_list, cube_value, owner, x,
+                                        away1, away2, is_crawford,
+                                        jacoby=jacoby)
+            else:
+                jacoby_active = (
+                    jacoby and owner == bgbot_cpp.CubeOwner.CENTERED
+                )
+                cf_eq = bgbot_cpp.cl2cf_money(probs_list, owner, x,
+                                              jacoby_active=jacoby_active)
 
         return PostMoveAnalysis(
             probs=Probabilities.from_list(probs_list),

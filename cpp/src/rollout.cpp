@@ -781,6 +781,15 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
     }
     const bool is_match = cube_active && n_branches > 0 && !branches[0].cube.is_money();
 
+    // Trial-scope flag for cube-aware checker selection. When on, move-0 /
+    // move-1 caches and best_candidate_idx reuse are bypassed because they
+    // store cubeless-best moves; we always re-pick via cubeful BMI against
+    // the active branches' cube states. See Phase 4 below for the full
+    // discussion. Computed once per trial: deterministic given config_,
+    // cube_active, and n_branches.
+    const bool use_cubeful_select =
+        (config_.cubeful_trial_moves && cube_active && n_branches > 0);
+
     // Starting convention
     Board board;
     int sp_parity_offset;
@@ -1097,6 +1106,13 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         ROLLOUT_TIMER_START;
         if (move1_entry) {
             // Fully precomputed for move 1.
+            // Exception: cube-aware checker selection bypasses the move1
+            // cache's `chosen[]` (cubeless) and needs candidates for the
+            // actual roll to re-pick via cubeful BMI.
+            if (use_cubeful_select) {
+                move_candidates[actual_idx].clear();
+                possible_boards(board, d1, d2, move_candidates[actual_idx]);
+            }
         } else if (do_vr) {
             for (size_t i = 0; i < ALL_ROLLS.size(); ++i) {
                 move_candidates[i].clear();
@@ -1203,13 +1219,63 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         // Phase 4: Pick best move for actual roll.
         // Move selection uses the full decision strategy (N-ply when applicable).
         //
+        // CUBE-AWARE SELECTION: when config_.cubeful_trial_moves is true AND
+        // any cube branch is active, the chosen move is the one that maximizes
+        // CUBEFUL equity (cl2cf) for the branch cube state, not cubeless
+        // equity. This is the trial-level cube-awareness gated by the flag.
+        // Single-branch case: chosen move is correctly optimal for that branch.
+        // Multi-branch case (cube_decision: ND + DT): branches still share the
+        // single trial board, so we use branches[0] (ND) as the selection
+        // driver — Option B approximation pending Option A per-branch boards
+        // (see CUBEFUL_TRIALS_PLAN.md §6). The cubeful-multi BMI call
+        // computes per-branch best indices internally, but only picks[0] is
+        // applied to the shared board for now.
+        //
+        // When cube-aware selection is on we bypass the move0 / move1 caches
+        // and best_candidate_idx reuse — those store cubeless-best moves.
+        //
         // MOVE-0 CACHE: At move 0, all trials share the same starting position
         // and there are only 21 possible first rolls. The first trial to encounter
         // each dice combo computes the N-ply best move; subsequent trials reuse
         // the cached result via CAS.
+        // (use_cubeful_select is trial-scope, defined above near cube_active.)
+
         Board chosen;
         bool used_move0_cache = false;
-        if (move1_entry) {
+        if (use_cubeful_select) {
+            // Cube-aware selection: ignore caches and VR-reuse; always do a
+            // fresh cubeful BMI call against the active branches' cube states.
+            const auto& candidates = move_candidates[actual_idx];
+            if (candidates.empty()) {
+                chosen = board;
+            } else if (candidates.size() == 1) {
+                chosen = candidates[0];
+            } else {
+                // Gather active branch cube states. n_branches <= 2 in the
+                // current architecture (cubeful position: 1, cube decision: 2).
+                std::array<CubeInfo, 2> active_cubes;
+                int n_active = 0;
+                for (int b = 0; b < n_branches; ++b) {
+                    if (!branches[b].finished) {
+                        active_cubes[n_active++] = branches[b].cube;
+                    }
+                }
+                if (n_active == 0) {
+                    // All branches finished but cube_active gate said otherwise?
+                    // Defensive cubeless fallback.
+                    chosen = candidates[current_strat.best_move_index(candidates, board)];
+                } else {
+                    std::array<int, 2> picks{0, 0};
+                    current_strat.best_move_index_cubeful_multi(
+                        candidates, board,
+                        active_cubes.data(), n_active, cube_x,
+                        picks.data());
+                    // Shared-board MVP: apply branch 0's pick to the trial.
+                    // TODO Option A: per-branch board evolution using picks[1+].
+                    chosen = candidates[picks[0]];
+                }
+            }
+        } else if (move1_entry) {
             chosen = move1_entry->chosen[actual_idx];
         } else {
             const auto& candidates = move_candidates[actual_idx];
@@ -2215,6 +2281,96 @@ int RolloutStrategy::best_move_index(const std::vector<Board>& candidates,
     }
 
     return best_idx;
+}
+
+// ========================== Cube-aware best_move_index ==========================
+//
+// Mirrors the cubeless best_move_index above: cubeless 1-ply filter, then
+// per-survivor evaluation — but each evaluation is a cubeful rollout per cube
+// state via cubeful_rollout_position (which already incorporates the
+// opponent's optimal cube action). For each cube state, pick the survivor
+// with the highest cubeful equity.
+
+int RolloutStrategy::best_move_index_cubeful(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo& ci,
+    float cube_x) const
+{
+    int out = 0;
+    best_move_index_cubeful_multi(candidates, pre_move_board, &ci, 1, cube_x, &out);
+    return out;
+}
+
+void RolloutStrategy::best_move_index_cubeful_multi(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo* cubes,
+    int n_cubes,
+    float cube_x,
+    int* out_indices) const
+{
+    (void)cube_x;  // unused — inner rollouts compute their own leaf cube_x.
+
+    const int n = static_cast<int>(candidates.size());
+    if (n == 0) return;
+    if (n == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = 0;
+        return;
+    }
+
+    clear_internal_caches();
+
+    // Step 1: cubeless 1-ply filter (cheap, same as the cubeless BMI path).
+    std::vector<double> equities(n);
+    double best_1ply = -1e30;
+    base_->batch_evaluate_candidates_equity(candidates, pre_move_board, equities.data());
+    for (int i = 0; i < n; ++i) {
+        if (equities[i] > best_1ply) best_1ply = equities[i];
+    }
+
+    std::vector<int> sorted_indices(n);
+    std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+    std::sort(sorted_indices.begin(), sorted_indices.end(),
+              [&](int a, int b) { return equities[a] > equities[b]; });
+
+    std::vector<int> survivors;
+    survivors.reserve(std::min(n, config_.filter.max_moves));
+    for (int idx : sorted_indices) {
+        if (static_cast<int>(survivors.size()) >= config_.filter.max_moves) break;
+        if (best_1ply - equities[idx] > config_.filter.threshold) break;
+        survivors.push_back(idx);
+    }
+
+    if (survivors.size() == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = survivors[0];
+        return;
+    }
+
+    // Step 2: per surviving candidate, run cubeful_rollout_position once per
+    // cube state. (No sharing across cubes — each call has its own dice and
+    // trial state. The cubes generally share structure, so the cube_inner_*
+    // path handles them efficiently.)
+    const int n_surv = static_cast<int>(survivors.size());
+    std::vector<std::vector<double>> cf_equities(n_surv, std::vector<double>(n_cubes));
+    for (int i = 0; i < n_surv; ++i) {
+        for (int c = 0; c < n_cubes; ++c) {
+            auto r = cubeful_rollout_position(candidates[survivors[i]], cubes[c]);
+            cf_equities[i][c] = r.cubeful_equity;
+        }
+    }
+
+    for (int c = 0; c < n_cubes; ++c) {
+        double best_cf = -1e30;
+        int best_surv_i = 0;
+        for (int i = 0; i < n_surv; ++i) {
+            if (cf_equities[i][c] > best_cf) {
+                best_cf = cf_equities[i][c];
+                best_surv_i = i;
+            }
+        }
+        out_indices[c] = survivors[best_surv_i];
+    }
 }
 
 } // namespace bgbot
