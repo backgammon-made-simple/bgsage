@@ -9,13 +9,13 @@ workers=6, out_dir=None)``.
 Each game is a money game with Jacoby + Beaver on, both sides played by Sage
 at the specified eval level. Per-game transcripts go to
 ``<out_dir>/seed_<N>.txt`` (one file per seed). Default ``out_dir`` is
-``logs/sage_vs_sage`` under the parent project root, matching the existing
-analysis workflow.
+``bgsage/logs/sage_vs_sage`` (resolved from the script location — fully
+self-contained within the bgsage repo).
 
 Usage:
 
-    python bgsage/scripts/run_sage_vs_sage_games.py 1 30 --level 3P
-    python bgsage/scripts/run_sage_vs_sage_games.py 1 200 --level 3P --workers 6
+    python scripts/run_sage_vs_sage_games.py 1 30 --level 3P
+    python scripts/run_sage_vs_sage_games.py 1 200 --level 3P --workers 6
 
 When ``workers > 1``, games run in parallel via ``ProcessPoolExecutor``. Each
 worker pre-loads its own analyzer at ``parallel_threads=1`` so 6 workers x 1
@@ -36,13 +36,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# bgsage path setup (same pattern as other bgsage/scripts/* runners)
+# bgsage path setup — fully self-contained within the bgsage repo. Never
+# reaches into a parent project: weights, build artifacts, and log outputs
+# all live under bgsage/.
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _SCRIPT_DIR.parent.parent
-_BGSAGE_PYTHON = _PROJECT_ROOT / "bgsage" / "python"
-_BUILD_DIR = _PROJECT_ROOT / "build"
+_PROJECT_ROOT = _SCRIPT_DIR.parent          # = bgsage repo root
+_BGSAGE_PYTHON = _PROJECT_ROOT / "python"   # = bgsage/python
+_BUILD_DIR = _PROJECT_ROOT / "build"        # = bgsage/build
 
 for _p in (_BGSAGE_PYTHON, _BUILD_DIR):
     sp = str(_p)

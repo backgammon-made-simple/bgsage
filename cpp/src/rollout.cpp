@@ -2028,6 +2028,16 @@ RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position
     // Compute opp's optimal cube action equity. Mirrors the logic in the
     // pybind cube_decision binding so callers see identical optimal_equity
     // values from cubeful_evaluate_board and cube_decision on the same board.
+    //
+    // When opp can't legally double (cube is owned by SP or already at
+    // max_cube_value, or match-play rules forbid it), only the ND branch is
+    // a valid action — opp must just play. The cubeful_cube_decision call
+    // above still ran a DT trial, but that DT result represents an illegal
+    // cube turn and must NOT be considered. Without this guard, post-move
+    // positions where the original SP owns the cube spuriously collapse to
+    // -DP = -1.0 because the rollout's noisy dt_equity > 1 makes the DP
+    // branch "optimal" even though opp can't actually offer the cube.
+    const bool opp_can_double = can_double(opp_cube);
     float optimal_equity;
     double opt_se;
     bool should_double, should_take;
@@ -2038,10 +2048,16 @@ RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position
         float equity_dt = (opp_cube.beaver && actual_dt < 0.0f)
             ? 2.0f * actual_dt  // Double/Beaver
             : actual_dt;
-        float best_double = std::min(equity_dt, equity_dp);
-        should_double = (best_double > equity_nd);
-        should_take = (equity_dt <= equity_dp);
-        optimal_equity = should_double ? best_double : equity_nd;
+        if (opp_can_double) {
+            float best_double = std::min(equity_dt, equity_dp);
+            should_double = (best_double > equity_nd);
+            should_take = (equity_dt <= equity_dp);
+            optimal_equity = should_double ? best_double : equity_nd;
+        } else {
+            should_double = false;
+            should_take = true;   // not applicable; pick a neutral default
+            optimal_equity = equity_nd;
+        }
 
         // SE of the chosen optimal action. DP equity is exactly +1.0 in money
         // (no rollout variance), so D/P contributes zero SE.
@@ -2061,11 +2077,18 @@ RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position
         float dt_m = static_cast<float>(cfr.dt_equity);
         float dp_m = dp_mwc(a1, a2, cv, craw);
 
-        bool auto_double = (!craw && a1 > 1 && a2 == 1);
-        float best_mwc = std::min(dt_m, dp_m);
-        should_double = auto_double || (best_mwc > nd_m);
-        should_take = (dt_m <= dp_m);
-        float optimal_mwc = should_double ? best_mwc : nd_m;
+        float optimal_mwc;
+        if (opp_can_double) {
+            bool auto_double = (!craw && a1 > 1 && a2 == 1);
+            float best_mwc = std::min(dt_m, dp_m);
+            should_double = auto_double || (best_mwc > nd_m);
+            should_take = (dt_m <= dp_m);
+            optimal_mwc = should_double ? best_mwc : nd_m;
+        } else {
+            should_double = false;
+            should_take = true;
+            optimal_mwc = nd_m;
+        }
         optimal_equity = mwc2eq(optimal_mwc, a1, a2, cv, craw);
 
         float opt_mwc_se;

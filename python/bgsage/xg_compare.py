@@ -274,12 +274,20 @@ def _parse_engine_double_action(data: bytes) -> dict[str, Any] | None:
     if all(abs(v) < 1e-10 for v in xg_eval[:6]):
         return None
 
+    # flag_double is XG's cube-action recommendation:
+    #   0 = no double
+    #   1 = double (take recommended)
+    #   2 = double, pass (probably)
+    #   -1 = too good to double (still NOT recommending double)
+    #   -100 = no analysis (record skipped)
+    # The naive bool(flag_double) misreads -1 as "double", which is wrong —
+    # treat only positive values as a recommendation to double.
     return {
         "probs": _xg_eval_to_probs(xg_eval),
         "equity_nd": eq_nd,
         "equity_dt": eq_dt,
         "equity_dp": eq_dp,
-        "should_double": bool(flag_double),
+        "should_double": flag_double > 0,
     }
 
 
@@ -487,28 +495,34 @@ def _build_cube_analysis(da: dict[str, Any] | None) -> dict[str, Any] | None:
 def _build_checker_analysis(
     bm: dict[str, Any] | None,
 ) -> list[dict[str, Any]] | None:
-    """Convert a parsed EngineStructBestMove to a list of move dicts."""
+    """Convert a parsed EngineStructBestMove to a list of move dicts.
+
+    XG stores moves in its own recommendation order (sorted by eval level
+    first, then by cubeful equity within the same level), so positions[0]
+    is XG's #1 recommendation. We trust that order — do NOT re-sort by the
+    stored ``equity`` field, since the cubeful equity at offset 6 doesn't
+    capture eval-level priority and naive sorting can promote a deeply-
+    evaluated lower-cubeful move above XG's actual recommendation.
+    """
     if not bm or bm["n_moves"] == 0:
         return None
     moves: list[dict[str, Any]] = []
-    best_equity: float | None = None
     for i in range(bm["n_moves"]):
         xg_eval = bm["evals"][i]
         probs = _xg_eval_to_probs(xg_eval)
         equity = float(xg_eval[6])
-        if best_equity is None:
-            best_equity = equity
         moves.append({
             "board": bm["positions"][i],
             "equity": equity,
-            "equity_diff": equity - best_equity,
             "probs": probs,
         })
-    moves.sort(key=lambda m: m["equity"], reverse=True)
-    if moves:
-        best_eq = moves[0]["equity"]
-        for m in moves:
-            m["equity_diff"] = m["equity"] - best_eq
+    # Compute equity_diff vs XG's #1 (= moves[0]). Note this can be POSITIVE
+    # for moves that have higher cubeful equity than XG's recommendation —
+    # those are typically moves XG evaluated at a lower level and thus
+    # didn't rank first despite the higher raw cubeful number.
+    best_eq = moves[0]["equity"]
+    for m in moves:
+        m["equity_diff"] = m["equity"] - best_eq
     return moves
 
 
@@ -887,3 +901,76 @@ def parse_xg_game(xg_bytes: bytes) -> list[dict[str, Any]]:
             f"Expected exactly 1 game in .xg file, found {len(games)}"
         )
     return _assemble_turns(games[0], _infer_analysis_level(records))
+
+
+def parse_xg_match(xg_bytes: bytes) -> dict[str, Any]:
+    """Parse a multi-game (match) .xg file.
+
+    Returns a dict with match-level metadata and a list of per-game records
+    in play order::
+
+        {
+            "match_length": int,         # 0 if money game
+            "player1": str,
+            "player2": str,
+            "jacoby": bool,
+            "beaver": bool,
+            "analysis_level": str,       # e.g. "xg-2ply"
+            "games": [
+                {
+                    "game_number": int,
+                    "score1_start": int,     # P1 score at game start
+                    "score2_start": int,     # P2 score at game start
+                    "crawford_apply": bool,  # True for the Crawford game
+                    "turns": [...],          # output of _assemble_turns
+                },
+                ...
+            ],
+        }
+
+    Single-game .xg files parse fine too (``games`` will be a list of one).
+    Raises ``ValueError`` if the file isn't a valid XG archive.
+    """
+    game_data = _extract_game_data(xg_bytes)
+    records = _parse_records(game_data)
+    analysis_level = _infer_analysis_level(records)
+
+    match_header: dict[str, Any] | None = None
+    for r in records:
+        if r.get("type") == TS_HEADER_MATCH:
+            match_header = r
+            break
+
+    games_records = _group_records_by_game(records)
+    if not games_records:
+        raise ValueError("No games found in .xg file")
+
+    games_out: list[dict[str, Any]] = []
+    for game_recs in games_records:
+        header = game_recs[0]
+        turns = _assemble_turns(game_recs, analysis_level)
+        games_out.append({
+            "game_number": header.get("game_number", len(games_out) + 1),
+            "score1_start": header.get("score1", 0),
+            "score2_start": header.get("score2", 0),
+            "crawford_apply": header.get("crawford_apply", False),
+            "turns": turns,
+        })
+
+    # Normalize XG's sentinel for "money / unlimited" (99999) to 0 so
+    # downstream code can treat ``match_length == 0`` as the universal
+    # "no match state" signal.
+    raw_match_length = (
+        match_header.get("match_length", 0) if match_header else 0
+    )
+    match_length = 0 if raw_match_length >= 99999 else int(raw_match_length)
+
+    return {
+        "match_length": match_length,
+        "player1": match_header.get("player1", "Player 1") if match_header else "Player 1",
+        "player2": match_header.get("player2", "Player 2") if match_header else "Player 2",
+        "jacoby": match_header.get("jacoby", True) if match_header else True,
+        "beaver": match_header.get("beaver", True) if match_header else True,
+        "analysis_level": analysis_level,
+        "games": games_out,
+    }

@@ -11,6 +11,16 @@ files (from a host project that vendors this repo as a submodule) are loaded as
 context. New Python modules go in `python/bgsage/`, new scripts in `scripts/`,
 new C++ in `cpp/`.
 
+The same applies to *runtime* paths: every directory the code references —
+compiled extension, weights, data, output dirs — must resolve inside `bgsage/`.
+Scripts must not reach into a parent directory for `bgbot_cpp.pyd`, model
+weights, or output logs. The compiled `bgbot_cpp.pyd` belongs in `bgsage/build/`,
+default output directories resolve under `bgsage/logs/`, and scripts should set
+`_PROJECT_ROOT = _SCRIPT_DIR.parent` (the bgsage repo root) — never
+`.parent.parent` (which points at the host project). Several existing scripts
+in `scripts/` still resolve paths via the host project root; treat that as
+legacy and fix it when convenient.
+
 ## Git Worktree Rules
 
 **CRITICAL: When working in a git worktree, ALL file operations (reads, edits,

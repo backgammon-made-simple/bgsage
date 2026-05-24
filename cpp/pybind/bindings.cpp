@@ -2042,6 +2042,13 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             bool should_double, should_take;
             float optimal_equity;
 
+            // The DT branch of `cubeful_cube_decision` always simulates "SP
+            // doubles, opp takes", but that's an illegal move when SP doesn't
+            // own (or share) the cube — equity_dt then represents an
+            // impossible scenario and must not drive the optimal decision.
+            // Mirrors the can_double guard in cube_decision_nply.
+            const bool sp_can_double = can_double(ci);
+
             if (!ci.is_money()) {
                 int a1 = ci.match.away1, a2 = ci.match.away2;
                 int cv = ci.cube_value;
@@ -2051,14 +2058,19 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                 float dt_m = static_cast<float>(cfr.dt_equity);
                 float dp_m = dp_mwc(a1, a2, cv, craw);
 
-                bool auto_double = (!craw && a1 > 1 && a2 == 1);
-                if (auto_double) {
-                    should_double = true;
-                    should_take = (dt_m <= dp_m);
+                if (!sp_can_double) {
+                    should_double = false;
+                    should_take = true;
                 } else {
-                    float best_mwc = std::min(dt_m, dp_m);
-                    should_double = (best_mwc > nd_m);
-                    should_take = (dt_m <= dp_m);
+                    bool auto_double = (!craw && a1 > 1 && a2 == 1);
+                    if (auto_double) {
+                        should_double = true;
+                        should_take = (dt_m <= dp_m);
+                    } else {
+                        float best_mwc = std::min(dt_m, dp_m);
+                        should_double = (best_mwc > nd_m);
+                        should_take = (dt_m <= dp_m);
+                    }
                 }
 
                 equity_nd = mwc2eq(nd_m, a1, a2, cv, craw);
@@ -2086,10 +2098,16 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                     equity_dt = actual_dt;
                 }
 
-                float best_double = std::min(equity_dt, equity_dp);
-                should_double = (best_double > equity_nd);
-                should_take = (equity_dt <= equity_dp);
-                optimal_equity = should_double ? best_double : equity_nd;
+                if (!sp_can_double) {
+                    should_double = false;
+                    should_take = true;
+                    optimal_equity = equity_nd;
+                } else {
+                    float best_double = std::min(equity_dt, equity_dp);
+                    should_double = (best_double > equity_nd);
+                    should_take = (equity_dt <= equity_dp);
+                    optimal_equity = should_double ? best_double : equity_nd;
+                }
 
                 // Money-game SE is already in equity-per-basis-cube units.
                 equity_nd_se = static_cast<float>(cfr.nd_se);
@@ -2097,7 +2115,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             }
 
             bool is_beaver_result = false;
-            if (ci.is_money() && ci.beaver) {
+            if (ci.is_money() && ci.beaver && sp_can_double) {
                 float actual_dt_check = static_cast<float>(cfr.dt_equity);
                 is_beaver_result = (actual_dt_check < 0.0f);
             }
@@ -2923,6 +2941,13 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         bool should_double, should_take;
         float optimal_equity;
 
+        // The DT branch of `cubeful_cube_decision` always simulates "SP
+        // doubles, opp takes", but that's an illegal move when SP can't
+        // legally double — equity_dt then represents an impossible scenario
+        // and must not drive the optimal decision. Mirrors the can_double
+        // guard in cube_decision_nply.
+        const bool sp_can_double = can_double(ci);
+
         if (!ci.is_money()) {
             // Match play: cfr.nd_equity / dt_equity are MWC from SP perspective
             int a1 = ci.match.away1, a2 = ci.match.away2;
@@ -2933,17 +2958,21 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             float dt_m = static_cast<float>(cfr.dt_equity);
             float dp_m = dp_mwc(a1, a2, cv, craw);
 
-            // Post-Crawford automatic double: trailing player always doubles
-            bool auto_double = (!craw && a1 > 1 && a2 == 1);
-
-            // Decision in MWC space
-            if (auto_double) {
-                should_double = true;
-                should_take = (dt_m <= dp_m);
+            if (!sp_can_double) {
+                should_double = false;
+                should_take = true;
             } else {
-                float best_mwc = std::min(dt_m, dp_m);
-                should_double = (best_mwc > nd_m);
-                should_take = (dt_m <= dp_m);
+                // Post-Crawford automatic double: trailing player always doubles
+                bool auto_double = (!craw && a1 > 1 && a2 == 1);
+                // Decision in MWC space
+                if (auto_double) {
+                    should_double = true;
+                    should_take = (dt_m <= dp_m);
+                } else {
+                    float best_mwc = std::min(dt_m, dp_m);
+                    should_double = (best_mwc > nd_m);
+                    should_take = (dt_m <= dp_m);
+                }
             }
 
             // Convert to equity at original cv for display
@@ -2974,10 +3003,16 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                 equity_dt = actual_dt;
             }
 
-            float best_double = std::min(equity_dt, equity_dp);
-            should_double = (best_double > equity_nd);
-            should_take = (equity_dt <= equity_dp);
-            optimal_equity = should_double ? best_double : equity_nd;
+            if (!sp_can_double) {
+                should_double = false;
+                should_take = true;
+                optimal_equity = equity_nd;
+            } else {
+                float best_double = std::min(equity_dt, equity_dp);
+                should_double = (best_double > equity_nd);
+                should_take = (equity_dt <= equity_dp);
+                optimal_equity = should_double ? best_double : equity_nd;
+            }
 
             // Money-game SE is already in equity-per-basis-cube units.
             equity_nd_se = static_cast<float>(cfr.nd_se);
@@ -2986,7 +3021,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
 
         // Determine is_beaver for non-money path (always false for match play)
         bool is_beaver_result = false;
-        if (ci.is_money() && ci.beaver) {
+        if (ci.is_money() && ci.beaver && sp_can_double) {
             float actual_dt_check = static_cast<float>(cfr.dt_equity);
             is_beaver_result = (actual_dt_check < 0.0f);
         }
