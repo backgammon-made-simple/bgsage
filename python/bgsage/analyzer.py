@@ -598,10 +598,12 @@ class _CubefulAnalyzer:
             opp_pre_roll = bgbot_cpp.flip_board(post_move_board)
             opp_owner = _FLIP_OWNER[owner]
             db = getattr(self._inner, '_bearoff_db', None)
+            n_threads = getattr(self._inner, '_parallel_threads', 1)
             if is_match:
                 opp_eq = bgbot_cpp.cubeful_equity_nply(
                     opp_pre_roll, opp_owner,
                     self._inner._strategy_1ply, self._cubeful_ply,
+                    n_threads=n_threads,
                     cube_value=cube_value,
                     away1=away2, away2=away1, is_crawford=is_crawford,
                     jacoby=jacoby, beaver=beaver,
@@ -611,6 +613,7 @@ class _CubefulAnalyzer:
                 opp_eq = bgbot_cpp.cubeful_equity_nply(
                     opp_pre_roll, opp_owner,
                     self._inner._strategy_1ply, self._cubeful_ply,
+                    n_threads=n_threads,
                     jacoby=jacoby, beaver=beaver,
                     bearoff_db=db,
                 )
@@ -1135,6 +1138,7 @@ class BgBotAnalyzer:
                 opp_probs = bgbot_cpp.cubeful_probs_nply(
                     opp_pre_roll, opp_owner,
                     inner._strategy_1ply, n_plies,
+                    n_threads=getattr(inner, '_parallel_threads', 1),
                     cube_value=cube_value,
                     away1=away2, away2=away1, is_crawford=is_crawford,
                     jacoby=jacoby,

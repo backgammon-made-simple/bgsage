@@ -356,4 +356,13 @@ inline CubeDecision cube_decision_from_probs(
 void reset_cubeful_counters();
 void print_cubeful_counters();
 
+struct CubefulCounters {
+    int64_t leaf_count;
+    int64_t internal_count;
+    int64_t cache_hit_count;
+    int64_t move_gen_count;
+    int64_t total_candidates;
+};
+CubefulCounters get_cubeful_counters();
+
 } // namespace bgbot

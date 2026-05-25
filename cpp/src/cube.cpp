@@ -44,6 +44,16 @@ void print_cubeful_counters() {
                : 0.0);
 }
 
+CubefulCounters get_cubeful_counters() {
+    return CubefulCounters{
+        g_leaf_count.load(),
+        g_internal_count.load(),
+        g_cache_hit_count.load(),
+        g_move_gen_count.load(),
+        g_total_candidates.load(),
+    };
+}
+
 void compute_WL(const std::array<float, NUM_OUTPUTS>& probs, float& W, float& L) {
     float p_win = probs[0];
     float p_gw = probs[1];
@@ -860,8 +870,10 @@ struct CubefulCacheEntry {
     int cci;
     bool fTop;
     bool occupied;
+    bool has_probs;          // true if probs slot is valid (Idea A)
     uint64_t epoch;
     float values[MAX_CCI];
+    float probs[NUM_OUTPUTS];  // cube-independent post-roll probs in player POV
 };
 
 static constexpr int CUBEFUL_CACHE_SIZE = 8192;   // must be power of 2
@@ -893,27 +905,42 @@ struct CubefulOpenCache {
         return h;
     }
 
-    bool get(const Board& board, int plies, int cci, bool fTop, uint64_t epoch, float* out) const {
+    // out_probs is optional: when non-null, only hit if the entry has stored
+    // probs. The probs slot is populated by put() callers that asked the
+    // recursion for probs (cubeful_probs_nply path).
+    bool get(const Board& board, int plies, int cci, bool fTop, uint64_t epoch,
+             float* out, float* out_probs = nullptr) const {
         std::size_t idx = hash_board(board, plies, cci, fTop) & CUBEFUL_CACHE_MASK;
         // Linear probe up to 4 slots
         for (int probe = 0; probe < 4; ++probe) {
             const auto& e = entries[(idx + probe) & CUBEFUL_CACHE_MASK];
             if (!e.occupied || e.epoch != epoch) continue;
             if (e.plies == plies && e.cci == cci && e.fTop == fTop && e.board == board) {
+                if (out_probs && !e.has_probs) return false;  // probs requested but not stored
                 for (int i = 0; i < cci; ++i) out[i] = e.values[i];
+                if (out_probs) {
+                    for (int i = 0; i < NUM_OUTPUTS; ++i) out_probs[i] = e.probs[i];
+                }
                 return true;
             }
         }
         return false;
     }
 
-    void put(const Board& board, int plies, int cci, bool fTop, uint64_t epoch, const float* values) {
+    void put(const Board& board, int plies, int cci, bool fTop, uint64_t epoch,
+             const float* values, const float* probs = nullptr) {
         std::size_t idx = hash_board(board, plies, cci, fTop) & CUBEFUL_CACHE_MASK;
         // Linear probe up to 4 slots, replace first empty/stale or matching slot
         for (int probe = 0; probe < 4; ++probe) {
             auto& e = entries[(idx + probe) & CUBEFUL_CACHE_MASK];
             if (!e.occupied || e.epoch != epoch ||
                 (e.plies == plies && e.cci == cci && e.fTop == fTop && e.board == board)) {
+                // If we're updating in place and probs already stored, preserve
+                // them; only overwrite probs if the caller is providing them.
+                bool keep_probs = e.occupied && e.epoch == epoch
+                                  && e.has_probs && probs == nullptr
+                                  && e.plies == plies && e.cci == cci
+                                  && e.fTop == fTop && e.board == board;
                 e.board = board;
                 e.plies = plies;
                 e.cci = cci;
@@ -921,6 +948,12 @@ struct CubefulOpenCache {
                 e.occupied = true;
                 e.epoch = epoch;
                 for (int i = 0; i < cci; ++i) e.values[i] = values[i];
+                if (probs != nullptr) {
+                    for (int i = 0; i < NUM_OUTPUTS; ++i) e.probs[i] = probs[i];
+                    e.has_probs = true;
+                } else if (!keep_probs) {
+                    e.has_probs = false;
+                }
                 return;
             }
         }
@@ -933,6 +966,12 @@ struct CubefulOpenCache {
         e.occupied = true;
         e.epoch = epoch;
         for (int i = 0; i < cci; ++i) e.values[i] = values[i];
+        if (probs != nullptr) {
+            for (int i = 0; i < NUM_OUTPUTS; ++i) e.probs[i] = probs[i];
+            e.has_probs = true;
+        } else {
+            e.has_probs = false;
+        }
     }
 };
 
@@ -949,11 +988,13 @@ static bool get_cached_cubeful(
     const Strategy& strategy,
     int plies,
     bool fTop,
-    float arCubeful[])
+    float arCubeful[],
+    std::array<float, NUM_OUTPUTS>* arProbsOut = nullptr)
 {
     if (!kEnableCubefulCache || cci <= 0) return false;
     uint64_t epoch = g_cubeful_cache_epoch.load(std::memory_order_relaxed);
-    return g_cubeful_cache.get(board, plies, cci, fTop, epoch, arCubeful);
+    float* probs_ptr = arProbsOut ? arProbsOut->data() : nullptr;
+    return g_cubeful_cache.get(board, plies, cci, fTop, epoch, arCubeful, probs_ptr);
 }
 
 static void put_cached_cubeful(
@@ -963,11 +1004,13 @@ static void put_cached_cubeful(
     const Strategy& strategy,
     int plies,
     bool fTop,
-    const float arCubeful[])
+    const float arCubeful[],
+    const std::array<float, NUM_OUTPUTS>* arProbsOut = nullptr)
 {
     if (!kEnableCubefulCache || cci <= 0) return;
     uint64_t epoch = g_cubeful_cache_epoch.load(std::memory_order_relaxed);
-    g_cubeful_cache.put(board, plies, cci, fTop, epoch, arCubeful);
+    const float* probs_ptr = arProbsOut ? arProbsOut->data() : nullptr;
+    g_cubeful_cache.put(board, plies, cci, fTop, epoch, arCubeful, probs_ptr);
 }
 
 // Resolve cube efficiency: use override if set, otherwise auto-detect.
@@ -1142,11 +1185,11 @@ static void cubeful_recursive_multi(
     bool is_money = (cci > 0 && aciCubePos[0].cube_value > 0)
                     ? aciCubePos[0].is_money() : true;
 
-    // Cubeful cache holds only equity, not probs. Bypass cache when caller
-    // requests probs (rare path used by post_move_analytics; cache benefit is
-    // small for top-level single calls anyway).
-    if (arProbsOut == nullptr &&
-        get_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful)) {
+    // Cache lookup. If arProbsOut is requested we only hit entries that have
+    // probs stored alongside the equity; otherwise we hit any current entry
+    // (probs slot ignored).
+    if (get_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop,
+                           arCubeful, arProbsOut)) {
         g_cache_hit_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1178,9 +1221,8 @@ static void cubeful_recursive_multi(
             }
         }
         if (arProbsOut) *arProbsOut = t_probs;
-        if (arProbsOut == nullptr) {
-            put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
-        }
+        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop,
+                           arCubeful, arProbsOut ? &t_probs : nullptr);
         return;
     }
 
@@ -1228,9 +1270,8 @@ static void cubeful_recursive_multi(
         // Collapse 2*cci → cci
         get_ecf3(arCubeful, cci, arCf, aci);
         if (arProbsOut) *arProbsOut = pre_roll_probs;
-        if (arProbsOut == nullptr) {
-            put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
-        }
+        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop,
+                           arCubeful, arProbsOut ? &pre_roll_probs : nullptr);
         return;
     }
 
@@ -1564,9 +1605,8 @@ static void cubeful_recursive_multi(
 
     // Collapse 2*cci → cci via optimal cube decisions
     get_ecf3(arCubeful, cci, arCf, aci);
-    if (arProbsOut == nullptr) {
-        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
-    }
+    put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop,
+                       arCubeful, arProbsOut);
 }
 
 float cubeful_equity_nply(

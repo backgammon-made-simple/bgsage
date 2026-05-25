@@ -2451,6 +2451,20 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("jacoby") = true, py::arg("beaver") = true,
        py::arg("bearoff_db") = nullptr);
 
+    // Profiling counters for cubeful recursion (debug only).
+    m.def("reset_cubeful_counters", &reset_cubeful_counters,
+          "Reset cubeful recursion profiling counters to zero.");
+    m.def("get_cubeful_counters", []() {
+        auto c = get_cubeful_counters();
+        py::dict d;
+        d["leaf_count"] = c.leaf_count;
+        d["internal_count"] = c.internal_count;
+        d["cache_hit_count"] = c.cache_hit_count;
+        d["move_gen_count"] = c.move_gen_count;
+        d["total_candidates"] = c.total_candidates;
+        return d;
+    }, "Snapshot cubeful recursion profiling counters.");
+
     // Cube-aware probs from the N-ply tree (parallels cubeful_equity_nply).
     m.def("cubeful_probs_nply", [](const std::vector<int>& board_vec,
                                     CubeOwner owner,
