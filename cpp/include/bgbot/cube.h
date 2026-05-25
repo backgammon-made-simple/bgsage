@@ -263,6 +263,25 @@ std::array<float, NUM_OUTPUTS> cubeful_probs_nply(
     int n_threads = 1,
     const Strategy* move_filter = nullptr);
 
+// Returns BOTH post-roll probabilities AND cubeful equity from a single
+// traversal of the N-ply CUBE-AWARE tree. Same probs as `cubeful_probs_nply`,
+// same equity as `cubeful_equity_nply` (CubeInfo overload). Use this when the
+// caller wants both (e.g. per-candidate checker play analytics) to avoid two
+// independent tree traversals.
+struct CubefulProbsAndEquity {
+    std::array<float, NUM_OUTPUTS> probs;
+    float equity;
+};
+
+CubefulProbsAndEquity cubeful_probs_and_equity_nply(
+    const Board& board,
+    const CubeInfo& cube,
+    const Strategy& strategy,
+    int n_plies,
+    const MoveFilter& filter = MoveFilters::TINY,
+    int n_threads = 1,
+    const Strategy* move_filter = nullptr);
+
 // Batched version: evaluate cubeful equity for the SAME board at N-ply depth
 // against MULTIPLE cube states simultaneously. Returns one equity per cube
 // state in `out`, in the same order as `cubes`.

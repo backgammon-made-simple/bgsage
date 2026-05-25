@@ -5314,6 +5314,56 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("jacoby") = true, py::arg("beaver") = true,
        py::arg("bearoff_db") = nullptr);
 
+    // --- Unified cubeful_probs_and_equity_nply ---
+    // Returns BOTH cube-aware probs and cubeful equity from a single tree
+    // traversal — saves a redundant cubeful_recursive_multi call when callers
+    // (e.g. per-candidate checker play analytics) want both values.
+    m.def("cubeful_probs_and_equity_nply",
+          [](const std::vector<int>& board_vec,
+             CubeOwner owner,
+             std::shared_ptr<Strategy> strategy,
+             int n_plies,
+             int filter_max_moves,
+             float filter_threshold,
+             int n_threads,
+             int cube_value,
+             int away1, int away2, bool is_crawford,
+             bool jacoby, bool beaver,
+             const BearoffDB* bearoff_db) {
+        Board board = list_to_board(board_vec);
+        MoveFilter filter{filter_max_moves, filter_threshold};
+
+        std::shared_ptr<Strategy> eval_strat = strategy;
+        if (bearoff_db && bearoff_db->is_loaded()) {
+            eval_strat = std::make_shared<BearoffStrategy>(strategy, bearoff_db);
+        }
+
+        CubefulProbsAndEquity result;
+        {
+            py::gil_scoped_release release;
+            CubeInfo ci{cube_value, owner,
+                        {(away1 > 0 ? away1 : 0), (away2 > 0 ? away2 : 0),
+                         is_crawford},
+                        -1.0f, jacoby, beaver};
+            result = cubeful_probs_and_equity_nply(
+                board, ci, *eval_strat, n_plies, filter, n_threads);
+        }
+        py::dict d;
+        d["probs"] = result.probs;
+        d["equity"] = result.equity;
+        return d;
+    }, "Post-roll probs AND cubeful equity from the N-ply CUBE-AWARE tree (single traversal).",
+       py::arg("board"), py::arg("owner"),
+       py::arg("strategy"),
+       py::arg("n_plies") = 2,
+       py::arg("filter_max_moves") = 5,
+       py::arg("filter_threshold") = 0.08f,
+       py::arg("n_threads") = 1,
+       py::arg("cube_value") = 1,
+       py::arg("away1") = 0, py::arg("away2") = 0, py::arg("is_crawford") = false,
+       py::arg("jacoby") = true, py::arg("beaver") = true,
+       py::arg("bearoff_db") = nullptr);
+
     // --- Unified 1-ply cube decision ---
     m.def("evaluate_cube_decision_unified", [](const std::vector<int>& checkers,
                                                 int cube_value, CubeOwner owner,

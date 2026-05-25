@@ -1711,6 +1711,78 @@ std::array<float, NUM_OUTPUTS> cubeful_probs_nply(
     return arProbs;
 }
 
+// Returns BOTH the cube-aware probs and the cubeful equity from a single
+// traversal of the cubeful tree. Avoids a second tree walk when callers want
+// both (per-candidate checker play analytics).
+CubefulProbsAndEquity cubeful_probs_and_equity_nply(
+    const Board& board,
+    const CubeInfo& cube,
+    const Strategy& strategy,
+    int n_plies,
+    const MoveFilter& filter,
+    int n_threads,
+    const Strategy* move_filter)
+{
+    if (n_plies <= 1) {
+        // 1-ply path: single NN eval, derive probs and 1-ply Janowski equity.
+        Board flipped = flip(board);
+        bool race = is_race(board);
+        GameResult result = check_game_over(flipped);
+        std::array<float, NUM_OUTPUTS> pre_roll_probs;
+        if (result != GameResult::NOT_OVER) {
+            pre_roll_probs = invert_probs(terminal_probs(result));
+        } else {
+            auto post_probs = strategy.evaluate_probs(flipped, race);
+            pre_roll_probs = invert_probs(post_probs);
+        }
+        clamp_probs_to_board(pre_roll_probs, board);
+
+        float eq;
+        if (cube.is_money()) {
+            if (result != GameResult::NOT_OVER) {
+                eq = cube.jacoby_active()
+                    ? (2.0f * pre_roll_probs[0] - 1.0f)
+                    : cubeless_equity(pre_roll_probs);
+            } else {
+                auto [pp, op] = pip_counts(board);
+                float x = cube_efficiency(pre_roll_probs, race, pp, op);
+                eq = cl2cf_money(pre_roll_probs, cube.owner, x,
+                                 cube.jacoby_active());
+            }
+        } else {
+            float mwc;
+            if (result != GameResult::NOT_OVER) {
+                mwc = cubeless_mwc(pre_roll_probs,
+                                   cube.match.away1, cube.match.away2,
+                                   cube.cube_value, cube.match.is_crawford);
+            } else {
+                auto [pp, op] = pip_counts(board);
+                float x = cube_efficiency(pre_roll_probs, race, pp, op);
+                mwc = cl2cf_match(pre_roll_probs, cube, x);
+            }
+            eq = mwc2eq(mwc, cube.match.away1, cube.match.away2,
+                        cube.cube_value, cube.match.is_crawford);
+        }
+        return {pre_roll_probs, eq};
+    }
+
+    begin_cubeful_cache_epoch();
+
+    CubeInfo aciCubePos[1] = {cube};
+    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
+    float arCubeful[1];
+    std::array<float, NUM_OUTPUTS> arProbs{};
+    bool allow_parallel = (n_threads > 1 && n_plies > 2);
+    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
+                            n_threads, allow_parallel, false, arCubeful,
+                            move_filter, &arProbs);
+    float eq = cube.is_money()
+        ? arCubeful[0]
+        : mwc2eq(arCubeful[0], cube.match.away1, cube.match.away2,
+                 cube.cube_value, cube.match.is_crawford);
+    return {arProbs, eq};
+}
+
 // Batched version: evaluate multiple cube states against the same board in a
 // single recursion.  Writes one cubeful equity per cube state into `out`.
 //
