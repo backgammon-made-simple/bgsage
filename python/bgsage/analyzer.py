@@ -707,22 +707,76 @@ class _CubefulAnalyzer:
             workers = max(2, os.cpu_count() or 2)
         workers = max(1, workers)
 
-        def _convert_move(m: dict) -> tuple[float, float]:
-            cubeless_eq = m["equity"]
-            cf_eq = self._cubeful_equity(
-                m["board"], m["probs"], owner,
-                cube_value=cube_value, away1=away1, away2=away2,
-                is_crawford=is_crawford, jacoby=jacoby, beaver=beaver,
-            )
-            return cubeless_eq, cf_eq
+        # When the inner analyzer is multi-ply with N > 1, route each candidate
+        # through cubeful_probs_and_equity_nply so the per-move probs come from
+        # the CUBE-AWARE tree (opponent move selection respects cube state /
+        # match equity). Otherwise the displayed probs are from MultiPlyStrategy's
+        # cubeless tree, where the opponent picks gammon-greedy moves in match
+        # play. The fix mirrors the post_move_analytics path.
+        use_cube_aware_probs = (
+            isinstance(inner, _MultiPlyAnalyzer)
+            and self._cubeful_ply > 1
+            and owner is not None
+        )
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            converted = list(pool.map(_convert_move, results))
+        if use_cube_aware_probs:
+            total_threads = getattr(inner, "_parallel_threads", 1) or 1
+            db = getattr(inner, "_bearoff_db", None)
+            opp_owner = _FLIP_OWNER[owner]
+            strat_1ply = inner._strategy_1ply
+            cubeful_ply = self._cubeful_ply
 
-        for m, (cubeless_eq, cf_eq) in zip(results, converted):
-            cubeless_eq = m["equity"]
-            m["cubeless_equity"] = cubeless_eq
-            m["equity"] = cf_eq
+            # Parallelize ACROSS candidates with n_threads=1 inside each call.
+            # The cubeful tree at 3-ply on a single candidate is small (~10ms
+            # serial), so outer parallelism overlaps far more effectively than
+            # inner parallelism would. Avoid oversubscription by giving each
+            # candidate a single thread.
+            def _convert_move(m: dict) -> tuple[list, float, float]:
+                opp_pre_roll = bgbot_cpp.flip_board(m["board"])
+                r = bgbot_cpp.cubeful_probs_and_equity_nply(
+                    opp_pre_roll, opp_owner, strat_1ply, cubeful_ply,
+                    n_threads=1,
+                    cube_value=cube_value,
+                    away1=away2, away2=away1, is_crawford=is_crawford,
+                    jacoby=jacoby, beaver=beaver,
+                    bearoff_db=db,
+                )
+                opp_probs = r["probs"]
+                # invert opp's POV probs → player's POV
+                probs = [1.0 - opp_probs[0],
+                         opp_probs[3], opp_probs[4],
+                         opp_probs[1], opp_probs[2]]
+                cl_eq = (2.0 * probs[0] - 1.0
+                         + probs[1] - probs[3]
+                         + probs[2] - probs[4])
+                # cubeful_probs_and_equity_nply returns the opponent's equity at
+                # the flipped board; negate to get the current player's equity.
+                cf_eq = -r["equity"]
+                return probs, cl_eq, cf_eq
+
+            with ThreadPoolExecutor(max_workers=total_threads) as pool:
+                converted = list(pool.map(_convert_move, results))
+
+            for m, (probs, cl_eq, cf_eq) in zip(results, converted):
+                m["probs"] = probs
+                m["cubeless_equity"] = cl_eq
+                m["equity"] = cf_eq
+        else:
+            def _convert_move_legacy(m: dict) -> tuple[float, float]:
+                cubeless_eq = m["equity"]
+                cf_eq = self._cubeful_equity(
+                    m["board"], m["probs"], owner,
+                    cube_value=cube_value, away1=away1, away2=away2,
+                    is_crawford=is_crawford, jacoby=jacoby, beaver=beaver,
+                )
+                return cubeless_eq, cf_eq
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                converted = list(pool.map(_convert_move_legacy, results))
+
+            for m, (cubeless_eq, cf_eq) in zip(results, converted):
+                m["cubeless_equity"] = m["equity"]
+                m["equity"] = cf_eq
 
         results.sort(key=lambda x: -x["equity"])
 
