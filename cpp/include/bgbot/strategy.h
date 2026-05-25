@@ -9,6 +9,12 @@
 
 namespace bgbot {
 
+// Forward declaration to avoid including cube.h (which includes strategy.h).
+// The cube-aware Strategy methods below take CubeInfo by reference, so the
+// header only needs the type name. strategy.cpp includes cube.h for the
+// default implementations.
+struct CubeInfo;
+
 constexpr int NUM_OUTPUTS = 5;  // P(win), P(gw), P(bw), P(gl), P(bl)
 
 // Compute equity from 5 output probabilities.
@@ -143,6 +149,40 @@ public:
     // Default implementation calls best_move_index(candidates, is_race(pre_move_board)).
     virtual int best_move_index(const std::vector<Board>& candidates,
                                 const Board& pre_move_board) const;
+
+    // ----- Cube-aware move selection -----
+    //
+    // Cube-aware variant of best_move_index: returns the candidate with the
+    // highest cubeful equity under the given cube state. The cube state may
+    // be money or match; the dispatcher cl2cf handles both. `cube_x` is the
+    // Janowski cube efficiency for the pre-move board, computed once by the
+    // caller and reused per cube state to avoid redundant work.
+    //
+    // The default implementation evaluates cubeless probs for each candidate
+    // via evaluate_probs (clamped against the candidate board), applies cl2cf,
+    // and returns the argmax. Strategies with batch evaluation (NNStrategy)
+    // or deeper search (MultiPlyStrategy, RolloutStrategy) override this for
+    // speed and accuracy.
+    virtual int best_move_index_cubeful(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo& ci,
+        float cube_x) const;
+
+    // Batched variant: pick the best candidate independently for each cube
+    // state. Returns one index per cube into out_indices[0..n_cubes-1]. The
+    // default implementation evaluates cubeless probs for each candidate
+    // exactly once (the expensive part — NN forward pass) and then loops
+    // cl2cf per cube state (essentially free). Strategies that share work
+    // across cubes more aggressively (MultiPlyStrategy via
+    // cubeful_equity_nply_multi) can override.
+    virtual void best_move_index_cubeful_multi(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo* cubes,
+        int n_cubes,
+        float cube_x,
+        int* out_indices) const;
 
     // ----- Batch evaluation methods -----
     // These evaluate multiple candidate post-move boards efficiently.

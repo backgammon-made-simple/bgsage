@@ -1858,7 +1858,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         .def_readwrite("filter", &RolloutConfig::filter)
         .def_readwrite("n_threads", &RolloutConfig::n_threads)
         .def_readwrite("seed", &RolloutConfig::seed)
-        .def_readwrite("ultra_late_threshold", &RolloutConfig::ultra_late_threshold);
+        .def_readwrite("ultra_late_threshold", &RolloutConfig::ultra_late_threshold)
+        .def_readwrite("cubeful_trial_moves", &RolloutConfig::cubeful_trial_moves)
+        .def_readwrite("cubeful_late_threshold", &RolloutConfig::cubeful_late_threshold);
 
     // TrialEvalConfig: per-purpose evaluation config for rollout trials
     py::class_<TrialEvalConfig>(m, "TrialEvalConfig")
@@ -2438,6 +2440,69 @@ PYBIND11_MODULE(bgbot_cpp, m) {
     }, "Compute cubeful equity for a pre-roll position at N-ply depth.\n"
        "Uses recursive cube decision modeling (Janowski only at 1-ply leaves).\n"
        "Returns cubeful equity normalized to cube value 1.",
+       py::arg("board"), py::arg("owner"),
+       py::arg("strategy"),
+       py::arg("n_plies") = 2,
+       py::arg("filter_max_moves") = 5,
+       py::arg("filter_threshold") = 0.08f,
+       py::arg("n_threads") = 1,
+       py::arg("cube_value") = 1,
+       py::arg("away1") = 0, py::arg("away2") = 0, py::arg("is_crawford") = false,
+       py::arg("jacoby") = true, py::arg("beaver") = true,
+       py::arg("bearoff_db") = nullptr);
+
+    // Profiling counters for cubeful recursion (debug only).
+    m.def("reset_cubeful_counters", &reset_cubeful_counters,
+          "Reset cubeful recursion profiling counters to zero.");
+    m.def("get_cubeful_counters", []() {
+        auto c = get_cubeful_counters();
+        py::dict d;
+        d["leaf_count"] = c.leaf_count;
+        d["internal_count"] = c.internal_count;
+        d["cache_hit_count"] = c.cache_hit_count;
+        d["move_gen_count"] = c.move_gen_count;
+        d["total_candidates"] = c.total_candidates;
+        return d;
+    }, "Snapshot cubeful recursion profiling counters.");
+
+    // Cube-aware probs from the N-ply tree (parallels cubeful_equity_nply).
+    m.def("cubeful_probs_nply", [](const std::vector<int>& board_vec,
+                                    CubeOwner owner,
+                                    GamePlanStrategy& strategy,
+                                    int n_plies,
+                                    int filter_max_moves,
+                                    float filter_threshold,
+                                    int n_threads,
+                                    int cube_value,
+                                    int away1, int away2, bool is_crawford,
+                                    bool jacoby, bool beaver,
+                                    const BearoffDB* bearoff_db) {
+        Board board = list_to_board(board_vec);
+        MoveFilter filter{filter_max_moves, filter_threshold};
+
+        std::shared_ptr<Strategy> wrapped;
+        if (bearoff_db && bearoff_db->is_loaded()) {
+            auto gps_ptr = std::shared_ptr<GamePlanStrategy>(&strategy, [](auto*){});
+            wrapped = std::make_shared<BearoffStrategy>(gps_ptr, bearoff_db);
+        }
+        const Strategy& eval_strat = wrapped
+            ? static_cast<const Strategy&>(*wrapped)
+            : static_cast<const Strategy&>(strategy);
+
+        std::array<float, NUM_OUTPUTS> probs;
+        {
+            py::gil_scoped_release release;
+            CubeInfo ci{cube_value, owner,
+                        {(away1 > 0 ? away1 : 0), (away2 > 0 ? away2 : 0),
+                         is_crawford},
+                        -1.0f, jacoby, beaver};
+            probs = cubeful_probs_nply(board, ci, eval_strat, n_plies, filter, n_threads);
+        }
+        return probs;
+    }, "Compute post-roll cubeless probs from the N-ply CUBE-AWARE tree.\n"
+       "Interior move picks use 1-ply cubeful equity (cl2cf) against the given\n"
+       "cube state, so the returned probs reflect match-aware play throughout.\n"
+       "Returns probs from the player-on-roll's perspective at the input board.",
        py::arg("board"), py::arg("owner"),
        py::arg("strategy"),
        py::arg("n_plies") = 2,
@@ -5121,7 +5186,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                                               const TrialEvalConfig& checker_late,
                                               const TrialEvalConfig& cube,
                                               const TrialEvalConfig& cube_late,
-                                              int ultra_late_threshold) {
+                                              int ultra_late_threshold,
+                                              bool cubeful_trial_moves,
+                                              int cubeful_late_threshold) {
         auto base = make_strategy_from_type(strategy_type, weight_paths, hidden_sizes);
         RolloutConfig rc;
         rc.n_trials = n_trials;
@@ -5139,6 +5206,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         rc.cube = cube;
         rc.cube_late = cube_late;
         rc.ultra_late_threshold = ultra_late_threshold;
+        rc.cubeful_trial_moves = cubeful_trial_moves;
+        rc.cubeful_late_threshold = cubeful_late_threshold;
         return std::make_shared<RolloutStrategy>(base, rc);
     }, "Create RolloutStrategy from any base strategy type",
        py::arg("strategy_type"),
@@ -5159,7 +5228,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("checker_late") = TrialEvalConfig{},
        py::arg("cube") = TrialEvalConfig{},
        py::arg("cube_late") = TrialEvalConfig{},
-       py::arg("ultra_late_threshold") = 2);
+       py::arg("ultra_late_threshold") = 2,
+       py::arg("cubeful_trial_moves") = true,
+       py::arg("cubeful_late_threshold") = 0);
 
     // --- Unified cubeful_equity_nply (accepts any Strategy via shared_ptr) ---
     m.def("cubeful_equity_nply", [](const std::vector<int>& board_vec,
@@ -5190,6 +5261,48 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         CubeInfo ci{cube_value, owner, {0, 0, false}, -1.0f, jacoby, beaver};
         return cubeful_equity_nply(board, ci, *eval_strat, n_plies, filter, n_threads);
     }, "Compute cubeful equity for a pre-roll position at N-ply depth (unified, any Strategy).",
+       py::arg("board"), py::arg("owner"),
+       py::arg("strategy"),
+       py::arg("n_plies") = 2,
+       py::arg("filter_max_moves") = 5,
+       py::arg("filter_threshold") = 0.08f,
+       py::arg("n_threads") = 1,
+       py::arg("cube_value") = 1,
+       py::arg("away1") = 0, py::arg("away2") = 0, py::arg("is_crawford") = false,
+       py::arg("jacoby") = true, py::arg("beaver") = true,
+       py::arg("bearoff_db") = nullptr);
+
+    // --- Unified cubeful_probs_nply (accepts any Strategy via shared_ptr) ---
+    m.def("cubeful_probs_nply", [](const std::vector<int>& board_vec,
+                                    CubeOwner owner,
+                                    std::shared_ptr<Strategy> strategy,
+                                    int n_plies,
+                                    int filter_max_moves,
+                                    float filter_threshold,
+                                    int n_threads,
+                                    int cube_value,
+                                    int away1, int away2, bool is_crawford,
+                                    bool jacoby, bool beaver,
+                                    const BearoffDB* bearoff_db) {
+        Board board = list_to_board(board_vec);
+        MoveFilter filter{filter_max_moves, filter_threshold};
+
+        std::shared_ptr<Strategy> eval_strat = strategy;
+        if (bearoff_db && bearoff_db->is_loaded()) {
+            eval_strat = std::make_shared<BearoffStrategy>(strategy, bearoff_db);
+        }
+
+        std::array<float, NUM_OUTPUTS> probs;
+        {
+            py::gil_scoped_release release;
+            CubeInfo ci{cube_value, owner,
+                        {(away1 > 0 ? away1 : 0), (away2 > 0 ? away2 : 0),
+                         is_crawford},
+                        -1.0f, jacoby, beaver};
+            probs = cubeful_probs_nply(board, ci, *eval_strat, n_plies, filter, n_threads);
+        }
+        return probs;
+    }, "Post-roll cubeless probs from the N-ply CUBE-AWARE tree (unified, any Strategy).",
        py::arg("board"), py::arg("owner"),
        py::arg("strategy"),
        py::arg("n_plies") = 2,

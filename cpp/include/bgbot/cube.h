@@ -248,6 +248,21 @@ float cubeful_equity_nply(
     int n_threads = 1,
     const Strategy* move_filter = nullptr);
 
+// Returns post-roll probabilities from the N-ply CUBE-AWARE tree, in the
+// player-on-roll's perspective at `board`. Mirrors `cubeful_equity_nply` (CubeInfo
+// overload) but accumulates probs from the same tree — interior move picks use
+// 1-ply cubeful equity against `cube` (shared-cube MVP), so the returned probs
+// reflect match-aware play throughout, unlike `evaluate_probs_nply` which uses
+// cubeless interior picks.
+std::array<float, NUM_OUTPUTS> cubeful_probs_nply(
+    const Board& board,
+    const CubeInfo& cube,
+    const Strategy& strategy,
+    int n_plies,
+    const MoveFilter& filter = MoveFilters::TINY,
+    int n_threads = 1,
+    const Strategy* move_filter = nullptr);
+
 // Batched version: evaluate cubeful equity for the SAME board at N-ply depth
 // against MULTIPLE cube states simultaneously. Returns one equity per cube
 // state in `out`, in the same order as `cubes`.
@@ -340,5 +355,14 @@ inline CubeDecision cube_decision_from_probs(
 // Profiling counters for cubeful recursion (debug only)
 void reset_cubeful_counters();
 void print_cubeful_counters();
+
+struct CubefulCounters {
+    int64_t leaf_count;
+    int64_t internal_count;
+    int64_t cache_hit_count;
+    int64_t move_gen_count;
+    int64_t total_candidates;
+};
+CubefulCounters get_cubeful_counters();
 
 } // namespace bgbot

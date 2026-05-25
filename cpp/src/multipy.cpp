@@ -3,6 +3,7 @@
 #include "bgbot/multipy.h"
 #include "bgbot/bearoff.h"
 #include "bgbot/board.h"
+#include "bgbot/cube.h"       // for cubeful_equity_nply_multi (cubeful BMI)
 #include "bgbot/moves.h"
 #include "bgbot/encoding.h"
 #include <algorithm>
@@ -819,6 +820,240 @@ int MultiPlyStrategy::best_move_index_impl(
     }
 
     return best_idx;
+}
+
+// ========================== Cube-aware best_move_index ==========================
+//
+// Picks the best candidate(s) by CUBEFUL equity at full N-ply depth, against
+// one or more cube states. Strategy:
+//   1. 1-ply cubeful filter per cube, UNIONED across cubes — each cube's
+//      cubeful-1-ply favorites reach the N-ply rescore. (See below for the
+//      correctness motivation; the old cubeless filter dropped match-defensive
+//      moves before the cubeful tree could see them.)
+//   2. Subsequent ply > 1 filter steps stay cubeless for now (only fire at
+//      4-ply target).
+//   3. Final N-ply cubeful evaluation per survivor via cubeful_equity_nply_multi
+//      (one call per survivor; shares its NN tree across all cube states).
+//      For each cube state, return the survivor with the highest cubeful equity.
+//
+// cube_x is used at the 1-ply filter (passed to cl2cf). At N-ply leaves,
+// cubeful_equity_nply_multi computes its own per-leaf cube efficiency.
+
+void MultiPlyStrategy::best_move_index_cubeful_multi(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo* cubes,
+    int n_cubes,
+    float cube_x,
+    int* out_indices) const
+{
+    const int n = static_cast<int>(candidates.size());
+    if (n == 0) return;
+    if (n_cubes <= 0) return;
+    if (n == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = 0;
+        return;
+    }
+
+    // 1-ply shortcut: delegate to base strategy's cubeful selection (it knows
+    // how to batch evaluate + apply cl2cf per cube).
+    if (n_plies_ == 1) {
+        base_->best_move_index_cubeful_multi(candidates, pre_move_board,
+                                              cubes, n_cubes, cube_x, out_indices);
+        return;
+    }
+
+    // ----- 1-ply cubeful filter (per cube, unioned across cubes) -----
+    //
+    // Why per-cube: a pure cubeless 1-ply filter drops candidates whose
+    // cubeless equity sits more than `threshold` below the cubeless-best —
+    // but in extreme match scores (e.g. 1-away with cube=2) the CUBEFUL
+    // winner can be a defensive move whose cubeless equity is well below
+    // the cubeless-best. Same applies when ND and DT branches have different
+    // cube ownership/value: their cubeful preferences can diverge. Without
+    // per-cube filtering the cubeful N-ply rescore never sees the defensive
+    // move and picks the same aggressive move under all cubes — a real
+    // correctness bug at extreme match scores.
+    //
+    // We compute 1-ply probs once per candidate, then for each cube state
+    // apply cl2cf and union the top max_moves within threshold into the
+    // survivor set. Each cube's cubeful-1-ply best is guaranteed in the
+    // set that reaches the N-ply rescore.
+    //
+    // Implementation note: this loops evaluate_probs per candidate (one NN
+    // call) rather than calling batch_evaluate_candidates_equity_probs. The
+    // batched variant in GamePlanStrategy segfaults under parallel trial
+    // dispatch (see comment in Strategy::best_move_index_cubeful_multi).
+
+    Strategy* filter_s = filter_strat_ ? filter_strat_.get() : base_.get();
+
+    std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
+    for (int i = 0; i < n; ++i) {
+        GameResult r = check_game_over(candidates[i]);
+        if (r != GameResult::NOT_OVER) {
+            probs_per[i] = terminal_probs(r);
+        } else {
+            probs_per[i] = filter_s->evaluate_probs(candidates[i], pre_move_board);
+        }
+        clamp_probs_to_board(probs_per[i], candidates[i]);
+    }
+
+    // First filter step from the chain (always ply=1 in the current default
+    // chains). Use its max_moves and threshold for the cubeful filter.
+    const MoveFilterStep& first_step = filter_chain_[0];
+    std::vector<bool> in_set(n, false);
+    std::vector<int> survivors;
+    survivors.reserve(std::min(n, first_step.max_moves * n_cubes));
+
+    {
+        // Per-cube top-K-within-threshold; union into in_set/survivors.
+        std::vector<std::pair<float, int>> cube_eqs;
+        cube_eqs.reserve(n);
+        for (int c = 0; c < n_cubes; ++c) {
+            cube_eqs.clear();
+            for (int i = 0; i < n; ++i) {
+                float cf = cl2cf(probs_per[i], cubes[c], cube_x);
+                cube_eqs.emplace_back(cf, i);
+            }
+            std::sort(cube_eqs.begin(), cube_eqs.end(),
+                      [](const std::pair<float, int>& a,
+                         const std::pair<float, int>& b) {
+                          return a.first > b.first;
+                      });
+            float best_cf = cube_eqs[0].first;
+            int keep = 0;
+            for (const auto& p : cube_eqs) {
+                if (keep >= first_step.max_moves) break;
+                if (best_cf - p.first > first_step.threshold) break;
+                if (!in_set[p.second]) {
+                    in_set[p.second] = true;
+                    survivors.push_back(p.second);
+                }
+                ++keep;
+            }
+        }
+    }
+
+    if (survivors.size() == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = survivors[0];
+        return;
+    }
+
+    // ----- Subsequent filter steps (currently cubeless; only fires at 4-ply) -----
+    //
+    // TODO: For full correctness at 4-ply in extreme match positions, this
+    // step should also become per-cube cubeful (call cubeful_equity_nply_multi
+    // at step.ply for each survivor across all cubes, then union top-K per
+    // cube). For now it stays cubeless — the 1-ply cubeful union above already
+    // ensures each cube's cubeful-1-ply favorite reaches this step.
+
+    std::vector<double> equities(n);
+    for (size_t step_idx = 1; step_idx < filter_chain_.size(); ++step_idx) {
+        if (static_cast<int>(survivors.size()) <= 1) break;
+        const auto& step = filter_chain_[step_idx];
+
+        for (int idx : survivors) {
+            auto probs = evaluate_probs_nply_impl(
+                candidates[idx], pre_move_board, step.ply, false);
+            equities[idx] = compute_equity(probs);
+        }
+        std::sort(survivors.begin(), survivors.end(),
+                  [&](int a, int b) { return equities[a] > equities[b]; });
+
+        double best_eq = equities[survivors[0]];
+        int keep = 0;
+        for (int idx : survivors) {
+            if (keep >= step.max_moves) break;
+            if (best_eq - equities[idx] > step.threshold) break;
+            ++keep;
+        }
+        if (keep < 1) keep = 1;
+        survivors.resize(keep);
+    }
+
+    if (survivors.size() == 1) {
+        for (int c = 0; c < n_cubes; ++c) out_indices[c] = survivors[0];
+        return;
+    }
+
+    // ----- Final cubeful evaluation per survivor -----
+    //
+    // cubeful_equity_nply_multi(board, cubes, ...) expects `board` to be a
+    // PRE-ROLL position from the perspective of the player about to roll, and
+    // returns equity from that player's POV. For our candidates (mover's
+    // post-move boards in mover's POV), the player about to roll is the
+    // OPPONENT — so we must flip both the board and the cubes to the
+    // opponent's perspective before the call. The returned equity is then in
+    // the opponent's POV; argmin picks the worst-for-opp = best-for-mover.
+    //
+    // (Matches the convention in BgBotAnalyzer._cubeful_equity, which flips
+    // the post-move board and negates the result.)
+    const int n_surv = static_cast<int>(survivors.size());
+    // cf_equities[i][c] = cubeful equity (in OPPONENT's POV) of survivor i under cube c
+    std::vector<std::vector<float>> cf_equities(n_surv, std::vector<float>(n_cubes));
+
+    // Pre-flip cube states once: owner toggles, away scores swap (match only),
+    // cube_value/jacoby/beaver/etc. unchanged.
+    std::vector<CubeInfo> opp_cubes(n_cubes);
+    for (int c = 0; c < n_cubes; ++c) {
+        opp_cubes[c] = cubes[c];
+        opp_cubes[c].owner = flip_owner(opp_cubes[c].owner);
+        if (!opp_cubes[c].is_money()) {
+            std::swap(opp_cubes[c].match.away1, opp_cubes[c].match.away2);
+        }
+    }
+
+    auto eval_one = [&](int i) {
+        Board opp_board = flip(candidates[survivors[i]]);
+        cubeful_equity_nply_multi(
+            opp_board, opp_cubes.data(), n_cubes,
+            *base_, n_plies_,
+            cf_equities[i].data(),
+            MoveFilters::TINY, 1,           // serial inside; trial-level parallelism is across trials
+            move_prefilter_ ? move_prefilter_.get() : nullptr,
+            /*fTop=*/false);
+    };
+
+    bool use_parallel = parallel_evaluate_ && n_plies_ > 2;
+    if (use_parallel) {
+        int n_threads = std::min<int>(parallel_thread_count(n_plies_), n_surv);
+        if (n_threads > 1) {
+            multipy_parallel_for(n_surv, n_threads, eval_one);
+        } else {
+            for (int i = 0; i < n_surv; ++i) eval_one(i);
+        }
+    } else {
+        for (int i = 0; i < n_surv; ++i) eval_one(i);
+    }
+
+    // For each cube state, pick the survivor with the LOWEST cubeful equity.
+    //
+    // cf_equities was computed by flipping the candidate to the opponent's
+    // perspective (since the opp is the next on-roll after our mover's move),
+    // so the values are in OPPONENT's POV. The MOVER wants to minimize the
+    // opponent's resulting equity → argmin picks the best move for the mover.
+    for (int c = 0; c < n_cubes; ++c) {
+        float best_cf = std::numeric_limits<float>::infinity();
+        int best_surv_i = 0;
+        for (int i = 0; i < n_surv; ++i) {
+            if (cf_equities[i][c] < best_cf) {
+                best_cf = cf_equities[i][c];
+                best_surv_i = i;
+            }
+        }
+        out_indices[c] = survivors[best_surv_i];
+    }
+}
+
+int MultiPlyStrategy::best_move_index_cubeful(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo& ci,
+    float cube_x) const
+{
+    int out = 0;
+    best_move_index_cubeful_multi(candidates, pre_move_board, &ci, 1, cube_x, &out);
+    return out;
 }
 
 int MultiPlyStrategy::best_move_index(const std::vector<Board>& candidates,

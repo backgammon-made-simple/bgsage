@@ -2,9 +2,11 @@
 // Copyright (C) 2026 Mark Higgins
 #include "bgbot/strategy.h"
 #include "bgbot/board.h"
+#include "bgbot/cube.h"        // for CubeInfo + cl2cf (cube-aware defaults)
 #include "bgbot/encoding.h"
 #include <limits>
 #include <algorithm>
+#include <vector>
 
 namespace bgbot {
 
@@ -42,6 +44,84 @@ int Strategy::best_move_index(const std::vector<Board>& candidates,
 int Strategy::best_move_index(const std::vector<Board>& candidates,
                               const Board& pre_move_board) const {
     return best_move_index(candidates, is_race(pre_move_board));
+}
+
+// ----- Cube-aware move selection (default implementations) -----
+//
+// Both defaults dispatch through batch_evaluate_candidates_equity_probs so
+// subclasses with optimized batch NN forward passes (e.g. GamePlanStrategy)
+// pick up the optimization automatically — no per-subclass override needed
+// for cubeful selection unless the subclass wants something fancier (e.g.
+// MultiPlyStrategy delegating to cubeful_equity_nply_multi).
+//
+// batch_evaluate_candidates_equity_probs already substitutes terminal_probs
+// for game-over candidates. We clamp afterward to enforce position invariants
+// before Janowski (cl2cf) sees them.
+
+int Strategy::best_move_index_cubeful(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo& ci,
+    float cube_x) const
+{
+    const int n = static_cast<int>(candidates.size());
+    std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
+    batch_evaluate_candidates_equity_probs(candidates, pre_move_board,
+                                           nullptr, probs_per.data());
+
+    int best_idx = 0;
+    float best_cf = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        clamp_probs_to_board(probs_per[i], candidates[i]);
+        float cf = cl2cf(probs_per[i], ci, cube_x);
+        if (cf > best_cf) {
+            best_cf = cf;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+void Strategy::best_move_index_cubeful_multi(
+    const std::vector<Board>& candidates,
+    const Board& pre_move_board,
+    const CubeInfo* cubes,
+    int n_cubes,
+    float cube_x,
+    int* out_indices) const
+{
+    // Evaluate cubeless probs once per candidate (expensive part — NN batch),
+    // then loop cl2cf per cube state (cheap).
+    const int n = static_cast<int>(candidates.size());
+    std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
+    // NOTE: tried batch_evaluate_candidates_equity_probs (Idea 5) and it
+    // segfaults under parallel trial dispatch. The batch implementation in
+    // GamePlanStrategy is not safe for concurrent use across many threads
+    // running this from inside rollout trials. Loop evaluate_probs instead.
+    for (int i = 0; i < n; ++i) {
+        GameResult r = check_game_over(candidates[i]);
+        if (r != GameResult::NOT_OVER) {
+            probs_per[i] = terminal_probs(r);
+        } else {
+            probs_per[i] = evaluate_probs(candidates[i], pre_move_board);
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        clamp_probs_to_board(probs_per[i], candidates[i]);
+    }
+
+    for (int c = 0; c < n_cubes; ++c) {
+        int best_idx = 0;
+        float best_cf = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n; ++i) {
+            float cf = cl2cf(probs_per[i], cubes[c], cube_x);
+            if (cf > best_cf) {
+                best_cf = cf;
+                best_idx = i;
+            }
+        }
+        out_indices[c] = best_idx;
+    }
 }
 
 // ----- Default batch evaluation implementations -----

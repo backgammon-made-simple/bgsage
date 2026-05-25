@@ -266,6 +266,26 @@ public:
     int best_move_index(const std::vector<Board>& candidates,
                         const Board& pre_move_board) const override;
 
+    // Cube-aware overrides: runs the existing cubeless filter chain to narrow
+    // candidates, then evaluates survivors at full N-ply CUBEFUL depth via
+    // cubeful_equity_nply_multi (one call per survivor; that call shares its
+    // NN tree across all cube states). cube_x is unused by this override —
+    // cubeful_equity_nply_multi computes per-leaf cube efficiency from the
+    // leaf board, which is the correct convention at N-ply.
+    int best_move_index_cubeful(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo& ci,
+        float cube_x) const override;
+
+    void best_move_index_cubeful_multi(
+        const std::vector<Board>& candidates,
+        const Board& pre_move_board,
+        const CubeInfo* cubes,
+        int n_cubes,
+        float cube_x,
+        int* out_indices) const override;
+
     // Cache management.
     void clear_cache() const;
     size_t cache_size() const;
