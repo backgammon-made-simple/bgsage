@@ -1136,12 +1136,17 @@ static void cubeful_recursive_multi(
     bool allow_parallel,
     bool fTop,
     float arCubeful[],
-    const Strategy* move_filter = nullptr)
+    const Strategy* move_filter = nullptr,
+    std::array<float, NUM_OUTPUTS>* arProbsOut = nullptr)
 {
     bool is_money = (cci > 0 && aciCubePos[0].cube_value > 0)
                     ? aciCubePos[0].is_money() : true;
 
-    if (get_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful)) {
+    // Cubeful cache holds only equity, not probs. Bypass cache when caller
+    // requests probs (rare path used by post_move_analytics; cache benefit is
+    // small for top-level single calls anyway).
+    if (arProbsOut == nullptr &&
+        get_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful)) {
         g_cache_hit_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1172,7 +1177,10 @@ static void cubeful_recursive_multi(
                     aciCubePos[ici].cube_value, aciCubePos[ici].match.is_crawford);
             }
         }
-        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+        if (arProbsOut) *arProbsOut = t_probs;
+        if (arProbsOut == nullptr) {
+            put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+        }
         return;
     }
 
@@ -1219,7 +1227,10 @@ static void cubeful_recursive_multi(
 
         // Collapse 2*cci → cci
         get_ecf3(arCubeful, cci, arCf, aci);
-        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+        if (arProbsOut) *arProbsOut = pre_roll_probs;
+        if (arProbsOut == nullptr) {
+            put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+        }
         return;
     }
 
@@ -1231,11 +1242,16 @@ static void cubeful_recursive_multi(
     make_cube_pos(aciCubePos, cci, fTop, aci, true);
     int expanded_cci = 2 * cci;
 
-    // Accumulators for weighted cubeful equities
+    // Accumulators for weighted cubeful equities (in opp's POV; converted to
+    // current player's POV via negate-or-MWC-complement at the end). When
+    // arProbsOut is requested, also accumulate weighted probs (in opp's POV;
+    // inverted to current player's POV at the end).
     float arCf[MAX_CCI * 2] = {};
+    std::array<float, NUM_OUTPUTS> arProbsAccum = {};
 
     // Lambda to evaluate a single dice roll
-    auto evaluate_roll = [&](int roll_idx, float arCfLocal[]) {
+    auto evaluate_roll = [&](int roll_idx, float arCfLocal[],
+                             std::array<float, NUM_OUTPUTS>* arProbsLocal) {
         const auto& roll = ALL_ROLLS[roll_idx];
         const bool child_allow_parallel = allow_parallel && (plies - 1 > 2);
 
@@ -1252,12 +1268,18 @@ static void cubeful_recursive_multi(
             // No legal moves: evaluate standing pat (flip board = opponent's turn)
             Board opp_board = flip(board);
             float arCfTemp[MAX_CCI * 2];
+            std::array<float, NUM_OUTPUTS> probsTemp{};
             cubeful_recursive_multi(opp_board, aci, expanded_cci,
                                     strategy, base_gps, plies - 1, filter,
                                     n_threads, child_allow_parallel, false,
-                                    arCfTemp, move_filter);
+                                    arCfTemp, move_filter,
+                                    arProbsLocal ? &probsTemp : nullptr);
             for (int i = 0; i < expanded_cci; i++)
                 arCfLocal[i] = roll.weight * arCfTemp[i];
+            if (arProbsLocal) {
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    (*arProbsLocal)[k] = roll.weight * probsTemp[k];
+            }
             return;
         }
 
@@ -1292,25 +1314,49 @@ static void cubeful_recursive_multi(
                             aci[i].cube_value, aci[i].match.is_crawford);
                     }
                 }
+                if (arProbsLocal) {
+                    // tp is already in opp-of-mover's POV (the recursive level
+                    // convention). Weight by roll prob.
+                    for (int k = 0; k < NUM_OUTPUTS; k++)
+                        (*arProbsLocal)[k] = roll.weight * tp[k];
+                }
                 return;
             }
 
             Board opp_pre_roll = flip(best_board);
             float arCfTemp[MAX_CCI * 2];
+            std::array<float, NUM_OUTPUTS> probsTemp{};
             cubeful_recursive_multi(opp_pre_roll, aci, expanded_cci,
                                     strategy, base_gps, plies - 1, filter,
                                     n_threads, child_allow_parallel, false,
-                                    arCfTemp, move_filter);
+                                    arCfTemp, move_filter,
+                                    arProbsLocal ? &probsTemp : nullptr);
             for (int i = 0; i < expanded_cci; i++) {
                 arCfLocal[i] = roll.weight * arCfTemp[i];
+            }
+            if (arProbsLocal) {
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    (*arProbsLocal)[k] = roll.weight * probsTemp[k];
             }
             return;
         }
 
-        // Pick best move by cubeless 1-ply equity (shared across all cube states).
-        // Two-stage filtering: if move_filter is set and we have enough candidates,
-        // use the cheap filter (e.g. PubEval) to narrow to top K, then evaluate
-        // survivors with the full model.
+        // Pick best move — shared across all cube states (no per-cube fork).
+        //
+        // When the input cci has at least one live cube, pick by CUBEFUL equity
+        // against cubes[0] (the primary cube state for this analysis). This is
+        // the multi-ply analog of the rollout's shared-board MVP — every
+        // interior pick becomes match-aware (when cubes[0] carries match info)
+        // without forking the recursion per cube. cl2cf applied to 1-ply NN
+        // probs is the approximation: it picks as if the rest of the game were
+        // a single roll under Janowski/MWC conversion. The probs are evaluated
+        // per candidate anyway, so cl2cf is only a few extra ops on top.
+        //
+        // When cci is 0 (cubeless callers), fall back to the cubeless pick.
+        //
+        // Two-stage filtering: if move_filter is set and we have enough
+        // candidates, use the cheap filter (e.g. PubEval) to narrow to top K
+        // first.
         static constexpr int MOVE_FILTER_THRESHOLD = 16;
         static constexpr int MOVE_FILTER_KEEP = 15;
 
@@ -1347,8 +1393,38 @@ static void cubeful_recursive_multi(
             eval_candidates = &filtered;
         }
 
-        // Stage 2: full model evaluation on survivors
-        if (base_gps) {
+        // Stage 2: full model evaluation on survivors. Cubeful pick uses
+        // cubes[0]; cubeless pick (cci == 0) uses cubeless equity.
+        const bool use_cubeful_pick = (cci > 0 && aciCubePos[0].cube_value > 0);
+
+        if (use_cubeful_pick) {
+            // Need probs per candidate to apply cl2cf. Loop evaluate_probs
+            // matches the safe-under-parallel-trial-dispatch convention used
+            // elsewhere (see Strategy::best_move_index_cubeful_multi).
+            float best_cf = -std::numeric_limits<float>::infinity();
+            int local_best = 0;
+            const int ec_size = static_cast<int>(eval_candidates->size());
+            for (int c = 0; c < ec_size; c++) {
+                const Board& cand = (*eval_candidates)[c];
+                std::array<float, NUM_OUTPUTS> probs;
+                GameResult gr = check_game_over(cand);
+                if (gr != GameResult::NOT_OVER) {
+                    probs = terminal_probs(gr);
+                } else {
+                    probs = strategy.evaluate_probs(cand, is_race(cand));
+                }
+                bool race = is_race(cand);
+                auto [pp, op] = pip_counts(cand);
+                float cube_x = cube_efficiency(probs, race, pp, op);
+                float cf = cl2cf(probs, aciCubePos[0], cube_x);
+                if (cf > best_cf) {
+                    best_cf = cf;
+                    local_best = c;
+                }
+            }
+            best_idx = (eval_candidates == &candidates)
+                ? local_best : orig_indices[local_best];
+        } else if (base_gps) {
             int local_best = base_gps->batch_evaluate_candidates_best_prob(
                 *eval_candidates, board, nullptr, nullptr);
             best_idx = (eval_candidates == &candidates)
@@ -1405,6 +1481,10 @@ static void cubeful_recursive_multi(
                         aci[i].cube_value, aci[i].match.is_crawford);
                 }
             }
+            if (arProbsLocal) {
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    (*arProbsLocal)[k] = roll.weight * tp[k];
+            }
             return;
         }
 
@@ -1412,30 +1492,49 @@ static void cubeful_recursive_multi(
         Board opp_pre_roll = flip(best_board);
 
         float arCfTemp[MAX_CCI * 2];
+        std::array<float, NUM_OUTPUTS> probsTemp{};
         cubeful_recursive_multi(opp_pre_roll, aci, expanded_cci,
                                 strategy, base_gps, plies - 1, filter,
                                 n_threads, child_allow_parallel, false,
-                                arCfTemp, move_filter);
+                                arCfTemp, move_filter,
+                                arProbsLocal ? &probsTemp : nullptr);
 
         for (int i = 0; i < expanded_cci; i++)
             arCfLocal[i] = roll.weight * arCfTemp[i];
+        if (arProbsLocal) {
+            for (int k = 0; k < NUM_OUTPUTS; k++)
+                (*arProbsLocal)[k] = roll.weight * probsTemp[k];
+        }
     };
 
     // Execute rolls (serial or parallel)
     if (allow_parallel && n_threads > 1 && plies > 1) {
         std::array<std::array<float, MAX_CCI * 2>, 21> roll_results;
+        std::array<std::array<float, NUM_OUTPUTS>, 21> roll_probs{};
         multipy_parallel_for(21, n_threads, [&](int idx) {
-            evaluate_roll(idx, roll_results[idx].data());
+            evaluate_roll(idx, roll_results[idx].data(),
+                          arProbsOut ? &roll_probs[idx] : nullptr);
         });
         for (int r = 0; r < 21; r++)
             for (int i = 0; i < expanded_cci; i++)
                 arCf[i] += roll_results[r][i];
+        if (arProbsOut) {
+            for (int r = 0; r < 21; r++)
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    arProbsAccum[k] += roll_probs[r][k];
+        }
     } else {
         float arCfLocal[MAX_CCI * 2];
+        std::array<float, NUM_OUTPUTS> probsLocal{};
         for (int r = 0; r < 21; r++) {
-            evaluate_roll(r, arCfLocal);
+            evaluate_roll(r, arCfLocal,
+                          arProbsOut ? &probsLocal : nullptr);
             for (int i = 0; i < expanded_cci; i++)
                 arCf[i] += arCfLocal[i];
+            if (arProbsOut) {
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    arProbsAccum[k] += probsLocal[k];
+            }
         }
     }
 
@@ -1448,6 +1547,13 @@ static void cubeful_recursive_multi(
         }
     }
 
+    // Probs: divide by 36 and invert from opp's POV to current player's POV.
+    if (arProbsOut) {
+        for (int k = 0; k < NUM_OUTPUTS; k++)
+            arProbsAccum[k] /= 36.0f;
+        *arProbsOut = invert_probs(arProbsAccum);
+    }
+
     // Un-invert the cube states back to current player's perspective
     // (make_cube_pos with fInvert=true flipped them to opponent's view)
     for (int i = 0; i < expanded_cci; i++) {
@@ -1458,7 +1564,9 @@ static void cubeful_recursive_multi(
 
     // Collapse 2*cci → cci via optimal cube decisions
     get_ecf3(arCubeful, cci, arCf, aci);
-    put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+    if (arProbsOut == nullptr) {
+        put_cached_cubeful(board, aciCubePos, cci, strategy, plies, fTop, arCubeful);
+    }
 }
 
 float cubeful_equity_nply(
@@ -1521,6 +1629,46 @@ float cubeful_equity_nply(
     if (cube.is_money()) return arCubeful[0];
     return mwc2eq(arCubeful[0], cube.match.away1, cube.match.away2,
                   cube.cube_value, cube.match.is_crawford);
+}
+
+// Returns post-roll probabilities from the N-ply CUBE-AWARE tree, in the
+// player-on-roll's perspective at `board`. Mirrors `cubeful_equity_nply` (CubeInfo
+// overload) but extracts probs from the same tree — the move picks at each
+// interior level use 1-ply cubeful equity against `cube` (Phase 1 shared-cube
+// MVP), so the resulting probs reflect match-aware play throughout.
+//
+// Used by `post_move_analytics` when the inner analyzer is N-ply and the
+// caller wants probs that depend on cube state (e.g. for a 1-away match score).
+std::array<float, NUM_OUTPUTS> cubeful_probs_nply(
+    const Board& board,
+    const CubeInfo& cube,
+    const Strategy& strategy,
+    int n_plies,
+    const MoveFilter& filter,
+    int n_threads,
+    const Strategy* move_filter)
+{
+    if (n_plies <= 1) {
+        // 1-ply: NN eval on the flipped board → invert to player-on-roll's POV.
+        Board flipped = flip(board);
+        bool race = is_race(board);
+        auto post_probs = strategy.evaluate_probs(flipped, race);
+        auto pre_roll_probs = invert_probs(post_probs);
+        clamp_probs_to_board(pre_roll_probs, board);
+        return pre_roll_probs;
+    }
+
+    begin_cubeful_cache_epoch();
+
+    CubeInfo aciCubePos[1] = {cube};
+    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
+    float arCubeful[1];
+    std::array<float, NUM_OUTPUTS> arProbs{};
+    bool allow_parallel = (n_threads > 1 && n_plies > 2);
+    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
+                            n_threads, allow_parallel, false, arCubeful,
+                            move_filter, &arProbs);
+    return arProbs;
 }
 
 // Batched version: evaluate multiple cube states against the same board in a

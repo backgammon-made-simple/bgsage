@@ -1118,9 +1118,40 @@ class BgBotAnalyzer:
         )
 
         if isinstance(inner, _MultiPlyAnalyzer):
-            r = inner._strategy_nply.evaluate_board(board, board)
-            eval_level = f"{inner._n_plies}-ply"
+            n_plies = inner._n_plies
             inner._strategy_nply.clear_cache()
+            # Route through cubeful_probs_nply (N-ply CUBE-AWARE tree) when
+            # cube info is meaningful so the returned probs reflect match-aware
+            # interior picks. Falls back to cubeless evaluate_board when no
+            # cube info is present (no-op for 1-ply where there's nothing to
+            # change).
+            if owner is not None and n_plies > 1:
+                # Mirror the flip/perspective dance in _cubeful_equity: flip
+                # the board to opp's POV, flip the cube owner, swap away
+                # scores; cubeful_probs_nply returns probs in opp's POV at the
+                # flipped pre-roll position; invert to get back to ours.
+                opp_pre_roll = bgbot_cpp.flip_board(board)
+                opp_owner = _FLIP_OWNER[owner]
+                opp_probs = bgbot_cpp.cubeful_probs_nply(
+                    opp_pre_roll, opp_owner,
+                    inner._strategy_1ply, n_plies,
+                    cube_value=cube_value,
+                    away1=away2, away2=away1, is_crawford=is_crawford,
+                    jacoby=jacoby,
+                    bearoff_db=getattr(inner, '_bearoff_db', None),
+                )
+                # invert_probs from bgsage.board: [W, gW, bW, gL, bL] in opp's
+                # POV → [1-W, gL, bL, gW, bW] in our POV
+                probs = [1.0 - opp_probs[0],
+                         opp_probs[3], opp_probs[4],
+                         opp_probs[1], opp_probs[2]]
+                cl_eq = (2.0 * probs[0] - 1.0
+                         + probs[1] - probs[3]
+                         + probs[2] - probs[4])
+                r = {"probs": probs, "equity": cl_eq}
+            else:
+                r = inner._strategy_nply.evaluate_board(board, board)
+            eval_level = f"{n_plies}-ply"
         elif isinstance(inner, _RolloutAnalyzer):
             if use_cubeful_rollout:
                 r = inner._rollout_strategy.cubeful_evaluate_board(

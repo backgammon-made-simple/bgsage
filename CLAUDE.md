@@ -1341,8 +1341,9 @@ this array:
   apply Janowski (`cl2cf`) to each expanded state, collapse via get_ecf3.
 
 - **Internal (plies>0):** Expand via make_cube_pos (with fInvert=true for opponent's
-  perspective). For each of 21 dice rolls: generate moves, pick best by cubeless
-  1-ply equity (shared across all cube states), flip to opponent perspective, recurse
+  perspective). For each of 21 dice rolls: generate moves, pick best by 1-ply CUBEFUL
+  equity (`cl2cf` against `aciCubePos[0]`, the primary cube state — shared across
+  all cube states; no per-cube subtree fork), flip to opponent perspective, recurse
   at plies-1. Average over 36 total weight, flip perspective back, collapse via
   get_ecf3.
 
@@ -1355,8 +1356,12 @@ this array:
 
 **Key properties:**
 - Cube decisions at every level use full recursive values (not heuristic predictions)
-- Move selection is cubeless (negligible impact, much cheaper than per-state cubeful)
-- Janowski `x` is only applied at 1-ply leaf nodes
+- Move selection uses 1-ply cubeful equity (`cl2cf` against the primary cube state
+  `aciCubePos[0]`) — captures match-awareness throughout the tree without per-cube
+  forking. For multi-cube callers (e.g. `cube_decision_nply` carrying ND+DT) the pick
+  is biased toward `cubes[0]`; this matches the rollout's shared-board MVP.
+- Janowski `x` is applied at 1-ply leaf nodes for the final cubeful conversion AND
+  at interior nodes for the cubeful move-pick (using each candidate's own cube_x)
 - The cci array grows and shrinks at each level (1->2->4->...->collapse back)
 - Both money game and match play use the same recursion; only the leaf conversion
   (`cl2cf_money` vs `cl2cf_match`) and get_ecf3 scaling differ
