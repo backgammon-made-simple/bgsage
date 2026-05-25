@@ -346,7 +346,8 @@ class _RolloutAnalyzer(_CubelessBase):
         checker=None, checker_late=None,
         cube=None, cube_late=None,
         ultra_late_threshold=9999,
-        cubeful_trial_moves=False,
+        cubeful_trial_moves=True,
+        cubeful_late_threshold=0,
     ):
         super().__init__(weights)
         requested_threads = n_threads
@@ -390,6 +391,7 @@ class _RolloutAnalyzer(_CubelessBase):
             cube_late=cube_late_cfg,
             ultra_late_threshold=ultra_late_threshold,
             cubeful_trial_moves=cubeful_trial_moves,
+            cubeful_late_threshold=cubeful_late_threshold,
         )
 
     def cancel(self):
@@ -861,7 +863,8 @@ class BgBotAnalyzer:
         cube=None,
         cube_late=None,
         ultra_late_threshold: int = 9999,
-        cubeful_trial_moves: bool = False,
+        cubeful_trial_moves: bool = True,
+        cubeful_late_threshold: int = 0,
     ):
         if weights is None:
             weights = default_weights()
@@ -872,6 +875,10 @@ class BgBotAnalyzer:
         # eval levels select trial moves by cubeful equity against the trial's
         # cube state instead of cubeless equity.
         self._cubeful_trial_moves = bool(cubeful_trial_moves)
+        # Per-move drop-to-cubeless threshold for full-game rollouts where
+        # ultra_late_threshold=9999 keeps cubeful active for ~50 half-moves.
+        # 0 = inherit from ultra_late_threshold (no separate drop).
+        self._cubeful_late_threshold = int(cubeful_late_threshold)
 
         # Load bearoff database
         self._bearoff_db = None
@@ -900,6 +907,7 @@ class BgBotAnalyzer:
                 seed=seed,
                 ultra_late_threshold=2,
                 cubeful_trial_moves=self._cubeful_trial_moves,
+                cubeful_late_threshold=self._cubeful_late_threshold,
             )
         elif eval_level == "truncated2":
             inner = _RolloutAnalyzer(
@@ -913,6 +921,7 @@ class BgBotAnalyzer:
                 late_threshold=2,
                 ultra_late_threshold=2,
                 cubeful_trial_moves=self._cubeful_trial_moves,
+                cubeful_late_threshold=self._cubeful_late_threshold,
             )
         elif eval_level == "truncated3":
             inner = _RolloutAnalyzer(
@@ -926,6 +935,7 @@ class BgBotAnalyzer:
                 late_threshold=2,
                 ultra_late_threshold=2,
                 cubeful_trial_moves=self._cubeful_trial_moves,
+                cubeful_late_threshold=self._cubeful_late_threshold,
             )
         elif eval_level == "rollout":
             inner = _RolloutAnalyzer(
@@ -943,6 +953,7 @@ class BgBotAnalyzer:
                 cube_late=cube_late,
                 ultra_late_threshold=ultra_late_threshold,
                 cubeful_trial_moves=self._cubeful_trial_moves,
+                cubeful_late_threshold=self._cubeful_late_threshold,
             )
         else:
             raise ValueError(f"Unknown eval_level: {eval_level!r}")

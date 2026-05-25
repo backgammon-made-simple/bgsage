@@ -569,12 +569,24 @@ std::array<float, NUM_OUTPUTS> RolloutStrategy::best_move_probs_for_candidates(
 
 void RolloutStrategy::prefill_move0_cache(
     const Board& start_board, Move0Cache& cache, int n_threads,
-    SharedPosCache* shared) const
+    SharedPosCache* shared, const CubeInfo* select_cubes, int n_select_cubes) const
 {
     // Move0 uses checker strategy for move selection.
     // This also warms the thread-local PosCache for truncation evaluation.
     const auto& current_strat = *checker_strat_;
     const bool using_base = (&current_strat == base_.get());
+
+    // When cube-aware selection is active, precompute cube_x once for the
+    // start board (cube_efficiency's current impl is position-only, so this
+    // is exact). cube_x is currently unused at N-ply (the cubeful tree
+    // computes leaf cube_x per leaf), but passed for interface consistency.
+    const bool cube_aware = (select_cubes != nullptr && n_select_cubes > 0);
+    float cube_x_stamp = 0.0f;
+    if (cube_aware) {
+        std::array<float, NUM_OUTPUTS> dummy{};
+        auto [pp, op] = pip_counts(start_board);
+        cube_x_stamp = cube_efficiency(dummy, is_race(start_board), pp, op);
+    }
 
     auto compute_roll = [&](int roll_idx) {
         if (shared) MultiPlyStrategy::set_shared_cache(shared);
@@ -591,6 +603,16 @@ void RolloutStrategy::prefill_move0_cache(
             chosen = start_board;
         } else if (candidates.size() == 1) {
             chosen = candidates[0];
+        } else if (cube_aware) {
+            // Multi-cube cubeful BMI: matches the trial loop's call exactly
+            // so the cache value is byte-identical to per-trial recomputation.
+            // Store the result for cubes[0] (the ND/shared-board pick).
+            std::array<int, 4> picks{0, 0, 0, 0};
+            current_strat.best_move_index_cubeful_multi(
+                candidates, start_board,
+                select_cubes, n_select_cubes,
+                cube_x_stamp, picks.data());
+            chosen = candidates[picks[0]];
         } else if (using_base) {
             chosen = candidates[base_->best_move_index(candidates, start_board)];
         } else {
@@ -614,13 +636,27 @@ void RolloutStrategy::prefill_move0_cache(
 }
 
 void RolloutStrategy::populate_move1_cache_entry(
-    const Move0Cache& move0_cache, int first_roll_idx, Move1Cache::Entry& entry) const
+    const Move0Cache& move0_cache, int first_roll_idx, Move1Cache::Entry& entry,
+    const CubeInfo* select_cubes, int n_select_cubes) const
 {
     thread_local std::vector<Board> candidates;
 
     const Board& move0_chosen = move0_cache.chosen[first_roll_idx];
     const Board move1_board = flip(move0_chosen);
     entry.race = is_race(move1_board);
+
+    // For cube-aware selection at move 1, flip every cube state's perspective
+    // to match move1_board (current mover at move 1 is the opponent-of-move-0-
+    // mover). The flipped cubes remain valid for the cache's lifetime
+    // (per-rollout). Multi-cube path is used so the BMI call matches the
+    // trial loop's multi call exactly.
+    const bool cube_aware = (select_cubes != nullptr && n_select_cubes > 0);
+    std::array<CubeInfo, 4> m1_cubes;
+    if (cube_aware) {
+        for (int i = 0; i < n_select_cubes && i < 4; ++i) {
+            m1_cubes[i] = flip_cube_perspective(select_cubes[i]);
+        }
+    }
 
     // Move1 uses 1-ply for move selection. The VR averaging over many trials
     // makes higher-ply move selection unnecessary here. When the bearoff DB
@@ -670,6 +706,15 @@ void RolloutStrategy::populate_move1_cache_entry(
             chosen = move1_board;
         } else if (candidates.size() == 1) {
             chosen = candidates[0];
+        } else if (cube_aware) {
+            // Multi-cube cubeful BMI matches the trial loop's call exactly.
+            // Uses base (1-ply) per ROLLOUT.md §10's move-1 convention.
+            std::array<int, 4> picks{0, 0, 0, 0};
+            current_strat.best_move_index_cubeful_multi(
+                candidates, move1_board,
+                m1_cubes.data(), n_select_cubes,
+                entry.cube_x, picks.data());
+            chosen = candidates[picks[0]];
         } else if (using_base) {
             if (best_idx >= 0 && best_idx < static_cast<int>(candidates.size())) {
                 chosen = candidates[best_idx];
@@ -715,11 +760,12 @@ void RolloutStrategy::populate_move1_cache_entry(
 
 void RolloutStrategy::prefill_move1_cache(
     const Move0Cache& move0_cache, Move1Cache& cache, int n_threads,
-    SharedPosCache* shared) const
+    SharedPosCache* shared, const CubeInfo* select_cubes, int n_select_cubes) const
 {
     auto populate_entry = [&](int roll_idx) {
         if (shared) MultiPlyStrategy::set_shared_cache(shared);
-        populate_move1_cache_entry(move0_cache, roll_idx, cache.entries[roll_idx]);
+        populate_move1_cache_entry(move0_cache, roll_idx, cache.entries[roll_idx],
+                                   select_cubes, n_select_cubes);
         cache.state[roll_idx].store(2, std::memory_order_release);
         if (shared) MultiPlyStrategy::set_shared_cache(nullptr);
     };
@@ -790,6 +836,15 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
     const bool use_cubeful_select =
         (config_.cubeful_trial_moves && cube_active && n_branches > 0);
 
+    // Cubeful-late threshold: stop using cube-aware selection at half-moves
+    // >= this value, falling back to cubeless BMI. Defaults to
+    // ultra_late_threshold (no separate fallback); set lower for full
+    // rollouts where ultra_late=9999 keeps cubeful active for ~50 half-moves.
+    const int cubeful_late_threshold =
+        (config_.cubeful_late_threshold > 0)
+            ? config_.cubeful_late_threshold
+            : config_.ultra_late_threshold;
+
     // Starting convention
     Board board;
     int sp_parity_offset;
@@ -832,8 +887,27 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 int expected = 0;
                 if (move1_cache->state[move0_roll_idx].compare_exchange_strong(
                         expected, 1, std::memory_order_acq_rel)) {
+                    // On-demand populate. When use_cubeful_select is on, pass
+                    // ALL active-branch cubes in MOVE-0 mover's perspective so
+                    // the BMI call matches the trial loop's multi call.
+                    // At move_num==1, Phase 6 has already flipped each branch's
+                    // cube to MOVE-1 mover perspective; flip back here.
+                    // populate_move1_cache_entry re-flips internally to align
+                    // with move 1's candidates (two flips = identity).
+                    std::array<CubeInfo, 4> sel_storage;
+                    const CubeInfo* sel = nullptr;
+                    int n_sel = 0;
+                    if (use_cubeful_select && n_branches > 0) {
+                        for (int b = 0; b < n_branches && b < 4; ++b) {
+                            if (!branches[b].finished) {
+                                sel_storage[n_sel++] = flip_cube_perspective(branches[b].cube);
+                            }
+                        }
+                        sel = (n_sel > 0) ? sel_storage.data() : nullptr;
+                    }
                     populate_move1_cache_entry(*move0_cache, move0_roll_idx,
-                                               move1_cache->entries[move0_roll_idx]);
+                                               move1_cache->entries[move0_roll_idx],
+                                               sel, n_sel);
                     move1_cache->state[move0_roll_idx].store(2, std::memory_order_release);
                     move1_entry = &move1_cache->entries[move0_roll_idx];
                 } else {
@@ -1240,19 +1314,74 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         // the cached result via CAS.
         // (use_cubeful_select is trial-scope, defined above near cube_active.)
 
+        // Per-move gate: drop to cubeless selection at and beyond the
+        // cubeful-late threshold (Idea 3). Cache hits at moves 0/1 are
+        // still cube-stamped, so the cubeful path is taken for those moves
+        // regardless of this threshold.
+        const bool use_cubeful_select_now =
+            use_cubeful_select && (move_num < cubeful_late_threshold);
+
         Board chosen;
         bool used_move0_cache = false;
-        if (use_cubeful_select) {
-            // Cube-aware selection: ignore caches and VR-reuse; always do a
-            // fresh cubeful BMI call against the active branches' cube states.
+        if (use_cubeful_select_now) {
+            // Cube-aware selection. The Move0Cache and Move1Cache are now
+            // cube-stamped (populated with cubeful-best chosen[] under
+            // branches[0]'s cube state at prefill time), so we can reuse them
+            // here exactly like the cubeless path. The cache stamping
+            // assumes ND-branch drives selection, matching the shared-board
+            // MVP that applies picks[0] to the trial.
             const auto& candidates = move_candidates[actual_idx];
-            if (candidates.empty()) {
+            if (move1_entry) {
+                // Move 1: cache stores cubeful-best chosen[]; use directly.
+                chosen = move1_entry->chosen[actual_idx];
+            } else if (candidates.empty()) {
                 chosen = board;
             } else if (candidates.size() == 1) {
                 chosen = candidates[0];
+            } else if (move0_cache && move_num == 0) {
+                // Move 0: try cube-stamped cache. CAS to claim/populate. The
+                // fallback BMI call matches the prefill: multi-cube with all
+                // active branches' cubes (in move-0 mover perspective).
+                int s = move0_cache->state[actual_idx].load(std::memory_order_acquire);
+                if (s == 2) {
+                    chosen = move0_cache->chosen[actual_idx];
+                    used_move0_cache = true;
+                } else {
+                    int expected = 0;
+                    if (move0_cache->state[actual_idx].compare_exchange_strong(
+                            expected, 1, std::memory_order_acq_rel)) {
+                        std::array<CubeInfo, 4> active_cubes;
+                        int n_active = 0;
+                        for (int b = 0; b < n_branches && b < 4; ++b) {
+                            if (!branches[b].finished) {
+                                active_cubes[n_active++] = branches[b].cube;
+                            }
+                        }
+                        if (n_active == 0) {
+                            chosen = candidates[current_strat.best_move_index(
+                                candidates, board)];
+                        } else {
+                            std::array<int, 4> picks{0, 0, 0, 0};
+                            current_strat.best_move_index_cubeful_multi(
+                                candidates, board,
+                                active_cubes.data(), n_active, cube_x,
+                                picks.data());
+                            chosen = candidates[picks[0]];
+                        }
+                        move0_cache->chosen[actual_idx] = chosen;
+                        move0_cache->state[actual_idx].store(2, std::memory_order_release);
+                        used_move0_cache = true;
+                    } else {
+                        while (move0_cache->state[actual_idx].load(std::memory_order_acquire) != 2) {
+                            std::this_thread::yield();
+                        }
+                        chosen = move0_cache->chosen[actual_idx];
+                        used_move0_cache = true;
+                    }
+                }
             } else {
-                // Gather active branch cube states. n_branches <= 2 in the
-                // current architecture (cubeful position: 1, cube decision: 2).
+                // No cache or move > 1: fresh cubeful BMI per the original
+                // shared-board MVP — gather active cubes and dispatch.
                 std::array<CubeInfo, 2> active_cubes;
                 int n_active = 0;
                 for (int b = 0; b < n_branches; ++b) {
@@ -1261,8 +1390,6 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                     }
                 }
                 if (n_active == 0) {
-                    // All branches finished but cube_active gate said otherwise?
-                    // Defensive cubeless fallback.
                     chosen = candidates[current_strat.best_move_index(candidates, board)];
                 } else {
                     std::array<int, 2> picks{0, 0};
@@ -1270,8 +1397,6 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                         candidates, board,
                         active_cubes.data(), n_active, cube_x,
                         picks.data());
-                    // Shared-board MVP: apply branch 0's pick to the trial.
-                    // TODO Option A: per-branch board evolution using picks[1+].
                     chosen = candidates[picks[0]];
                 }
             }
@@ -1868,14 +1993,29 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
     const bool uses_move1_cache =
         (config_.truncation_depth == 0) || (config_.truncation_depth > 1);
 
+    // Cube-aware cache stamping: when cubeful_trial_moves is on, prefill the
+    // caches by calling the SAME multi-cube BMI the trial loop calls (both ND
+    // and DT cubes) so cache values are byte-identical to per-trial
+    // recomputation. chosen[] stores the result for cubes[0] (ND) — that's
+    // what the shared-board MVP applies in the trial.
+    std::array<CubeInfo, 2> select_cubes_for_cache{nd_template.cube, dt_template.cube};
+    const CubeInfo* select_cubes_ptr = nullptr;
+    int n_select_cubes = 0;
+    if (config_.cubeful_trial_moves) {
+        select_cubes_ptr = select_cubes_for_cache.data();
+        n_select_cubes = 2;
+    }
+
     const int report_interval = progress ? std::max(1, n_trials / 100) : 0;
 
     if (n_threads == 1) {
         // Serial: prefill + trials on a single thread (PosCache stays warm)
-        prefill_move0_cache(pre_roll_board, move0_cache, 1, nullptr);
+        prefill_move0_cache(pre_roll_board, move0_cache, 1, nullptr,
+                            select_cubes_ptr, n_select_cubes);
         if (uses_move1_cache) {
             for (int i = 0; i < Move0Cache::N_ROLLS; ++i) {
-                populate_move1_cache_entry(move0_cache, i, move1_cache.entries[i]);
+                populate_move1_cache_entry(move0_cache, i, move1_cache.entries[i],
+                                           select_cubes_ptr, n_select_cubes);
                 move1_cache.state[i].store(2, std::memory_order_release);
             }
         }
@@ -1917,7 +2057,17 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
             MultiPlyStrategy::get_cache().clear();
             MultiPlyStrategy::set_shared_cache(shared_cache);
 
-            // Phase 1+2: Combined move0 + move1 prefill per roll
+            // Phase 1+2: Combined move0 + move1 prefill per roll.
+            // When cube-aware selection is on, prefill calls the SAME multi-
+            // cube BMI as the trial loop, with ND and DT cubes — guarantees
+            // chosen[] is byte-identical to per-trial recomputation.
+            float cube_x_stamp = 0.0f;
+            if (select_cubes_ptr) {
+                std::array<float, NUM_OUTPUTS> dummy{};
+                auto [pp, op] = pip_counts(pre_roll_board);
+                cube_x_stamp = cube_efficiency(dummy, is_race(pre_roll_board), pp, op);
+            }
+
             int r;
             while ((r = next_roll.fetch_add(1, std::memory_order_relaxed)) < 21) {
                 thread_local std::vector<Board> candidates;
@@ -1929,6 +2079,13 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
                     chosen = pre_roll_board;
                 } else if (candidates.size() == 1) {
                     chosen = candidates[0];
+                } else if (select_cubes_ptr) {
+                    std::array<int, 4> picks{0, 0, 0, 0};
+                    m0_strat->best_move_index_cubeful_multi(
+                        candidates, pre_roll_board,
+                        select_cubes_ptr, n_select_cubes,
+                        cube_x_stamp, picks.data());
+                    chosen = candidates[picks[0]];
                 } else {
                     chosen = candidates[m0_strat->best_move_index(
                         candidates, pre_roll_board)];
@@ -1937,7 +2094,8 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
                 move0_cache.state[r].store(2, std::memory_order_release);
 
                 if (uses_move1_cache) {
-                    populate_move1_cache_entry(move0_cache, r, move1_cache.entries[r]);
+                    populate_move1_cache_entry(move0_cache, r, move1_cache.entries[r],
+                                               select_cubes_ptr, n_select_cubes);
                     move1_cache.state[r].store(2, std::memory_order_release);
                 }
             }
@@ -2310,10 +2468,9 @@ void RolloutStrategy::best_move_index_cubeful_multi(
     float cube_x,
     int* out_indices) const
 {
-    (void)cube_x;  // unused — inner rollouts compute their own leaf cube_x.
-
     const int n = static_cast<int>(candidates.size());
     if (n == 0) return;
+    if (n_cubes <= 0) return;
     if (n == 1) {
         for (int c = 0; c < n_cubes; ++c) out_indices[c] = 0;
         return;
@@ -2321,25 +2478,54 @@ void RolloutStrategy::best_move_index_cubeful_multi(
 
     clear_internal_caches();
 
-    // Step 1: cubeless 1-ply filter (cheap, same as the cubeless BMI path).
-    std::vector<double> equities(n);
-    double best_1ply = -1e30;
-    base_->batch_evaluate_candidates_equity(candidates, pre_move_board, equities.data());
+    // Step 1: 1-ply CUBEFUL filter per cube, unioned across cubes — mirrors
+    // the fix in MultiPlyStrategy::best_move_index_cubeful_multi. A pure
+    // cubeless filter would drop a candidate whose cubeful equity is best
+    // for a particular cube state but whose cubeless equity sits more than
+    // `threshold` below the cubeless-best (e.g. a match-defensive move at
+    // 1-away with cube=2). Per-cube cubeful filtering guarantees each cube's
+    // cubeful-1-ply favorite reaches the per-survivor rollout step.
+
+    std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
     for (int i = 0; i < n; ++i) {
-        if (equities[i] > best_1ply) best_1ply = equities[i];
+        GameResult r = check_game_over(candidates[i]);
+        if (r != GameResult::NOT_OVER) {
+            probs_per[i] = terminal_probs(r);
+        } else {
+            probs_per[i] = base_->evaluate_probs(candidates[i], pre_move_board);
+        }
+        clamp_probs_to_board(probs_per[i], candidates[i]);
     }
 
-    std::vector<int> sorted_indices(n);
-    std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
-    std::sort(sorted_indices.begin(), sorted_indices.end(),
-              [&](int a, int b) { return equities[a] > equities[b]; });
-
+    std::vector<bool> in_set(n, false);
     std::vector<int> survivors;
-    survivors.reserve(std::min(n, config_.filter.max_moves));
-    for (int idx : sorted_indices) {
-        if (static_cast<int>(survivors.size()) >= config_.filter.max_moves) break;
-        if (best_1ply - equities[idx] > config_.filter.threshold) break;
-        survivors.push_back(idx);
+    survivors.reserve(std::min(n, config_.filter.max_moves * n_cubes));
+    {
+        std::vector<std::pair<float, int>> cube_eqs;
+        cube_eqs.reserve(n);
+        for (int c = 0; c < n_cubes; ++c) {
+            cube_eqs.clear();
+            for (int i = 0; i < n; ++i) {
+                float cf = cl2cf(probs_per[i], cubes[c], cube_x);
+                cube_eqs.emplace_back(cf, i);
+            }
+            std::sort(cube_eqs.begin(), cube_eqs.end(),
+                      [](const std::pair<float, int>& a,
+                         const std::pair<float, int>& b) {
+                          return a.first > b.first;
+                      });
+            float best_cf = cube_eqs[0].first;
+            int keep = 0;
+            for (const auto& p : cube_eqs) {
+                if (keep >= config_.filter.max_moves) break;
+                if (best_cf - p.first > config_.filter.threshold) break;
+                if (!in_set[p.second]) {
+                    in_set[p.second] = true;
+                    survivors.push_back(p.second);
+                }
+                ++keep;
+            }
+        }
     }
 
     if (survivors.size() == 1) {

@@ -524,8 +524,9 @@ anywhere a `Strategy` is expected.
    trial start so that the branch's cube perspective matches the post-flip
    board (opponent's perspective at move 0).
 3. Prefill move0 and move1 caches for the flipped starting board (same caches
-   as the cubeless path; cubeless prefill is sufficient because move selection
-   is independent of cube state in the trial loop).
+   as the cubeless path). When `cubeful_trial_moves` is on, prefill receives
+   the branch's cube state so `chosen[]` is cubeful-best; otherwise prefill
+   uses cubeless selection.
 4. Run trials in parallel, each calling `run_trial_unified` with
    `start_post_move = true`, `branches = [tmpl_copy]`, `n_branches = 1`.
 5. Aggregate per-trial cubeful equities (basis-cube SP-perspective units) into
@@ -569,7 +570,10 @@ dice sequences.
    - **ND branch:** Same cube state as input (player hasn't doubled).
    - **DT branch:** Cube value doubled, opponent owns.
    - Both branches share `basis_cube = cube.cube_value` for normalization.
-3. Prefill move0 and move1 caches for the pre-roll board.
+3. Prefill move0 and move1 caches for the pre-roll board. When
+   `cubeful_trial_moves` is on, prefill receives both branch cube states
+   (ND + DT) and stamps `chosen[]` with the cubeful-best move for
+   `branches[0]` (the ND branch, which both branches share).
 4. Run trials in parallel, each calling `run_trial_unified` with
    `start_post_move = false`, `branches = [nd_copy, dt_copy]`, `n_branches = 2`.
 5. Aggregate per-trial ND and DT equities into means and standard errors.
@@ -648,28 +652,65 @@ For each half-move, the move selection strategy is chosen (first match wins):
 ### Cube-Aware Selection (`cubeful_trial_moves`)
 
 When `RolloutConfig.cubeful_trial_moves` is true AND the trial has at least
-one active cube branch, the selected strategy's `best_move_index_cubeful_multi`
-is called instead of `best_move_index`. The chosen move is the candidate
-that maximizes CUBEFUL equity (cl2cf) against the active branches' cube
-states, rather than cubeless equity.
+one active cube branch AND the half-move index is less than
+`cubeful_late_threshold`, the strategy's `best_move_index_cubeful_multi` is
+called instead of `best_move_index`. The chosen move is the candidate that
+maximizes CUBEFUL equity (cl2cf) against the active branches' cube states.
 
 - **Single branch** (`cubeful_rollout_position`, used by checker-play
   analytics): the chosen move is optimal for that branch's cube state.
-  Fully correct.
-- **Two branches** (`cubeful_cube_decision`: ND + DT): the BMI call returns
-  per-branch best indices, but the shared trial board currently uses
-  branches[0]'s pick (an Option B approximation). Per-branch board evolution
-  (Option A) is documented in [CUBEFUL_TRIALS_PLAN.md](CUBEFUL_TRIALS_PLAN.md) §6
-  as a follow-up extension.
+- **Two branches** (`cubeful_cube_decision`: ND + DT): the multi-cube BMI
+  returns per-branch best indices; the trial applies `branches[0]`'s pick
+  to its shared board. Both branches evolve through the same trajectory,
+  differing only in cube state.
 
-When `cubeful_trial_moves` is on, the move0 / move1 caches' `chosen[]` entries
-and the VR best_candidate_idx reuse are bypassed at the actual move-selection
-site (they store cubeless-best moves). Move1Cache's `mover_probs` and
-`roll_best_probs` are still used for cube decisions and VR mean (cube-state-
-independent computations).
+The cubeful BMI call inside `MultiPlyStrategy::best_move_index_cubeful_multi`
+runs a **per-cube 1-ply cubeful filter** (cl2cf per cube state, top
+`max_moves` within `threshold` of each cube's cubeful-best) and unions the
+survivors across cubes. This guarantees every cube's 1-ply cubeful favorite
+reaches the N-ply rescore — a pure cubeless filter would drop candidates
+whose cubeless equity sits well below the cubeless-best, including the
+match-defensive plays preferred at extreme away scores (e.g. 1-away with
+cube=2). The filter loops `evaluate_probs` per candidate because the batched
+`batch_evaluate_candidates_equity_probs` variant in `GamePlanStrategy` is
+not thread-safe under parallel trial dispatch.
 
-Default is false to preserve byte-identical existing behavior for all existing
-benchmarks and cached analytics.
+The union survivors are then evaluated at the configured N-ply via
+`cubeful_equity_nply_multi`, **after flipping the candidate board and cube
+states to the opponent's perspective** — `cubeful_equity_nply_multi`
+expects a pre-roll position from the player-on-roll's POV and returns the
+equity in that POV, so for a post-move candidate (mover already moved) we
+flip first. The returned per-cube equities are then in the opponent's POV,
+so the mover's best move is the one that **minimizes** the opponent's
+equity (argmin per cube). This matches the `_cubeful_equity` helper in
+the Python analyzer, which uses the same flip-and-negate pattern.
+
+For 4-ply targets the filter chain has an intermediate 3-ply step that
+still narrows survivors cubelessly — see the TODO note in `multipy.cpp`
+about extending the per-cube cubeful treatment to that step for full
+correctness in extreme match positions at 4-ply.
+
+The Move0Cache and Move1Cache are populated **cube-aware** at prefill time:
+`prefill_move0_cache` and `populate_move1_cache_entry` accept the active
+branch cube states and call `best_move_index_cubeful_multi` instead of
+`best_move_index`. Each trial then reuses the cached `chosen[]` at moves
+0 and 1 — no per-trial cubeful BMI cost at those moves, and trial outputs
+are deterministic across runs because every trial picks the same move at
+each cache hit. Move1Cache's `mover_probs`, `roll_best_probs`, and the
+`cl_mean` fields are cube-state-independent (1-ply cubeless) and shared
+between cubeless and cube-aware modes — they feed the per-move cube
+decisions and the cubeless VR mean.
+
+The `cubeful_late_threshold` config caps cube-aware selection to early
+half-moves: at moves >= this threshold the trial falls back to cubeless
+BMI even when `cubeful_trial_moves` is on. Late-game cube state is usually
+settled (the cube has either turned to a level both branches accepted, or
+a D/P has terminated one branch), so cube-aware selection there adds
+little signal but real cost. The default `cubeful_late_threshold = 0`
+inherits from `ultra_late_threshold`; for full rollouts where
+`ultra_late_threshold = 9999` keeps the cubeful path active for the entire
+game, set `cubeful_late_threshold` lower (e.g. 12) to bound cube-aware
+work to the early game.
 
 ### Strategy Construction
 
@@ -778,15 +819,21 @@ struct Move0Cache {
 };
 ```
 
-**Population:** The cache is prefilled before trial execution begins. Prefilling
-uses the full checker strategy (e.g., 3-ply) for move selection, not 1-ply.
-When multithreaded, `multipy_parallel_for` distributes the 21 entries across
-workers.
+**Population:** The cache is prefilled before trial execution begins.
+Prefilling uses the full checker strategy (e.g., 3-ply) for move selection,
+not 1-ply. When multithreaded, `multipy_parallel_for` distributes the 21
+entries across workers.
+
+When `cubeful_trial_moves` is on, the prefill receives the active branch
+cube states and calls `best_move_index_cubeful_multi` instead of
+`best_move_index`. The cached `chosen[]` is then the cubeful-best move
+under those cube states, matching what each trial would compute on its own.
 
 **CAS protocol for on-demand population:** If a trial encounters an empty cache
 entry (not prefilled), it atomically claims the slot via
 `compare_exchange_strong(0 → 1)`, computes the result, then stores it with
-`state = 2`. Other trials spin-yield until the entry is ready.
+`state = 2`. Other trials spin-yield until the entry is ready. The CAS
+populate uses the same cubeless/cube-aware branch as prefill.
 
 ### Move1Cache
 
@@ -814,10 +861,19 @@ requires ~21 NN evaluations (one per second roll). When multithreaded, entries
 are distributed across workers. Like move0, a CAS protocol handles on-demand
 population for entries not yet prefilled when a trial reaches move 1.
 
-**Move1 uses 1-ply for move selection.** Unlike move0 which uses the full checker
-strategy, move1 always uses the base (1-ply) strategy. The VR averaging over many
-trials makes higher-ply move selection at move 1 unnecessary — the VR correction
-dominates the accuracy gain.
+When `cubeful_trial_moves` is on, the prefill receives the active branch cube
+states (flipped to move-1 mover's perspective inside `populate_move1_cache_entry`)
+and `chosen[]` is the cubeful-best second move under those cube states. The
+other entry fields (`mover_probs`, `roll_best_probs`, `actual_probs`,
+`cl_mean_*`) are cube-state-independent and computed the same way in both
+modes.
+
+**Move1 uses 1-ply for move selection.** Unlike move0 which uses the full
+checker strategy, move1 always uses the base (1-ply) strategy. The VR
+averaging over many trials makes higher-ply move selection at move 1
+unnecessary — the VR correction dominates the accuracy gain. In cube-aware
+mode the 1-ply BMI is the cubeful variant against the active cube states;
+in cubeless mode it is the standard `best_move_index`.
 
 ### No-Barrier Design
 
@@ -1190,7 +1246,8 @@ contamination.
 | `checker_late` | unset | TrialEvalConfig: late-game checker play override |
 | `cube` | unset | TrialEvalConfig: cube decision strategy override |
 | `cube_late` | unset | TrialEvalConfig: late-game cube decision override |
-| `cubeful_trial_moves` | false | When true, trial-level checker moves are picked by cubeful equity (cl2cf) against the branch cube state. See §8 "Cube-Aware Selection". |
+| `cubeful_trial_moves` | true | When true, trial-level checker moves are picked by cubeful equity (cl2cf) against the branch cube state. See §8 "Cube-Aware Selection". Set false for the legacy cubeless-trials behavior. |
+| `cubeful_late_threshold` | 0 | When `cubeful_trial_moves` is on, drop to cubeless BMI at half-moves >= this value. 0 = inherit from `ultra_late_threshold`. Set lower than `ultra_late_threshold` (e.g. 12) for full rollouts to bound cube-aware work to the early game. |
 | `cancel_flag` | null | Atomic bool for rollout cancellation |
 
 ### TrialEvalConfig Fields

@@ -94,9 +94,10 @@ void Strategy::best_move_index_cubeful_multi(
     // then loop cl2cf per cube state (cheap).
     const int n = static_cast<int>(candidates.size());
     std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
-    // TODO: use batch_evaluate_candidates_equity_probs once we confirm
-    // GamePlanStrategy's batch path is safe under parallel trials. For now
-    // loop evaluate_probs per candidate to match best_move_index's pattern.
+    // NOTE: tried batch_evaluate_candidates_equity_probs (Idea 5) and it
+    // segfaults under parallel trial dispatch. The batch implementation in
+    // GamePlanStrategy is not safe for concurrent use across many threads
+    // running this from inside rollout trials. Loop evaluate_probs instead.
     for (int i = 0; i < n; ++i) {
         GameResult r = check_game_over(candidates[i]);
         if (r != GameResult::NOT_OVER) {

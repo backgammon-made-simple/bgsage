@@ -69,7 +69,17 @@ struct RolloutConfig {
     // (cubeful_cube_decision: ND + DT), the ND branch's cube state currently
     // drives selection and all branches share the chosen move — see
     // CUBEFUL_TRIALS_PLAN.md §6 for the future per-branch-board extension.
-    bool cubeful_trial_moves = false;
+    bool cubeful_trial_moves = true;
+
+    // When cubeful_trial_moves is on, stop using cube-aware selection at
+    // half-move >= this threshold and fall back to cubeless selection at
+    // those moves. Late-game cube state is usually settled (cube turned
+    // to a level both branches accepted, or D/P'd ending one branch), so
+    // cube-aware selection adds little signal but real cost. 0 = inherit
+    // from ultra_late_threshold (no separate fallback). For full rollouts
+    // with ultra_late_threshold=9999, set this to a smaller value (e.g. 12)
+    // to bound cube-aware work to the early game.
+    int cubeful_late_threshold = 0;
 
     // Per-purpose evaluation overrides.
     // When is_set(), override the legacy decision_ply / late_ply defaults.
@@ -435,20 +445,38 @@ private:
         int* best_index = nullptr) const;
 
     // Precompute the move-0 choice for each opening roll.
+    //
+    // When `select_cubes` is non-null and `n_select_cubes > 0`
+    // (cubeful_trial_moves on), the chosen move is the cubeful-best under
+    // those cube states (matching the trial loop's multi-cube call exactly,
+    // so cache values are byte-identical to per-trial recomputation). Only
+    // the result for cubes[0] is stored in `chosen[]` — that's what the
+    // shared-board MVP uses. The cube states are fixed across all trials
+    // in a rollout, so the cache can be safely cube-stamped.
     void prefill_move0_cache(const Board& start_board, Move0Cache& cache,
                              int n_threads = 1,
-                             SharedPosCache* shared = nullptr) const;
+                             SharedPosCache* shared = nullptr,
+                             const CubeInfo* select_cubes = nullptr,
+                             int n_select_cubes = 0) const;
 
     // Compute the move-1 cache entry for a specific first roll.
+    // When `select_cubes` is non-null, `chosen[]` reflects cubeful-best
+    // second moves under those cube states (cubes flipped internally to
+    // match the move-1 mover's perspective). mover_probs, roll_best_probs,
+    // and the cl_mean fields remain cube-state-independent (1-ply cubeless).
     void populate_move1_cache_entry(const Move0Cache& move0_cache,
                                     int first_roll_idx,
-                                    Move1Cache::Entry& entry) const;
+                                    Move1Cache::Entry& entry,
+                                    const CubeInfo* select_cubes = nullptr,
+                                    int n_select_cubes = 0) const;
 
     // Precompute all move-1 cache entries. This is especially important for
     // cubeful rollouts, where move 1 is the first expensive opponent turn.
     void prefill_move1_cache(const Move0Cache& move0_cache, Move1Cache& cache,
                              int n_threads,
-                             SharedPosCache* shared = nullptr) const;
+                             SharedPosCache* shared = nullptr,
+                             const CubeInfo* select_cubes = nullptr,
+                             int n_select_cubes = 0) const;
 };
 
 } // namespace bgbot
