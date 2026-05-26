@@ -1228,6 +1228,7 @@ class BgBotAnalyzer:
         away2: int = 0,
         is_crawford: bool = False,
         jacoby: bool = True,
+        progress_callback: Any | None = None,
     ) -> PostMoveAnalysis:
         """Evaluate a post-move position (right before the opponent's turn).
 
@@ -1243,6 +1244,10 @@ class BgBotAnalyzer:
             is_crawford: True if this is the Crawford game.
             jacoby: If True, gammons/backgammons don't count when cube is
                 centered (money games only). Auto-disabled for match play.
+            progress_callback: Optional ``callback(completed, total)`` called
+                from inside the rollout's worker threads.  Only meaningful for
+                rollout eval levels — N-ply and 1-ply paths return synchronously
+                and don't emit progress.
         """
         if away1 > 0 or away2 > 0:
             jacoby = False
@@ -1307,9 +1312,13 @@ class BgBotAnalyzer:
                     cube_value=cube_value, owner=owner,
                     away1=away1, away2=away2, is_crawford=is_crawford,
                     jacoby=jacoby,
+                    progress=progress_callback,
                 )
             else:
-                r = inner._rollout_strategy.evaluate_board(board, board)
+                r = inner._rollout_strategy.evaluate_board(
+                    board, board,
+                    progress=progress_callback,
+                )
             eval_level = "Rollout"
         else:
             r = inner._strategy_1ply.evaluate_board(board, board)
