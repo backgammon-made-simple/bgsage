@@ -88,7 +88,7 @@ class _CubelessBase:
             weights.strategy_type, weights.weight_paths_list, weights.hidden_sizes_list)
         self._bearoff_db = None  # Set by BgBotAnalyzer after construction
 
-    def _score_candidates_1ply(
+    def _score_candidates(
         self,
         candidates: list,
         board: list[int],
@@ -98,13 +98,16 @@ class _CubelessBase:
         away2: int = 0,
         is_crawford: bool = False,
         jacoby: bool = True,
+        strategy=None,
     ) -> list[tuple[float, float, list[int], list[float]]]:
+        if strategy is None:
+            strategy = self._strategy_1ply
         owner = resolve_owner(cube_owner) if cube_owner else None
         is_match = away1 > 0 or away2 > 0
         scored = []
         for b in candidates:
             bl = list(b)
-            r = self._strategy_1ply.evaluate_board(bl, board)
+            r = strategy.evaluate_board(bl, board)
             cl_eq = r["equity"]
             probs = list(r["probs"])
             if owner is not None:
@@ -257,7 +260,7 @@ class _MultiPlyAnalyzer(_CubelessBase):
         if not candidates:
             return []
 
-        scored_1ply = self._score_candidates_1ply(
+        scored_1ply = self._score_candidates(
             candidates, board, cube_owner,
             cube_value=cube_value, away1=away1, away2=away2,
             is_crawford=is_crawford, jacoby=jacoby,
@@ -348,8 +351,25 @@ class _RolloutAnalyzer(_CubelessBase):
         ultra_late_threshold=9999,
         cubeful_trial_moves=True,
         cubeful_late_threshold=0,
+        prefilter_threshold=0.0,
     ):
         super().__init__(weights)
+        # Two-stage candidate filter for checker_play_analytics: when
+        # prefilter_threshold > 0, stage 1 is a loose 1-ply cull at that
+        # threshold (no max_moves cap), stage 2 is the standard TINY filter
+        # at 2-ply on stage 1's survivors. Survivors of stage 2 are rolled
+        # out. When 0, the legacy single-stage 1-ply TINY filter is used.
+        self._prefilter_threshold = float(prefilter_threshold)
+        self._strategy_2ply = None
+        if self._prefilter_threshold > 0:
+            self._strategy_2ply = bgbot_cpp.create_multipy(
+                weights.strategy_type,
+                weights.weight_paths_list,
+                weights.hidden_sizes_list,
+                n_plies=2,
+                parallel_evaluate=True,
+                parallel_threads=max(2, _default_parallel_threads()),
+            )
         requested_threads = n_threads
         if n_threads <= 0:
             requested_threads = _default_parallel_threads()
@@ -418,24 +438,50 @@ class _RolloutAnalyzer(_CubelessBase):
         if not candidates:
             return []
 
-        scored_1ply = self._score_candidates_1ply(
+        scored_1ply = self._score_candidates(
             candidates, board, cube_owner,
             cube_value=cube_value, away1=away1, away2=away2,
             is_crawford=is_crawford, jacoby=jacoby,
         )
-        # TINY filter (top FILTER_MAX_MOVES within FILTER_THRESHOLD of best at
-        # 1-ply) — same gate the N-ply analyzer uses. Every survivor is rolled
-        # out; non-survivors keep their 1-ply equity. No intermediate ply
-        # rescore: the user-facing rollout is meant to give a rollout-quality
-        # answer for the full TINY-filtered candidate set, not a narrower
-        # sub-filter of it.
-        survivors, survivor_set = self._filter_candidates(
-            scored_1ply, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
-        )
+
+        # Stage 1: 1-ply filter. If prefilter_threshold > 0, this is a loose
+        # cull (no max_moves cap) that just drops obvious garbage; stage 2 at
+        # 2-ply then applies the TINY filter. Otherwise it's a single-stage
+        # TINY filter at 1-ply.
+        if self._prefilter_threshold > 0:
+            stage1_survivors, _ = self._filter_candidates(
+                scored_1ply, self._prefilter_threshold, max_moves=len(scored_1ply)
+            )
+        else:
+            stage1_survivors = scored_1ply
+
+        # Stage 2: 2-ply rescore + TINY filter (only when prefilter is on and
+        # more than one candidate survived stage 1).
+        scored_2ply = None
+        scored_2ply_set: set = set()
+        if self._prefilter_threshold > 0 and len(stage1_survivors) > 1:
+            stage1_boards = [item[2] for item in stage1_survivors]
+            scored_2ply = self._score_candidates(
+                stage1_boards, board, cube_owner,
+                cube_value=cube_value, away1=away1, away2=away2,
+                is_crawford=is_crawford, jacoby=jacoby,
+                strategy=self._strategy_2ply,
+            )
+            scored_2ply_set = {tuple(item[2]) for item in scored_2ply}
+            survivors, survivor_set = self._filter_candidates(
+                scored_2ply, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
+            )
+            self._strategy_2ply.clear_cache()
+        else:
+            survivors, survivor_set = self._filter_candidates(
+                stage1_survivors, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
+            )
+
         # Ensure at least 2 candidates get rolled out so the cubeful sort
         # always has at least two rollout-quality entries to compare.
-        if len(survivors) < 2 and len(scored_1ply) >= 2:
-            for item in scored_1ply:
+        fallback_pool = scored_2ply if scored_2ply is not None else scored_1ply
+        if len(survivors) < 2 and len(fallback_pool) >= 2:
+            for item in fallback_pool:
                 if tuple(item[2]) not in survivor_set:
                     survivors.append(item)
                     survivor_set.add(tuple(item[2]))
@@ -503,17 +549,29 @@ class _RolloutAnalyzer(_CubelessBase):
                 entry["rollout_cubeful_se"] = r["cubeful_se"]
             results.append(entry)
 
-        # Non-rolled-out moves: keep their 1-ply equity. Mirrors the
-        # _MultiPlyAnalyzer pattern (TINY survivors at the chosen level,
-        # everything else at 1-ply).
+        # Non-rolled-out moves: those that survived stage 1 (1-ply prefilter)
+        # but failed stage 2 (2-ply TINY) get their 2-ply equity; those that
+        # failed stage 1 keep their 1-ply equity. When prefilter is off, all
+        # non-survivors get their 1-ply equity (legacy single-stage path).
+        if scored_2ply is not None:
+            for feq, cleq, b, p in scored_2ply:
+                if tuple(b) not in survivor_set:
+                    results.append({
+                        "board": b,
+                        "equity": cleq,
+                        "probs": p,
+                        "eval_level": "2-ply",
+                    })
         for feq, cleq, b, p in scored_1ply:
-            if tuple(b) not in survivor_set:
-                results.append({
-                    "board": b,
-                    "equity": cleq,
-                    "probs": p,
-                    "eval_level": "1-ply",
-                })
+            t = tuple(b)
+            if t in survivor_set or t in scored_2ply_set:
+                continue
+            results.append({
+                "board": b,
+                "equity": cleq,
+                "probs": p,
+                "eval_level": "1-ply",
+            })
 
         return self._finalize_results(results)
 
@@ -897,6 +955,13 @@ class BgBotAnalyzer:
         checker_late: TrialEvalConfig for late-game checker play.
         cube: TrialEvalConfig for cube decisions during rollout trials.
         cube_late: TrialEvalConfig for late-game cube decisions.
+        prefilter_threshold: Two-stage checker_play filter for rollout levels.
+            When > 0, stage 1 culls candidates with > prefilter_threshold
+            1-ply equity error from best (no count cap), then stage 2 applies
+            the TINY filter at 2-ply on the survivors before rollout. Defaults
+            to 0.15 for truncated2/truncated3 and 0.0 (legacy single-stage
+            1-ply TINY) for truncated1 and rollout. Pass an explicit value to
+            override.
     """
 
     def __init__(
@@ -922,11 +987,21 @@ class BgBotAnalyzer:
         ultra_late_threshold: int = 9999,
         cubeful_trial_moves: bool = True,
         cubeful_late_threshold: int = 0,
+        prefilter_threshold: float | None = None,
     ):
         if weights is None:
             weights = default_weights()
         self._weights = weights
         self._eval_level = eval_level
+        # Two-stage checker_play filter: 1-ply loose cull (prefilter_threshold)
+        # then 2-ply TINY. Defaults to 0.15 for truncated2/truncated3, 0.0
+        # (disabled, legacy single-stage 1-ply TINY) for other levels.
+        # User-supplied value overrides the per-level default.
+        if prefilter_threshold is None:
+            prefilter_threshold = (
+                0.15 if eval_level in ("truncated2", "truncated3") else 0.0
+            )
+        self._prefilter_threshold = float(prefilter_threshold)
         # Flag-gated cube-aware trial moves (CUBEFUL_TRIALS_PLAN.md). Default
         # False keeps existing rollout behavior. When True, all rollout-based
         # eval levels select trial moves by cubeful equity against the trial's
@@ -979,6 +1054,7 @@ class BgBotAnalyzer:
                 ultra_late_threshold=2,
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
+                prefilter_threshold=self._prefilter_threshold,
             )
         elif eval_level == "truncated3":
             inner = _RolloutAnalyzer(
@@ -993,6 +1069,7 @@ class BgBotAnalyzer:
                 ultra_late_threshold=2,
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
+                prefilter_threshold=self._prefilter_threshold,
             )
         elif eval_level == "rollout":
             inner = _RolloutAnalyzer(
@@ -1011,6 +1088,7 @@ class BgBotAnalyzer:
                 ultra_late_threshold=ultra_late_threshold,
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
+                prefilter_threshold=self._prefilter_threshold,
             )
         else:
             raise ValueError(f"Unknown eval_level: {eval_level!r}")
@@ -1030,6 +1108,8 @@ class BgBotAnalyzer:
                 bgbot_cpp.multipy_set_bearoff_db(inner._strategy_nply, self._bearoff_db)
             elif isinstance(inner, _RolloutAnalyzer):
                 bgbot_cpp.rollout_set_bearoff_db(inner._rollout_strategy, self._bearoff_db)
+                if inner._strategy_2ply is not None:
+                    bgbot_cpp.multipy_set_bearoff_db(inner._strategy_2ply, self._bearoff_db)
 
         if cubeful:
             self._analyzer = _CubefulAnalyzer(inner)
