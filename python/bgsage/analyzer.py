@@ -959,9 +959,10 @@ class BgBotAnalyzer:
             When > 0, stage 1 culls candidates with > prefilter_threshold
             1-ply equity error from best (no count cap), then stage 2 applies
             the TINY filter at 2-ply on the survivors before rollout. Defaults
-            to 0.15 for truncated2/truncated3 and 0.0 (legacy single-stage
-            1-ply TINY) for truncated1 and rollout. Pass an explicit value to
-            override.
+            to 0.15 for truncated2, truncated3, and any non-truncated rollout
+            (eval_level="rollout" with truncation_depth=0); 0.0 (legacy
+            single-stage 1-ply TINY) for truncated1 and user-configured
+            truncated rollouts. Pass an explicit value to override.
     """
 
     def __init__(
@@ -994,13 +995,22 @@ class BgBotAnalyzer:
         self._weights = weights
         self._eval_level = eval_level
         # Two-stage checker_play filter: 1-ply loose cull (prefilter_threshold)
-        # then 2-ply TINY. Defaults to 0.15 for truncated2/truncated3, 0.0
-        # (disabled, legacy single-stage 1-ply TINY) for other levels.
-        # User-supplied value overrides the per-level default.
+        # then 2-ply TINY. Defaults to 0.15 for truncated2, truncated3, and
+        # any non-truncated rollout (eval_level="rollout" with
+        # truncation_depth=0); 0.0 (disabled, legacy single-stage 1-ply
+        # TINY) elsewhere. Rationale: the rollout is expensive enough at all
+        # those levels that pre-rollout filtering is worth the small 2-ply
+        # cost; 1T and user-configured truncated rollouts are cheap enough
+        # that the extra 2-ply scoring isn't worth it. User-supplied value
+        # overrides the per-level default.
         if prefilter_threshold is None:
-            prefilter_threshold = (
-                0.15 if eval_level in ("truncated2", "truncated3") else 0.0
+            is_full_rollout = (
+                eval_level == "rollout" and truncation_depth == 0
             )
+            if eval_level in ("truncated2", "truncated3") or is_full_rollout:
+                prefilter_threshold = 0.15
+            else:
+                prefilter_threshold = 0.0
         self._prefilter_threshold = float(prefilter_threshold)
         # Flag-gated cube-aware trial moves (CUBEFUL_TRIALS_PLAN.md). Default
         # False keeps existing rollout behavior. When True, all rollout-based

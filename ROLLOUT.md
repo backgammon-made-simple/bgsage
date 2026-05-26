@@ -1229,15 +1229,17 @@ parameter on `BgBotAnalyzer` / `_RolloutAnalyzer`. This is a Python-layer
 option only — the C++ `RolloutConfig` is unaware of it.
 
 **Single-stage (`prefilter_threshold = 0`)** — the legacy filter, used by
-1T and the full Rollout level (R):
+1T and by user-configured truncated rollouts (`eval_level="rollout"` with
+`truncation_depth > 0`):
 
 - Apply the standard **TINY filter** (top `filter.max_moves` = 5 within
   `filter.threshold` = 0.08 of best) directly on the 1-ply cubeful
   equities. Survivors are rolled out; non-survivors keep their 1-ply
   equity in the result list.
 
-**Two-stage (`prefilter_threshold > 0`)** — the default for 2T and 3T,
-threshold 0.15:
+**Two-stage (`prefilter_threshold > 0`)** — the default (threshold 0.15)
+for 2T, 3T, and any non-truncated rollout (`eval_level="rollout"` with
+`truncation_depth = 0`):
 
 - **Stage 1 (loose 1-ply cull):** keep every candidate whose 1-ply
   cubeful equity is within `prefilter_threshold` of the 1-ply best. No
@@ -1253,16 +1255,14 @@ threshold 0.15:
   this (`"Rollout"`, `"2-ply"`, or `"1-ply"`).
 
 **Why two stages exist.** A single 1-ply TINY filter can drop a move
-whose true equity is best but whose 1-ply estimate is poor — at 2T and
-3T this happens often enough to be visible. Doing the cheap loose 1-ply
-cull first and then a stricter 2-ply filter recovers those moves at low
-cost: the 2-ply rescore runs on a small surviving set (typically
-~3–8 candidates), and 2-ply is accurate enough that the TINY gate at
-that depth rarely drops the rollout winner. 1T isn't worth the extra
-2-ply scoring because the rollout itself is only 1-ply at 42 trials; the
-filter's accuracy ceiling is already the bottleneck. The full Rollout
-(R) is similar — at 1296 trials with `decision_ply = 1`, the value of a
-sharper pre-rollout filter is small relative to the rollout cost.
+whose true equity is best but whose 1-ply estimate is poor — at 2T, 3T,
+and the full Rollout this happens often enough to be visible. Doing the
+cheap loose 1-ply cull first and then a stricter 2-ply filter recovers
+those moves at low cost: the 2-ply rescore runs on a small surviving set
+(typically ~3–8 candidates), and 2-ply is accurate enough that the TINY
+gate at that depth rarely drops the rollout winner. 1T isn't worth the
+extra 2-ply scoring because the rollout itself is only 1-ply at 42
+trials — the filter's accuracy ceiling is already the bottleneck.
 
 A 2-ply strategy instance is lazily created on `_RolloutAnalyzer` only
 when `prefilter_threshold > 0`, and the bearoff DB (if loaded) is wired
@@ -1327,7 +1327,7 @@ into it.
 | 1T (XG Roller) | 42 | 5 | 1 | -1 | 20 | 2 | 0 (off) |
 | 2T (XG Roller+) | 360 | 7 | 2 | 1 | 2 | 2 | 0.15 |
 | 3T (XG Roller++) | 360 | 5 | 3 | 2 | 2 | 2 | 0.15 |
-| R (Full Rollout) | 1,296 | 0 | 1 | -1 | 20 | 9999 | 0 (off) |
+| R (Full Rollout) | 1,296 | 0 | 1 | -1 | 20 | 9999 | 0.15 |
 
 These per-level defaults are defined in one place — the `BgBotAnalyzer.__init__`
 dispatch in [python/bgsage/analyzer.py](python/bgsage/analyzer.py), in the
@@ -1343,6 +1343,9 @@ truncated rollouts; full-rollout callers must override it.
 `prefilter` is the Python-side `prefilter_threshold` parameter on
 `BgBotAnalyzer` / `_RolloutAnalyzer`. When > 0 it enables the two-stage
 checker-play candidate filter (1-ply loose cull → 2-ply TINY) described in
-§16; when 0 the legacy single-stage 1-ply TINY runs. Users can override
-the per-level default by passing `prefilter_threshold=...` to
+§16; when 0 the legacy single-stage 1-ply TINY runs. The default is
+0.15 for 2T, 3T, and any non-truncated rollout (i.e. `eval_level="rollout"`
+with `truncation_depth = 0`); 0 for 1T and for user-configured truncated
+rollouts (`eval_level="rollout"` with `truncation_depth > 0`). Users can
+override the per-level default by passing `prefilter_threshold=...` to
 `BgBotAnalyzer`.
