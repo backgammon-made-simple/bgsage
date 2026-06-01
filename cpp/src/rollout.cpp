@@ -480,26 +480,77 @@ std::array<float, NUM_OUTPUTS> RolloutStrategy::best_move_probs_for_candidates(
     }
 
     // Fast batch path when using base_ (1-ply) or base_bearoff_ (1-ply
-    // wrapped with the bearoff DB) directly. For base_bearoff_, use base_'s
-    // optimized batch to find the best candidate, then override that
-    // candidate's probs with the exact DB lookup if it lives in the bearoff
-    // range. This preserves the GamePlanStrategy batch fast path while
-    // making VR DB-aware: at bearoff positions, the returned `best_probs`
-    // are deterministically equal to the DB result, so VR luck = (actual −
-    // mean) cancels exactly across the 21 rolls when all reachable post-
-    // move states share the same DB cubeless probabilities.
+    // wrapped with the bearoff DB) directly.
+    //
+    // VR DB consistency (critical): when the bearoff DB is engaged, the actual
+    // trial move is selected by the configured checker strategy. At N-ply that
+    // strategy short-circuits bearoff leaves to the exact DB, so it plays the
+    // DB-OPTIMAL move. The VR mean must use the SAME move, or luck =
+    // (actual − mean) is biased. Selecting the best candidate with the raw NN
+    // here (batch_evaluate_candidates_best_prob) and merely DB-correcting that
+    // candidate's probs can pick a DB-suboptimal move whose DB value is < the
+    // DB-optimal move actually played, so luck skews positive and the
+    // VR-corrected result skews low (observed: a bearoff cube rollout reporting
+    // P(win)=0.72 vs the exact 0.78). So when any candidate is in DB range,
+    // rank candidates by exact DB equity (NN equity for any non-bearoff
+    // boundary candidate) to match actual play. With no bearoff candidate, the
+    // raw-NN fast path is already correct for VR (the trial plays the NN/N-ply
+    // move and the mean uses the same), so it is kept unchanged.
     const bool is_base = (&strat == base_.get());
     const bool is_base_bearoff = (base_bearoff_ && &strat == base_bearoff_.get());
     if (is_base || is_base_bearoff) {
+        if (is_base_bearoff && bearoff_db_) {
+            bool all_bearoff = true, any_bearoff = false;
+            for (const auto& c : candidates) {
+                if (bearoff_db_->is_bearoff(c)) any_bearoff = true;
+                else all_bearoff = false;
+            }
+            if (any_bearoff) {
+                // NN equities are only needed for non-bearoff boundary
+                // candidates; pure-bearoff positions skip the NN entirely.
+                thread_local std::vector<double> nn_eq;
+                if (!all_bearoff) {
+                    nn_eq.resize(candidates.size());
+                    base_->batch_evaluate_candidates_equity(
+                        candidates, board, nn_eq.data());
+                }
+                double best_eq = -1e30;
+                int best_db_idx = 0;
+                for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+                    double eq;
+                    GameResult gr = check_game_over(candidates[i]);
+                    if (gr != GameResult::NOT_OVER) {
+                        eq = static_cast<double>(static_cast<int>(gr));
+                    } else if (bearoff_db_->is_bearoff(candidates[i])) {
+                        auto p = bearoff_db_->lookup_probs(
+                            candidates[i], /*post_move=*/true);
+                        clamp_probs_to_board(p, candidates[i]);
+                        eq = compute_equity(p);
+                    } else {
+                        eq = nn_eq[i];
+                    }
+                    if (eq > best_eq) { best_eq = eq; best_db_idx = i; }
+                }
+                std::array<float, NUM_OUTPUTS> best_probs{};
+                GameResult gr = check_game_over(candidates[best_db_idx]);
+                if (gr != GameResult::NOT_OVER) {
+                    best_probs = terminal_probs(gr);
+                } else if (bearoff_db_->is_bearoff(candidates[best_db_idx])) {
+                    best_probs = bearoff_db_->lookup_probs(
+                        candidates[best_db_idx], /*post_move=*/true);
+                    clamp_probs_to_board(best_probs, candidates[best_db_idx]);
+                } else {
+                    best_probs = base_->evaluate_probs(
+                        candidates[best_db_idx], board);
+                    clamp_probs_to_board(best_probs, candidates[best_db_idx]);
+                }
+                if (best_index) *best_index = best_db_idx;
+                return best_probs;
+            }
+        }
         std::array<float, NUM_OUTPUTS> best_probs{};
         int idx = base_->batch_evaluate_candidates_best_prob(
             candidates, board, nullptr, &best_probs);
-        if (is_base_bearoff && bearoff_db_ &&
-            idx >= 0 && idx < static_cast<int>(candidates.size()) &&
-            bearoff_db_->is_bearoff(candidates[idx])) {
-            best_probs = bearoff_db_->lookup_probs(candidates[idx],
-                                                    /*post_move=*/true);
-        }
         if (idx >= 0 && idx < static_cast<int>(candidates.size())) {
             clamp_probs_to_board(best_probs, candidates[idx]);
         }

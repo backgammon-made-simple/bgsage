@@ -253,8 +253,13 @@ the decision strategy's ply level. This is critical:
 When the bearoff database is loaded, the 1-ply evaluator used for VR is the
 DB-aware variant: at any bearoff position encountered during VR mean or VR
 actual evaluation, the exact DB probabilities are used in place of the NN
-output. Both sides of the luck difference use the same DB-aware evaluator, so
-the bias-cancellation property still holds. Crucially, when the per-trial
+output. For the luck difference to remain unbiased, the VR mean's per-roll
+baseline move must be the same move the trial actually plays — sharing the
+evaluator for the probabilities is not sufficient. In the bearoff range the
+decision strategy plays the DB-optimal move (an N-ply strategy short-circuits
+its leaves to the DB), so the VR mean ranks its candidates by exact DB equity as
+well (see §14), keeping both the selected move and its probabilities consistent
+between mean and actual. Crucially, when the per-trial
 trajectory enters the bearoff range and all reachable post-move states share
 the same DB cubeless probabilities (e.g. a "saved-gammon" state where the
 loser already has at least one checker borne off), VR luck at every move from
@@ -1091,9 +1096,12 @@ allocation/deallocation within the hot loop.
 
 ### Batch Evaluation
 
-When using the base (1-ply) strategy for VR mean computation,
-`batch_evaluate_candidates_best_prob` evaluates all candidates and returns both
-the best index and its probabilities in a single pass — no redundant NN calls.
+When using the base (1-ply) strategy for VR mean computation at a position with
+no bearoff candidate, `batch_evaluate_candidates_best_prob` evaluates all
+candidates and returns both the best index and its probabilities in a single
+pass — no redundant NN calls. (When a candidate is in the bearoff range, the VR
+mean ranks candidates by exact DB equity instead; see "Bearoff Database
+Integration".)
 
 ### Ultra-Late Threshold
 
@@ -1115,10 +1123,17 @@ the DB returns exact cubeless probabilities; otherwise the call falls through
 to the underlying NN. Specifically, the DB-aware base is used at:
 
 - **VR mean** at every half-move (`best_move_probs_for_candidates` over all 21
-  rolls). The fast batch path uses the underlying NN's optimized batch to find
-  the best candidate, then overrides that candidate's probabilities with the
-  DB lookup if it is bearoff — keeping batch performance for non-bearoff
-  positions while making the VR mean DB-exact in the bearoff range.
+  rolls). When no candidate is in the bearoff range, the underlying NN's
+  optimized batch selects the best candidate and returns its probabilities in a
+  single pass. When any candidate is in the bearoff range, candidates are ranked
+  by exact DB equity instead (NN equity is used only for a non-bearoff candidate
+  at a boundary position). Ranking by DB equity makes the per-roll baseline move
+  identical to the move the decision strategy actually plays there — an N-ply
+  checker strategy short-circuits its leaves to the DB, so it plays the
+  DB-optimal move. This match is required for the luck term `actual − mean` to
+  stay unbiased: a baseline that selected a different, weaker move than the
+  trial plays would be systematically below the actual value and bias the
+  VR-corrected result. The selected baseline move's probabilities are DB-exact.
 - **VR actual** at every half-move when the chosen move's probabilities are
   evaluated for luck computation (the N-ply decision path).
 - **Move-1 cache prefill** for both `mover_probs` and `roll_best_probs`.
