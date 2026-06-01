@@ -34,6 +34,7 @@ struct SharedPosCache {
         std::atomic<int> state{STATE_EMPTY};
         std::size_t hash = 0;
         int plies = 0;
+        Board board = {};  // verified on lookup to detect hash collisions
         std::array<float, NUM_OUTPUTS> probs = {};
     };
 
@@ -60,13 +61,15 @@ struct SharedPosCache {
         inserts.store(0, std::memory_order_relaxed);
     }
 
-    const std::array<float, NUM_OUTPUTS>* lookup(std::size_t h, int plies) const {
+    const std::array<float, NUM_OUTPUTS>* lookup(std::size_t h, int plies,
+                                                  const Board& board) const {
         std::size_t key = h | 1;
         std::size_t idx = key & MASK;
         for (int probe = 0; probe < MAX_PROBE; ++probe) {
             int s = entries[idx].state.load(std::memory_order_acquire);
             if (s == STATE_EMPTY) return nullptr;
-            if (s == STATE_READY && entries[idx].hash == key && entries[idx].plies == plies) {
+            if (s == STATE_READY && entries[idx].hash == key
+                && entries[idx].plies == plies && entries[idx].board == board) {
                 hits.fetch_add(1, std::memory_order_relaxed);
                 return &entries[idx].probs;
             }
@@ -76,7 +79,7 @@ struct SharedPosCache {
         return nullptr;
     }
 
-    LookupResult lookup_or_reserve(std::size_t h, int plies) {
+    LookupResult lookup_or_reserve(std::size_t h, int plies, const Board& board) {
         std::size_t key = h | 1;
         std::size_t idx = key & MASK;
         for (int probe = 0; probe < MAX_PROBE; ++probe) {
@@ -88,6 +91,7 @@ struct SharedPosCache {
                                                     std::memory_order_acq_rel)) {
                     e.hash = key;
                     e.plies = plies;
+                    e.board = board;
                     std::atomic_thread_fence(std::memory_order_release);
                     e.state.store(STATE_COMPUTING, std::memory_order_release);
                     inserts.fetch_add(1, std::memory_order_relaxed);
@@ -97,7 +101,7 @@ struct SharedPosCache {
             }
 
             if ((s == STATE_COMPUTING || s == STATE_READY) &&
-                e.hash == key && e.plies == plies) {
+                e.hash == key && e.plies == plies && e.board == board) {
                 if (s == STATE_READY) {
                     hits.fetch_add(1, std::memory_order_relaxed);
                     return {&e.probs, nullptr};
@@ -106,7 +110,8 @@ struct SharedPosCache {
                 for (int spin = 0; spin < WAIT_SPINS; ++spin) {
                     std::this_thread::yield();
                     int ready = e.state.load(std::memory_order_acquire);
-                    if (ready == STATE_READY && e.hash == key && e.plies == plies) {
+                    if (ready == STATE_READY && e.hash == key
+                        && e.plies == plies && e.board == board) {
                         hits.fetch_add(1, std::memory_order_relaxed);
                         return {&e.probs, nullptr};
                     }
@@ -136,7 +141,8 @@ struct SharedPosCache {
         entry->state.store(STATE_EMPTY, std::memory_order_release);
     }
 
-    void insert(std::size_t h, int plies, const std::array<float, NUM_OUTPUTS>& probs) {
+    void insert(std::size_t h, int plies, const Board& board,
+                const std::array<float, NUM_OUTPUTS>& probs) {
         std::size_t key = h | 1;
         std::size_t idx = key & MASK;
         for (int probe = 0; probe < MAX_PROBE; ++probe) {
@@ -148,6 +154,7 @@ struct SharedPosCache {
                                                     std::memory_order_acq_rel)) {
                     e.hash = key;
                     e.plies = plies;
+                    e.board = board;
                     e.probs = probs;
                     e.state.store(STATE_READY, std::memory_order_release);
                     inserts.fetch_add(1, std::memory_order_relaxed);
@@ -156,7 +163,7 @@ struct SharedPosCache {
                 s = expected;
             }
             if ((s == STATE_COMPUTING || s == STATE_READY) &&
-                e.hash == key && e.plies == plies) {
+                e.hash == key && e.plies == plies && e.board == board) {
                 return;  // already cached
             }
             idx = (idx + 1) & MASK;
@@ -371,6 +378,7 @@ private:
     struct CacheEntry {
         std::size_t hash;  // 0 = empty slot
         int plies;
+        Board board;       // verified on lookup to detect hash collisions
         std::array<float, NUM_OUTPUTS> probs;
     };
 
@@ -400,7 +408,10 @@ private:
         }
 
         // Returns pointer to cached probs, or nullptr if not found.
-        const std::array<float, NUM_OUTPUTS>* lookup(std::size_t h, int plies) const {
+        // The board parameter is verified against the cached entry's board to
+        // protect against hash collisions (different positions with same hash).
+        const std::array<float, NUM_OUTPUTS>* lookup(std::size_t h, int plies,
+                                                      const Board& board) const {
             // Ensure hash is never 0 (our empty marker)
             std::size_t key = h | 1;
             std::size_t idx = key & MASK;
@@ -410,7 +421,7 @@ private:
                     global_misses.fetch_add(1, std::memory_order_relaxed);
                     return nullptr;
                 }
-                if (e.hash == key && e.plies == plies) {
+                if (e.hash == key && e.plies == plies && e.board == board) {
                     global_hits.fetch_add(1, std::memory_order_relaxed);
                     return &e.probs;
                 }
@@ -420,7 +431,8 @@ private:
             return nullptr;  // max probe exceeded
         }
 
-        void insert(std::size_t h, int plies, const std::array<float, NUM_OUTPUTS>& probs) {
+        void insert(std::size_t h, int plies, const Board& board,
+                    const std::array<float, NUM_OUTPUTS>& probs) {
             // Clear if too full (>75% load factor)
             if (count >= (CAPACITY * 3) / 4) {
                 clear();
@@ -432,12 +444,13 @@ private:
                 if (e.hash == 0) {
                     e.hash = key;
                     e.plies = plies;
+                    e.board = board;
                     e.probs = probs;
                     ++count;
                     return;
                 }
-                if (e.hash == key && e.plies == plies) {
-                    e.probs = probs;  // update existing
+                if (e.hash == key && e.plies == plies && e.board == board) {
+                    e.probs = probs;  // update existing (same logical position)
                     return;
                 }
                 idx = (idx + 1) & MASK;

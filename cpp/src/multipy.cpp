@@ -448,7 +448,7 @@ std::array<float, NUM_OUTPUTS> MultiPlyStrategy::evaluate_probs_nply_impl(
     std::size_t bh = cache_enabled_ ? cache_key_for(board, plies) : 0;
     auto& cache = get_cache();
     if (cache_enabled_) {
-        const auto* cached = cache.lookup(bh, /*plies folded into key*/ 0);
+        const auto* cached = cache.lookup(bh, /*plies folded into key*/ 0, board);
         if (cached) {
             return *cached;
         }
@@ -461,9 +461,9 @@ std::array<float, NUM_OUTPUTS> MultiPlyStrategy::evaluate_probs_nply_impl(
 
     // Check shared cross-thread cache (active during parallel rollouts)
     if (cache_enabled_ && tl_shared_cache) {
-        auto shared_result = tl_shared_cache->lookup_or_reserve(bh, 0);
+        auto shared_result = tl_shared_cache->lookup_or_reserve(bh, 0, board);
         if (shared_result.probs) {
-            cache.insert(bh, 0, *shared_result.probs);  // promote to thread-local
+            cache.insert(bh, 0, board, *shared_result.probs);  // promote to thread-local
             return *shared_result.probs;
         }
         shared_reservation = shared_result.reservation;
@@ -673,7 +673,7 @@ std::array<float, NUM_OUTPUTS> MultiPlyStrategy::evaluate_probs_nply_impl(
 
     // Store in cache (auto-clears at 75% load)
     if (cache_enabled_) {
-        cache.insert(bh, /*plies folded into key*/ 0, avg);
+        cache.insert(bh, /*plies folded into key*/ 0, board, avg);
     }
 
     // Also insert into shared cross-thread cache if active
@@ -681,7 +681,7 @@ std::array<float, NUM_OUTPUTS> MultiPlyStrategy::evaluate_probs_nply_impl(
         if (shared_reservation) {
             tl_shared_cache->publish(shared_reservation, avg);
         } else {
-            tl_shared_cache->insert(bh, 0, avg);
+            tl_shared_cache->insert(bh, 0, board, avg);
         }
     }
 
