@@ -729,15 +729,18 @@ void RolloutStrategy::populate_move1_cache_entry(
         GameResult r = check_game_over(chosen);
         if (r != GameResult::NOT_OVER) {
             entry.actual_probs[second_roll] = terminal_probs(r);
-        } else if (using_base) {
-            // Already clamped inside best_move_probs_for_candidates against
-            // candidates[best_idx]; reuse directly.
-            entry.actual_probs[second_roll] = entry.roll_best_probs[second_roll];
         } else if (best_idx >= 0 &&
                    best_idx < static_cast<int>(candidates.size()) &&
                    chosen == candidates[best_idx]) {
+            // Chosen matches the 1-ply cubeless-best (the common path when
+            // cube_aware is off, or when cubeful and cubeless picks happen
+            // to agree). Reuse roll_best_probs — already clamped inside
+            // best_move_probs_for_candidates.
             entry.actual_probs[second_roll] = entry.roll_best_probs[second_roll];
         } else {
+            // Chosen differs from cubeless-best (cube_aware path picked the
+            // cubeful-best instead). Evaluate the actual chosen move at
+            // 1-ply so VR's "actual" matches the move the trial will play.
             entry.actual_probs[second_roll] = current_strat.evaluate_probs(chosen, move1_board);
             clamp_probs_to_board(entry.actual_probs[second_roll], chosen);
         }
@@ -1463,12 +1466,23 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
             std::array<float, NUM_OUTPUTS> actual_probs;
             if (move1_entry) {
                 actual_probs = move1_entry->actual_probs[actual_idx];
-            } else if (using_base) {
-                // Decision also used 1-ply — reuse VR's stored probs (already
-                // clamped inside best_move_probs_for_candidates).
+            } else if (using_base &&
+                       best_candidate_idx[actual_idx] >= 0 &&
+                       best_candidate_idx[actual_idx] <
+                           static_cast<int>(move_candidates[actual_idx].size()) &&
+                       chosen == move_candidates[actual_idx]
+                                     [best_candidate_idx[actual_idx]]) {
+                // Decision used 1-ply AND chosen == 1-ply-cubeless-best.
+                // Reuse VR's stored probs (already clamped inside
+                // best_move_probs_for_candidates). When cubeful_trial_moves
+                // is on, the cubeful pick can diverge from the cubeless
+                // best — the candidate-match guard above ensures we only
+                // take this shortcut when the move actually played matches.
                 actual_probs = roll_best_probs[actual_idx];
             } else {
-                // Decision used N-ply — evaluate chosen at 1-ply for VR.
+                // Decision used N-ply, OR using_base with cube-aware
+                // selection picking a non-cubeless-best move. Evaluate
+                // chosen at 1-ply for VR.
                 // Use base_bearoff_ when the bearoff DB is set so the VR
                 // actual is DB-exact at bearoff (matching the VR mean above).
                 GameResult r = check_game_over(chosen);
