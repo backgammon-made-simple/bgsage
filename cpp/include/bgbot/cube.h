@@ -174,6 +174,9 @@ struct OpponentRollDetail {
     int die1, die2;
     Board post_move_board;    // Player's perspective (original player, not opponent)
     float cubeful_equity;     // Player's perspective, per-initial-cube
+    // Cubeless probabilities [W, Gw, Bw, Gl, Bl] in the original player's
+    // perspective, averaged over the same N-ply paths as cubeful_equity.
+    std::array<float, NUM_OUTPUTS> probs{};
 };
 
 // Detail for a single player roll within the 2-ply detail view.
@@ -182,6 +185,9 @@ struct PlayerRollDetail {
     Board post_move_board;    // Player's perspective
     float cubeful_equity;     // Player's perspective, per-initial-cube,
                               // incorporates opponent's optimal cube decision
+    // Cubeless probabilities [W, Gw, Bw, Gl, Bl] in the player's perspective,
+    // averaged over the same N-ply paths as cubeful_equity (cube-independent).
+    std::array<float, NUM_OUTPUTS> probs{};
     bool is_terminal = false; // Player's move ended the game (no opponent rolls)
     bool opponent_dp = false; // Opponent has Double/Pass (game over, no opponent rolls)
     std::vector<OpponentRollDetail> opponent_rolls; // 21 entries (empty if terminal/DP)

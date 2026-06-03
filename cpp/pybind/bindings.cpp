@@ -78,6 +78,7 @@ static py::list player_rolls_to_list(const std::vector<PlayerRollDetail>& rolls)
         d["die2"] = pr.die2;
         d["checkers"] = board_to_list(pr.post_move_board);
         d["cubeful_equity"] = pr.cubeful_equity;
+        d["probs"] = pr.probs;
         if (pr.is_terminal) {
             // Terminal: no opponent_rolls field
         } else if (pr.opponent_dp) {
@@ -91,6 +92,7 @@ static py::list player_rolls_to_list(const std::vector<PlayerRollDetail>& rolls)
                 od["die2"] = opp.die2;
                 od["checkers"] = board_to_list(opp.post_move_board);
                 od["cubeful_equity"] = opp.cubeful_equity;
+                od["probs"] = opp.probs;
                 opp_list.append(od);
             }
             d["opponent_rolls"] = opp_list;

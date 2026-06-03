@@ -2251,6 +2251,7 @@ CubeDecision cube_decision_nply_with_details(
             std::array<std::array<float, MAX_CCI * 2>, 21> opp_roll_results;
             std::array<Board, 21> opp_boards;
             std::array<bool, 21> opp_terminal;
+            std::array<std::array<float, NUM_OUTPUTS>, 21> opp_probs_arr{};
             nd_detail.opponent_rolls.resize(21);
             dt_detail.opponent_rolls.resize(21);
 
@@ -2290,6 +2291,10 @@ CubeDecision cube_decision_nply_with_details(
                             post_result, aci_L2[i], /*invert_perspective=*/true);
                         arCf_L2[i] += opp_roll.weight * opp_roll_results[opp_r][i];
                     }
+                    // Opponent just moved and won → invert terminal probs to player POV.
+                    opp_probs_arr[opp_r] = invert_probs(terminal_probs(post_result));
+                    nd_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+                    dt_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
                     continue;
                 }
 
@@ -2298,11 +2303,28 @@ CubeDecision cube_decision_nply_with_details(
                 float arCfTemp2[MAX_CCI * 2];
                 cubeful_recursive_multi(player_pre_roll, aci_L2, expanded_cci_L2,
                                         strategy, base_gps, n_plies - 2, filter,
-                                        n_threads, false, false, arCfTemp2, move_filter);
+                                        n_threads, false, false, arCfTemp2, move_filter,
+                                        &opp_probs_arr[opp_r]);
                 for (int i = 0; i < expanded_cci_L2; i++) {
                     opp_roll_results[opp_r][i] = arCfTemp2[i];
                     arCf_L2[i] += opp_roll.weight * arCfTemp2[i];
                 }
+                // Cubeless probs of player_pre_roll (player POV), same N-ply
+                // paths as the cubeful equity accumulated above.
+                nd_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+                dt_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+            }
+
+            // Player-roll node cubeless probs = weighted mean over the 21
+            // opponent-roll node probs (player POV; cube-independent).
+            {
+                std::array<float, NUM_OUTPUTS> player_probs{};
+                for (int opp_r = 0; opp_r < 21; opp_r++)
+                    for (int k = 0; k < NUM_OUTPUTS; k++)
+                        player_probs[k] += ALL_ROLLS[opp_r].weight * opp_probs_arr[opp_r][k];
+                for (int k = 0; k < NUM_OUTPUTS; k++) player_probs[k] /= 36.0f;
+                nd_detail.probs = player_probs;
+                dt_detail.probs = player_probs;
             }
 
             // Perspective flip (level 2): opponent perspective
@@ -2368,6 +2390,9 @@ CubeDecision cube_decision_nply_with_details(
         if (post_result != GameResult::NOT_OVER) {
             nd_detail.is_terminal = true;
             dt_detail.is_terminal = true;
+            // Player just moved and won → terminal probs (player perspective).
+            nd_detail.probs = terminal_probs(post_result);
+            dt_detail.probs = terminal_probs(post_result);
             // Terminal equity from opponent's perspective (for level 1 accumulation)
             for (int i = 0; i < expanded_cci_L1; i++) {
                 l1r.arCfLocal[i] = roll.weight * terminal_equity_for_cube(
@@ -2412,6 +2437,7 @@ CubeDecision cube_decision_nply_with_details(
         std::array<std::array<float, MAX_CCI * 2>, 21> opp_roll_results;
         std::array<Board, 21> opp_boards;
         std::array<bool, 21> opp_terminal;
+        std::array<std::array<float, NUM_OUTPUTS>, 21> opp_probs_arr{};
         nd_detail.opponent_rolls.resize(21);
         dt_detail.opponent_rolls.resize(21);
 
@@ -2449,6 +2475,10 @@ CubeDecision cube_decision_nply_with_details(
                         opp_post_result, aci_L2[i], /*invert_perspective=*/true);
                     arCf_L2[i] += opp_roll.weight * opp_roll_results[opp_r][i];
                 }
+                // Opponent just moved and won → invert terminal probs to player POV.
+                opp_probs_arr[opp_r] = invert_probs(terminal_probs(opp_post_result));
+                nd_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+                dt_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
                 continue;
             }
 
@@ -2456,11 +2486,28 @@ CubeDecision cube_decision_nply_with_details(
             float arCfTemp2[MAX_CCI * 2];
             cubeful_recursive_multi(player_pre_roll, aci_L2, expanded_cci_L2,
                                     strategy, base_gps, n_plies - 2, filter,
-                                    n_threads, false, false, arCfTemp2, move_filter);
+                                    n_threads, false, false, arCfTemp2, move_filter,
+                                    &opp_probs_arr[opp_r]);
             for (int i = 0; i < expanded_cci_L2; i++) {
                 opp_roll_results[opp_r][i] = arCfTemp2[i];
                 arCf_L2[i] += opp_roll.weight * arCfTemp2[i];
             }
+            // Cubeless probs of player_pre_roll (player POV), same N-ply paths
+            // as the cubeful equity accumulated above.
+            nd_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+            dt_detail.opponent_rolls[opp_r].probs = opp_probs_arr[opp_r];
+        }
+
+        // Player-roll node cubeless probs = weighted mean over the 21
+        // opponent-roll node probs (player POV; cube-independent).
+        {
+            std::array<float, NUM_OUTPUTS> player_probs{};
+            for (int opp_r = 0; opp_r < 21; opp_r++)
+                for (int k = 0; k < NUM_OUTPUTS; k++)
+                    player_probs[k] += ALL_ROLLS[opp_r].weight * opp_probs_arr[opp_r][k];
+            for (int k = 0; k < NUM_OUTPUTS; k++) player_probs[k] /= 36.0f;
+            nd_detail.probs = player_probs;
+            dt_detail.probs = player_probs;
         }
 
         // Perspective flip (level 2)
