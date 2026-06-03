@@ -982,15 +982,27 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         // Phase 1: Cube check (cubeful only, skip on move 0)
         if (cube_active && move_num > 0) {
             // Determine cube evaluation mode for this move.
-            // Ultra-late positions always use 1-ply Janowski.
-            // Otherwise use the configured cube evaluation strategy.
-            const int ultra_late_cube = config_.ultra_late_threshold;
-            bool use_cube_1ply = move_num >= ultra_late_cube;
-            const TrialEvalConfig* cube_cfg = nullptr;
-            if (!use_cube_1ply) {
-                cube_cfg = is_late ? &cube_late_eval_config_ : &cube_eval_config_;
-                use_cube_1ply = (cube_cfg->ply <= 1 && !cube_cfg->is_rollout());
-            }
+            //
+            // Cube take/pass decisions are evaluated at the configured cube
+            // strategy (decision_ply) for the ENTIRE trial. Unlike checker-play
+            // move selection, they are NOT dropped to 1-ply at the late /
+            // ultra-late thresholds. Rationale: the trial's outcome is scored
+            // by the N-ply truncation at decision_ply, so deciding take/pass at
+            // a shallower ply creates a decision-vs-evaluation mismatch — the
+            // opponent takes doubles that a consistent-depth evaluation would
+            // pass, and the deeper continuation then over-credits the doubler.
+            // Under Jacoby with a centered cube this is visible as a No-Double
+            // equity above the +1.0 cash ceiling (impossible: while the cube is
+            // centered the doubler can realize at most the cash). Checker play
+            // can still drop to 1-ply late (its quality is diluted by trial
+            // averaging); cube decisions cannot.
+            //
+            // To keep this affordable, the N-ply cube path below runs a cheap
+            // 1-ply screen and only escalates branches the screen flags as
+            // doubles to the deep decision_ply recursion (see there) — so the
+            // common no-double moves never pay for the deep eval.
+            const TrialEvalConfig* cube_cfg = &cube_eval_config_;
+            bool use_cube_1ply = (cube_cfg->ply <= 1 && !cube_cfg->is_rollout());
 
             if (use_cube_1ply) {
                 // 1-ply Janowski path (original behavior)
@@ -1052,8 +1064,9 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 MoveFilter cube_filter = {2, 0.03f};
                 const RolloutStrategy* cube_rollout = nullptr;
                 if (cube_cfg->is_rollout()) {
-                    cube_rollout = is_late ? cube_late_inner_rollout_.get()
-                                           : cube_inner_rollout_.get();
+                    // cube_cfg is always the (non-late) cube config now, so use
+                    // the matching non-late inner rollout for consistency.
+                    cube_rollout = cube_inner_rollout_.get();
                 }
 
                 // Also compute 1-ply cube_x for the cubeful VR mean later
@@ -1088,10 +1101,40 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 int n_cd = 0;
 
                 if (cube_rollout == nullptr) {
+                    // 1-ply screen + escalate. A branch is sent to the deep
+                    // decision_ply cube recursion only when a cheap 1-ply
+                    // decision already wants to double; branches the screen
+                    // clears keep their cube unchanged (no double). Because the
+                    // cube can only TURN via the deep decision applied below, a
+                    // 1-ply false-negative merely misses a double — a safe,
+                    // conservative under-count — and can never reintroduce the
+                    // take-driven >1.0 leak. This keeps the deep recursion off
+                    // the common no-double moves (it dominates the cost on
+                    // contact positions where the cube stays live for many
+                    // moves). cube_x is already resolved above for the VR mean.
+                    std::array<float, NUM_OUTPUTS> screen_probs;
+                    bool screen_ready = false;
                     CubeInfo cubes_in[8];
                     for (int b = 0; b < n_branches; ++b) {
                         if (branches[b].finished) continue;
                         if (!can_double(branches[b].cube)) continue;
+                        if (!screen_ready) {
+                            if (move1_entry) {
+                                screen_probs = move1_entry->mover_probs;
+                            } else if (bearoff_db_ && bearoff_db_->is_bearoff(board)) {
+                                screen_probs = bearoff_db_->lookup_probs(board);
+                            } else {
+                                Board opp_board = flip(board);
+                                auto opp_probs =
+                                    base_->evaluate_probs(opp_board, opp_board);
+                                screen_probs = invert_probs(opp_probs);
+                            }
+                            clamp_probs_to_board(screen_probs, board);
+                            screen_ready = true;
+                        }
+                        CubeDecision cd1 =
+                            cube_decision_1ply(screen_probs, branches[b].cube, cube_x);
+                        if (!cd1.should_double) continue;  // screen: no double
                         cd_branch[n_cd] = b;
                         cubes_in[n_cd]  = branches[b].cube;
                         ++n_cd;
