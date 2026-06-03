@@ -1135,9 +1135,11 @@ analyzer = BgBotAnalyzer(eval_level="rollout",
 
 Rollout trials support independent evaluation strengths for checker play (move
 selection) and cube decisions. Each can be configured as N-ply or truncated rollout,
-with separate late/ultra-late fallbacks. Backward compatible — when no per-purpose
-configs are set, checker uses `decision_ply` and cube uses 1-ply (identical to
-previous behavior).
+with separate late/ultra-late fallbacks. When no per-purpose configs are set, both
+checker and cube default to `decision_ply` (`build_rollout_strategies` in
+`rollout.cpp` resolves an unset `cube` config to `decision_ply` to match checker
+play). This is why the named 1T/2T/3T levels do 1/2/3-ply cube decisions
+respectively, not 1-ply.
 
 **`TrialEvalConfig`** struct (C++: `rollout.h`, Python: `bgbot_cpp.TrialEvalConfig`):
 - `ply`: N-ply depth (0 = unset/inherit, 1 = raw NN, 2+ = multi-ply)

@@ -1067,16 +1067,18 @@ class BgBotAnalyzer:
                 prefilter_threshold=self._prefilter_threshold,
             )
         elif eval_level == "truncated3":
+            # 3T: trunc-7, 3-ply early then 2-ply late (ultra_late=9999 disables
+            # the 1-ply drop). Closer to XG Roller++. (Was trunc-5 / 1-ply late.)
             inner = _RolloutAnalyzer(
                 weights,
                 n_trials=360,
-                truncation_depth=5,
+                truncation_depth=7,
                 decision_ply=3,
                 n_threads=parallel_threads,
                 seed=seed,
                 late_ply=2,
                 late_threshold=2,
-                ultra_late_threshold=2,
+                ultra_late_threshold=9999,
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
                 prefilter_threshold=self._prefilter_threshold,

@@ -131,6 +131,25 @@ _RE_EVAL_LEVEL_CHOICES = ["truncated2", "truncated3"]
 # now refer to whatever level was selected via --re-eval-level.
 _TWO_T_EVAL_LEVEL = _DEFAULT_RE_EVAL_LEVEL
 
+# Optional overrides for the re-eval truncated rollout (set from CLI in main()).
+# When either is not None, the re-analyzer is built as eval_level="rollout"
+# replicating the named level's base params (below) with these fields overridden,
+# e.g. "3T but truncation_depth=7, ultra_late_threshold=9999".
+_RE_EVAL_TRUNC_DEPTH: int | None = None
+_RE_EVAL_ULTRA_LATE: int | None = None
+
+# Base params for the named truncated levels (mirror analyzer.py's eval_level
+# resolution); used only when an override above is active. prefilter_threshold
+# 0.15 matches what BgBotAnalyzer auto-applies for truncated2/truncated3.
+_NAMED_TRUNC_PARAMS = {
+    "truncated2": dict(n_trials=360, truncation_depth=7, decision_ply=2,
+                       late_ply=1, late_threshold=2, ultra_late_threshold=2,
+                       prefilter_threshold=0.15),
+    "truncated3": dict(n_trials=360, truncation_depth=7, decision_ply=3,
+                       late_ply=2, late_threshold=2, ultra_late_threshold=9999,
+                       prefilter_threshold=0.15),
+}
+
 
 def _re_eval_cache_filename(level: str) -> str:
     """Map an eval level to its default cache filename.
@@ -151,14 +170,32 @@ _two_t_analyzer = None  # lazy-built
 
 
 def _get_two_t_analyzer(n_threads: int = 0):
-    """Build (once) and return the 2T analyzer."""
+    """Build (once) and return the re-analysis analyzer.
+
+    Normally the named level (``_TWO_T_EVAL_LEVEL``). If a truncation-depth or
+    ultra-late override is set, build an equivalent ``eval_level="rollout"`` from
+    the named level's base params plus the override(s).
+    """
     global _two_t_analyzer
     if _two_t_analyzer is None:
         from bgsage import BgBotAnalyzer
-        _two_t_analyzer = BgBotAnalyzer(
-            eval_level=_TWO_T_EVAL_LEVEL, cubeful=True,
-            parallel_threads=n_threads,
-        )
+        if _RE_EVAL_TRUNC_DEPTH is None and _RE_EVAL_ULTRA_LATE is None:
+            _two_t_analyzer = BgBotAnalyzer(
+                eval_level=_TWO_T_EVAL_LEVEL, cubeful=True,
+                parallel_threads=n_threads,
+            )
+        else:
+            params = dict(_NAMED_TRUNC_PARAMS[_TWO_T_EVAL_LEVEL])
+            if _RE_EVAL_TRUNC_DEPTH is not None:
+                params["truncation_depth"] = _RE_EVAL_TRUNC_DEPTH
+            if _RE_EVAL_ULTRA_LATE is not None:
+                params["ultra_late_threshold"] = _RE_EVAL_ULTRA_LATE
+            print(f"  [re-eval] custom rollout from {_TWO_T_EVAL_LEVEL}: {params}",
+                  flush=True)
+            _two_t_analyzer = BgBotAnalyzer(
+                eval_level="rollout", cubeful=True,
+                parallel_threads=n_threads, **params,
+            )
     return _two_t_analyzer
 
 
@@ -663,14 +700,15 @@ def _find_disputes_in_game(
 # ---------------------------------------------------------------------------
 
 
-def _build_rollout_analyzer(seed: int = 42, n_threads: int = 0):
-    """Full rollout: 1,296 trials, no truncation, 3-ply throughout."""
+def _build_rollout_analyzer(seed: int = 42, n_threads: int = 0,
+                            n_trials: int = _ROLLOUT_N_TRIALS):
+    """Full rollout: n_trials (default 1,296), no truncation, 3-ply throughout."""
     from bgsage import BgBotAnalyzer
     import bgbot_cpp
     return BgBotAnalyzer(
         eval_level="rollout",
         cubeful=True,
-        n_trials=_ROLLOUT_N_TRIALS,
+        n_trials=n_trials,
         truncation_depth=_ROLLOUT_TRUNCATION_DEPTH,
         decision_ply=1,  # overridden by checker/cube below
         checker=bgbot_cpp.TrialEvalConfig(ply=_ROLLOUT_DECISION_PLY),
@@ -1016,6 +1054,15 @@ def main() -> None:
         help="Threads per rollout (default: 0 = auto-detect cores).",
     )
     parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=_ROLLOUT_N_TRIALS,
+        help=(
+            f"Trials per rollout (default: {_ROLLOUT_N_TRIALS}; keep a multiple "
+            "of 36 for VR stratification, e.g. 5184 = 4x1296)."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -1051,6 +1098,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--re-eval-trunc-depth",
+        type=int,
+        default=None,
+        help=(
+            "Override the re-eval rollout's truncation_depth (default: the named "
+            "level's: 7 for both 3T and 2T). Builds eval_level='rollout' from the "
+            "named level's base params with this override."
+        ),
+    )
+    parser.add_argument(
+        "--re-eval-ultra-late",
+        type=int,
+        default=None,
+        help=(
+            "Override the re-eval rollout's ultra_late_threshold (default: the "
+            "named level's: 2 for 1T/2T, 9999 for 3T). E.g. 9999 keeps the configured late ply instead of "
+            "dropping to 1-ply."
+        ),
+    )
+    parser.add_argument(
         "--two-t-cache-file",
         type=Path,
         default=None,
@@ -1067,9 +1134,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Apply re-eval level globally before any analyzer is built.
-    global _TWO_T_EVAL_LEVEL
+    # Apply re-eval level + optional overrides before any analyzer is built.
+    global _TWO_T_EVAL_LEVEL, _RE_EVAL_TRUNC_DEPTH, _RE_EVAL_ULTRA_LATE
     _TWO_T_EVAL_LEVEL = args.re_eval_level
+    _RE_EVAL_TRUNC_DEPTH = args.re_eval_trunc_depth
+    _RE_EVAL_ULTRA_LATE = args.re_eval_ultra_late
 
     xg_files = sorted(args.folder.glob(args.pattern), key=_seed_sort_key)
     if not xg_files:
@@ -1197,9 +1266,10 @@ def main() -> None:
         rollout_file.parent.mkdir(parents=True, exist_ok=True)
         analyzer = None
         if n_to_roll > 0:
-            print("Building rollout analyzer (1296 trials, full play-out, 3-ply throughout)...")
+            print(f"Building rollout analyzer ({args.n_trials} trials, full play-out, 3-ply throughout)...")
             analyzer = _build_rollout_analyzer(
                 seed=args.rollout_seed, n_threads=args.rollout_threads,
+                n_trials=args.n_trials,
             )
         cube_cache: dict = {}
         for i, dispute in enumerate(todo, 1):
