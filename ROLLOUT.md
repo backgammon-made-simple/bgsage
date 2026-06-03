@@ -91,8 +91,12 @@ the truncation evaluation introduces NN bias.
 |-------|----------|-------------------|-------------|----------|----------------|
 | XG Roller (1T)    | 42  | 5 | 1 | -1 | 20 |
 | XG Roller+ (2T)   | 360 | 7 | 2 | 1  | 2  |
-| XG Roller++ (3T)  | 360 | 5 | 3 | 2  | 2  |
+| XG Roller++ (3T)  | 360 | 7 | 3 | 2  | 2  |
 | Full Rollout (R)  | 1,296 | 0 | 1 | -1 | 20 |
+
+> **3T note:** 3T also uses `ultra_late_threshold=9999` (3-ply early, then 2-ply for
+> the rest of each trial — no 1-ply drop), which this 5-column table can't show; see
+> the "Standard Configurations (App Levels)" table below for the full per-level row.
 
 ## 3. Stratified Dice Generation
 
@@ -1341,7 +1345,7 @@ into it.
 |-------|----------|-------------|-------------|----------|----------------|------------|-----------|
 | 1T (XG Roller) | 42 | 5 | 1 | -1 | 20 | 2 | 0 (off) |
 | 2T (XG Roller+) | 360 | 7 | 2 | 1 | 2 | 2 | 0.15 |
-| 3T (XG Roller++) | 360 | 5 | 3 | 2 | 2 | 2 | 0.15 |
+| 3T (XG Roller++) | 360 | 7 | 3 | 2 | 2 | 9999 | 0.15 |
 | R (Full Rollout) | 1,296 | 0 | 1 | -1 | 20 | 9999 | 0.15 |
 
 These per-level defaults are defined in one place — the `BgBotAnalyzer.__init__`

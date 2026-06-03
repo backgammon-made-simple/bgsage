@@ -1088,8 +1088,12 @@ rollout (child RolloutStrategy).
 | XGRoller++ Cube    | 360 | 7 | 3 | 2  | 2  |
 
 **App level names**: `truncated1` = XG Roller, `truncated2` = XG Roller+,
-`truncated3` = XG Roller++ Checker, `rollout` = full rollout (1296 trials,
-play to completion).
+`rollout` = full rollout (1296 trials, play to completion). `truncated3` no longer
+maps to a single XG level: it uses `truncation_depth=7`, `decision_ply=3`,
+`late_ply=2`, `late_threshold=2`, **`ultra_late_threshold=9999`** (3-ply early, then
+2-ply for the rest of each trial — no 1-ply drop), making it closer to XG Roller++
+than the old `truncated3` = XG Roller++ Checker (trunc-5) mapping. See the
+`truncated3` branch in `analyzer.py`.
 
 ```python
 from bgsage import BgBotAnalyzer
