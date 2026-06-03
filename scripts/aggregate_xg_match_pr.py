@@ -602,13 +602,14 @@ def _find_disputes_in_game(
 # ---------------------------------------------------------------------------
 
 
-def _build_rollout_analyzer(seed: int = 42, n_threads: int = 0):
+def _build_rollout_analyzer(seed: int = 42, n_threads: int = 0,
+                            n_trials: int = _ROLLOUT_N_TRIALS):
     from bgsage import BgBotAnalyzer
     import bgbot_cpp
     return BgBotAnalyzer(
         eval_level="rollout",
         cubeful=True,
-        n_trials=_ROLLOUT_N_TRIALS,
+        n_trials=n_trials,
         truncation_depth=_ROLLOUT_TRUNCATION_DEPTH,
         decision_ply=1,
         checker=bgbot_cpp.TrialEvalConfig(ply=_ROLLOUT_DECISION_PLY),
@@ -1009,6 +1010,13 @@ def main() -> None:
         help="Threads per rollout (default: 0 = auto-detect).",
     )
     parser.add_argument(
+        "--n-trials", type=int, default=_ROLLOUT_N_TRIALS,
+        help=(
+            f"Trials per rollout (default: {_ROLLOUT_N_TRIALS}; keep a multiple "
+            "of 36 for VR stratification, e.g. 5184 = 4x1296)."
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Only roll out the first N pending disputes.",
     )
@@ -1220,11 +1228,12 @@ def main() -> None:
         analyzer = None
         if n_to_roll > 0:
             print(
-                "Building rollout analyzer "
-                "(1296 trials, full play-out, 3-ply throughout)..."
+                f"Building rollout analyzer "
+                f"({args.n_trials} trials, full play-out, 3-ply throughout)..."
             )
             analyzer = _build_rollout_analyzer(
                 seed=args.rollout_seed, n_threads=args.rollout_threads,
+                n_trials=args.n_trials,
             )
         cube_cache: dict = {}
         for i, dispute in enumerate(todo, 1):
