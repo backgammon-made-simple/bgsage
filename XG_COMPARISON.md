@@ -8,6 +8,8 @@ However, we did settle on an approach to test Open Sage against XG at scale usin
 
 Our goal was to compare the relative strengths of Open Sage's 3T evaluation and XG's Roller ++ evaluation, which are designed to give similar levels of accuracy. Both are truncated rollouts with 360 paths and incorporating variance reduction.
 
+This is similar in approach to the analysis done on XG (and a number of other bots) in 2012, though not as extensive: https://www.extremegammon.com/studies.aspx.
+
 ## Money Games
 
 To compare Open Sage against XG we want to look at a range of realistic positions that come up in real games, find cases where Open Sage and XG disagree on a decision, then roll out those cases. We assume that the rollout results are "truth" and can then judge, for each position, whether Open Sage or XG was correct on their decision (or if neither was).
