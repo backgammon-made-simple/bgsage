@@ -6,18 +6,25 @@
 namespace bgbot {
 
 void possible_boards_one_die(const Board& b, int die, std::vector<Board>& out) {
+    // Push-then-mutate-in-place: each legal move pushes a copy of `b` into the
+    // output vector and mutates it there, instead of copying to a stack `nb`
+    // and then copying that into the vector (two 104-byte copies -> one).
+    // Bit-identical output, same order. out.back() stays valid after push_back
+    // (any realloc happens during the push), and no prior reference is held
+    // across iterations.
+
     // If player has checkers on the bar, must enter them first
     if (b[25] > 0) {
         int target = 25 - die;
         if (b[target] >= -1) {
-            Board nb = b;
+            out.push_back(b);
+            Board& nb = out.back();
             if (nb[target] == -1) {
                 nb[0] += 1;
                 nb[target] = 0;
             }
             nb[25] -= 1;
             nb[target] += 1;
-            out.push_back(nb);
         }
         return; // Must enter from bar
     }
@@ -35,29 +42,27 @@ void possible_boards_one_die(const Board& b, int die, std::vector<Board>& out) {
         int target = i - die;
         if (target > 0) {
             if (b[target] >= -1) {
-                Board nb = b;
+                out.push_back(b);
+                Board& nb = out.back();
                 if (nb[target] == -1) {
                     nb[0] += 1;
                     nb[target] = 0;
                 }
                 nb[i] -= 1;
                 nb[target] += 1;
-                out.push_back(nb);
             }
         } else if (can_bear_off) {
             if (target == 0) {
-                Board nb = b;
-                nb[i] -= 1;
-                out.push_back(nb);
+                out.push_back(b);
+                out.back()[i] -= 1;
             } else {
                 bool highest = true;
                 for (int j = i + 1; j <= 6; ++j) {
                     if (b[j] > 0) { highest = false; break; }
                 }
                 if (highest) {
-                    Board nb = b;
-                    nb[i] -= 1;
-                    out.push_back(nb);
+                    out.push_back(b);
+                    out.back()[i] -= 1;
                 }
             }
         }
@@ -69,14 +74,14 @@ void possible_boards_one_die(const Board& b, int die, std::vector<Board>& out) {
 
         int target = i - die;
         if (target >= 1 && b[target] >= -1) {
-            Board nb = b;
+            out.push_back(b);
+            Board& nb = out.back();
             if (nb[target] == -1) {
                 nb[0] += 1;
                 nb[target] = 0;
             }
             nb[i] -= 1;
             nb[target] += 1;
-            out.push_back(nb);
         }
     }
 }
