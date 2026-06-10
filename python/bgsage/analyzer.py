@@ -1392,7 +1392,10 @@ class BgBotAnalyzer:
                 Auto-disabled for match play.
             incl_2ply_details: If True, include per-roll details for the
                 first two turns under both ND and DT scenarios. Requires
-                3-ply or higher evaluation.
+                2-ply or higher evaluation. At 2-ply only the player-roll
+                level is captured (per-roll equities at 1-ply, no
+                opponent_rolls); the headline equities match the plain
+                2-ply call.
         """
         if away1 > 0 or away2 > 0:
             jacoby = False

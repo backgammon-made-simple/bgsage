@@ -84,6 +84,8 @@ static py::list player_rolls_to_list(const std::vector<PlayerRollDetail>& rolls)
         } else if (pr.opponent_dp) {
             // Opponent D/P: no opponent_rolls field
             d["opponent_dp"] = true;
+        } else if (pr.opponent_rolls.empty()) {
+            // 2-ply analysis: opponent-roll level not captured — omit the field
         } else {
             py::list opp_list;
             for (const auto& opp : pr.opponent_rolls) {

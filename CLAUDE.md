@@ -279,7 +279,7 @@ cube = analyzer.cube_action(board, cube_value=1, cube_owner="centered")
 cube = analyzer.cube_action(board, cube_value=1, cube_owner="centered",
                              away1=5, away2=3, is_crawford=False)
 
-# 2-ply details: per-roll breakdown for ND and DT scenarios (requires >= 3-ply)
+# 2-ply details: per-roll breakdown for ND and DT scenarios (requires >= 2-ply)
 cube = analyzer.cube_action(board, cube_value=1, cube_owner="centered",
                              incl_2ply_details=True)
 # cube.details: dict with "nd" and "dt" keys, each a list of 21 player roll dicts
@@ -288,7 +288,7 @@ nd_rolls = cube.details["nd"]   # No Double scenario
 dt_rolls = cube.details["dt"]   # Double/Take scenario
 ```
 
-**2-Ply Detail Fields** (`incl_2ply_details=True`, requires >= 3-ply):
+**2-Ply Detail Fields** (`incl_2ply_details=True`, requires >= 2-ply):
 
 Returns per-roll details for the first two turns under both the **ND** (No Double)
 and **DT** (Double/Take) scenarios. The ND section shows equities assuming the
@@ -314,7 +314,7 @@ Each player roll dict (in both `"nd"` and `"dt"`):
 | `checkers` | list[int] | 26-element post-move board after optimal checker play |
 | `cubeful_equity` | float | Cubeful equity incorporating opponent's optimal cube decision within this scenario. |
 | `opponent_dp` | bool | Present and `True` when opponent has D/P in this scenario (game over) |
-| `opponent_rolls` | list[dict] | 21 opponent roll details. **Absent** if the player's move is terminal or opponent has D/P. |
+| `opponent_rolls` | list[dict] | 21 opponent roll details. **Absent** if the player's move is terminal, opponent has D/P, or the analysis is 2-ply. |
 
 Each element of `opponent_rolls`:
 
@@ -335,10 +335,24 @@ redouble; per-roll equities reflect the opponent's optimal cube action at the
 doubled cube level, scaled back to per-initial-cube units. The weighted average
 of `cubeful_equity` across all 21 DT player rolls equals `equity_dt`.
 
-Move selection at both levels uses 1-ply cubeless equity (matching the cubeful
-recursion's internal behavior). Equities are evaluated at (N-1)-ply for player
-rolls and (N-2)-ply for opponent rolls — so at 3-ply, player-roll equities are
-2-ply accurate and opponent-roll equities use 1-ply Janowski.
+Move selection at both captured levels uses 1-ply cubeless equity (this is what
+keeps the ND and DT boards identical — cube state never affects the pick), with
+the same PubEval keep-15 prefilter the recursion applies when a roll has >16
+candidates. Note the recursion's own interior picks below these levels are 1-ply
+CUBEFUL (see "N-Ply Cubeful Algorithm"), so per-roll detail equities can diverge
+slightly from standalone (N-1)-ply evaluations of the same boards. Equities are
+evaluated at (N-1)-ply for player rolls and (N-2)-ply for opponent rolls — so at
+3-ply, player-roll equities are 2-ply accurate and opponent-roll equities use
+1-ply Janowski.
+
+**2-ply behavior**: at 2-ply only the player-roll level is captured — the
+opponent-roll level would sit below the 1-ply leaf. Each post-move position is
+evaluated directly at the 1-ply Janowski leaf (the same subtree the plain 2-ply
+call evaluates), so per-roll equities are 1-ply accurate, `opponent_rolls` is
+absent from every entry, headline equities match the plain (no-details) 2-ply
+call, and the cost is that of a plain 2-ply cube evaluation. (Before 2026-06 the
+details path always ran its two manual recursion levels, so a 2-ply details
+request silently returned 3-ply-grade headline equities at ~21x the cost.)
 
 **Python (batch, pre-roll)** — `batch_evaluate()` (`python/bgsage/batch.py`):
 ```python

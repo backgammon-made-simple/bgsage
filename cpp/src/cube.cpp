@@ -2174,6 +2174,12 @@ static void extract_opp_roll_equities(
 // cube_decision_nply_with_details: N-ply cube decision with per-roll details.
 // Manually implements the top two levels of the cubeful recursion to capture
 // per-roll data, delegating to cubeful_recursive_multi for deeper levels.
+//
+// At n_plies == 2 there is no opponent-roll level below the leaf, so only the
+// player-roll level is captured: each post-move position is evaluated directly
+// at the 1-ply Janowski leaf (the exact subtree the plain 2-ply recursion
+// evaluates), opponent_rolls stays empty, and the headline equities match
+// cube_decision_nply at 2-ply instead of silently upgrading to 3-ply.
 // ---------------------------------------------------------------------------
 CubeDecision cube_decision_nply_with_details(
     const Board& board,
@@ -2230,6 +2236,48 @@ CubeDecision cube_decision_nply_with_details(
         dt_detail.die1 = roll.d1;
         dt_detail.die2 = roll.d2;
 
+        // True 2-ply: evaluate the opponent's pre-roll position at the 1-ply
+        // Janowski leaf with the L1-expanded cube states, then derive the
+        // per-roll ND/DT detail equities from the collapsed values (each in
+        // opponent perspective, same convention as arCubeful_L2 below). The
+        // opponent-roll level would sit below the leaf, so opponent_rolls
+        // stays empty.
+        auto two_ply_leaf = [&](const Board& opp_pre_roll) {
+            float arCubeful_L2[MAX_CCI * 2];
+            std::array<float, NUM_OUTPUTS> opp_probs{};
+            cubeful_recursive_multi(opp_pre_roll, aci_L1, expanded_cci_L1,
+                                    strategy, base_gps, /*plies=*/1, filter,
+                                    n_threads, false, false, arCubeful_L2,
+                                    move_filter, &opp_probs);
+
+            // Leaf probs are pre-roll from the opponent's perspective.
+            auto player_probs = invert_probs(opp_probs);
+            nd_detail.probs = player_probs;
+            dt_detail.probs = player_probs;
+
+            int cv = cube.cube_value;
+            int a1 = cube.match.away1, a2 = cube.match.away2;
+            bool craw = cube.match.is_crawford;
+
+            // ND player-roll equity: arCubeful_L2[0] from opponent's perspective
+            if (is_money) {
+                nd_detail.cubeful_equity = -arCubeful_L2[0];
+            } else {
+                nd_detail.cubeful_equity = mwc2eq(1.0f - arCubeful_L2[0], a1, a2, cv, craw);
+            }
+
+            // DT player-roll equity: arCubeful_L2[2] from opponent's perspective, per-2x-cube
+            if (is_money) {
+                dt_detail.cubeful_equity = -2.0f * arCubeful_L2[2];
+            } else {
+                dt_detail.cubeful_equity = mwc2eq(1.0f - arCubeful_L2[2], a1, a2, 2*cv, craw);
+            }
+
+            // Accumulate for level 1
+            for (int i = 0; i < expanded_cci_L1; i++)
+                l1r.arCfLocal[i] = roll.weight * arCubeful_L2[i];
+        };
+
         // Generate legal moves and pick best
         thread_local std::vector<Board> candidates;
         int best_idx = pick_best_move_for_roll(board, roll.d1, roll.d2,
@@ -2240,6 +2288,11 @@ CubeDecision cube_decision_nply_with_details(
             nd_detail.post_move_board = board;
             dt_detail.post_move_board = board;
             Board opp_board = flip(board);
+
+            if (n_plies == 2) {
+                two_ply_leaf(opp_board);
+                return;
+            }
 
             // --- Run level 2 for this player roll (standing pat) ---
             // Expand cube states for level 2
@@ -2422,6 +2475,11 @@ CubeDecision cube_decision_nply_with_details(
                     cube.match.away1, cube.match.away2,
                     2 * cube.cube_value, cube.match.is_crawford);
             }
+            return;
+        }
+
+        if (n_plies == 2) {
+            two_ply_leaf(flip(best_board));
             return;
         }
 
