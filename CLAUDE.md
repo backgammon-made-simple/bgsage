@@ -997,7 +997,9 @@ saves ~1.5s — roughly a **1.6x speedup** on 4-ply checker play.
 **Implementation**: `MoveFilterStep` struct and `build_filter_chain()` in `multipy.h`.
 The chain is built once in the `MultiPlyStrategy` constructor and stored as
 `filter_chain_`. The `best_move_index_impl()` function in `multipy.cpp` loops through
-the chain, calling `evaluate_probs_nply_impl()` at each step's ply level.
+the chain, evaluating survivors at each step's ply level through the cubeful
+evaluation engine's dead-cube path (`cubeless_tree_probs`; the old recursion
+only in hybrid / full-depth-opponent modes).
 
 **Optimizations**: AVX2 FMA intrinsics, fast sigmoid LUT, open-addressing position
 cache, incremental delta evaluation, transposed weight matrix.
@@ -1050,6 +1052,47 @@ perspective flip. Money game branches use equity-based logic unchanged. Jacoby
 rule is propagated through `CubeInfo` on each branch; VR luck, terminal payoffs,
 and truncation all respect `jacoby_active()`.
 
+**Cubeful evaluation engine:** the N-ply cubeful evaluation engine in
+[cpp/src/cube_eval.cpp](cpp/src/cube_eval.cpp) powers all cubeful analytics —
+cube action, checker play, and post-move evaluation — both inside rollout
+trials (escalated cube decisions, truncation eval, cubeful BMI) and at the
+standalone 2-4 ply levels via the cube.h entry points (`cube_decision_nply*`,
+`cubeful_equity_nply*`, `cubeful_probs_nply`,
+`cubeful_probs_and_equity_nply`; the single-cube wrappers in cube.cpp compose
+the multi entries). Key mechanisms: batched delta-eval interior picks with
+1-ply cubeful move selection, leaf reuse at 2-ply nodes, hash-dedup move
+generation (`possible_boards_unsorted`), a deep-node PubEval pre-filter
+(16/14, enabled only for rollout-internal evaluations via the
+`deep_prefilter` parameter), cubeless probs accumulated through the same tree
+walk (so rollout truncation needs one walk, not two), a per-thread
+cube-state-keyed memoization cache, the move-1 cube-decision cache, and a
+1-ply screen that gates in-trial cube-decision escalations.
+
+The same engine also runs the **cubeless** N-ply evaluation everywhere: the
+rollout internals (in-trial N-ply move selection, cubeless truncation
+evaluation) and the standalone paths (`MultiPlyStrategy::evaluate_probs_nply`
+and the cubeless `best_move_index` rescore — i.e. post-move N-ply analytics,
+benchmark ER scoring, self-play) all go through the engine with a single
+**dead cube** (`cube_value=1, max_cube_value=1` — Janowski bypassed, interior
+picks reduce to cubeless 1-ply). Dead-cube tree nodes are shared across trial
+threads via the rollout's `SharedPosCache` (probs fully determine dead-node
+values); bearoff positions short-circuit to exact DB probs. The old cubeless
+recursion (`evaluate_probs_nply_impl`) survives only for the hybrid evaluator
+(separate filter strategy). Note the engine classifies candidates by their
+own boards (per-candidate NN selection) where the old recursion used the
+pre-move board — values shift ~0.01-0.02 on some plan-boundary contact
+positions, and the benchmark ER improved (stage9 contact 2-ply 7.99 → 7.76).
+Full specification: **`MULTI-PLY.md`** (sections 4-7) and **`ROLLOUT.md`**.
+Benchmarks against saved baselines: `scripts/bench_3t.py` (cube action),
+`scripts/bench_3t_checker.py` (checker play, fixed dice in
+`scripts/bench_checker_dice.json`), `scripts/bench_3t_postmove.py`
+(post-move eval), `scripts/bench_3t_cubeless.py` (cubeless rollout of
+post-move positions), `scripts/bench_nply_cubeless.py` (standalone N-ply
+cubeless: post-move probs at 2-4 ply + contact/race benchmark ER) — each
+supports `--save`/`--compare` with a material band of max(SE, 0.01) for
+equities and 0.005 for probabilities (the cubeless rollout bench widens the
+prob band to each prob's own SE).
+
 ### Truncated Rollouts (XG Roller-style)
 
 Truncated rollouts are short Monte Carlo simulations truncated at a fixed depth
@@ -1079,7 +1122,7 @@ for position evaluation.
 - At or after `ultra_late_threshold`: `base_` (1-ply)
 - Before `late_threshold`: `checker_strat_` (configured checker evaluation)
 - At or after `late_threshold`: `checker_late_strat_` (configured late checker evaluation)
-- Truncation evaluation: `truncation_strat_` (defaults to `decision_ply`, configurable via `truncation_ply`)
+- Truncation evaluation: the cubeful evaluation engine at `truncation_ply` (defaults to `decision_ply`); 1-ply truncation uses the base strategy directly
 
 **Cube decision strategy selection during trials** (same fallback chain):
 - Race positions: always `base_` (1-ply)

@@ -7,6 +7,7 @@
 #include "match_equity.h"
 #include "types.h"
 #include <array>
+#include <cstdint>
 #include <memory>
 
 namespace bgbot {
@@ -306,6 +307,15 @@ CubefulProbsAndEquity cubeful_probs_and_equity_nply(
 //
 // The returned values are equities (money game) or equities-via-mwc2eq
 // (match play), matching the single-cube overload's return semantics.
+// probs_out: when non-null, receives the tree's cubeless pre-roll probs in
+// the player-on-roll's perspective (same convention as cubeful_probs_nply),
+// accumulated through the same traversal — no extra tree walk.
+//
+// deep_prefilter: when true, nodes strictly below the entry ply prune
+// candidates to the PubEval-top-14 before NN evaluation. Used by
+// rollout-internal evaluations (truncation, in-trial cube decisions, cubeful
+// move rescoring), where the slight per-call shift averages out over hundreds
+// of trials. Standalone deterministic N-ply analytics leave it off.
 void cubeful_equity_nply_multi(
     const Board& board,
     const CubeInfo* cubes,
@@ -316,7 +326,9 @@ void cubeful_equity_nply_multi(
     const MoveFilter& filter = MoveFilters::TINY,
     int n_threads = 1,
     const Strategy* move_filter = nullptr,
-    bool fTop = false);                      // true: caller already built ND+DT pairs
+    bool fTop = false,                       // true: caller already built ND+DT pairs
+    std::array<float, NUM_OUTPUTS>* probs_out = nullptr,
+    bool deep_prefilter = false);
 
 // Batched cube decision: evaluate cube decisions for multiple branches that
 // share the same board.  For each input cube in `cubes`, this is exactly
@@ -324,6 +336,7 @@ void cubeful_equity_nply_multi(
 // branches are processed in a single recursion with cci = 2 * n_cubes and
 // fTop = true, so move selection and the cubeless NN evaluations are shared
 // across all branches.  Writes N CubeDecision results into `out`.
+// deep_prefilter: see cubeful_equity_nply_multi.
 void cube_decision_nply_multi(
     const Board& board,
     const CubeInfo* cubes,
@@ -333,7 +346,8 @@ void cube_decision_nply_multi(
     CubeDecision* out,                       // size n_cubes
     const MoveFilter& filter = MoveFilters::TINY,
     int n_threads = 1,
-    const Strategy* move_filter = nullptr);
+    const Strategy* move_filter = nullptr,
+    bool deep_prefilter = false);
 
 // Compute full cube decision at N-ply depth.
 // `board` is pre-roll from the player's perspective.
@@ -376,6 +390,17 @@ inline CubeDecision cube_decision_from_probs(
 {
     return cube_decision_1ply(cubeless_probs, cube, board, is_race_pos);
 }
+
+// Clear this thread's cubeful evaluation cache (the per-thread,
+// cube-state-keyed memoization table used by the N-ply cubeful engine).
+// Entries persist across calls on a thread; call this before reusing a
+// thread for an unrelated evaluation batch (rollout dispatch does this for
+// each worker at the start of every rollout).
+void clear_cubeful_eval_cache();
+
+// Fingerprint of a cube-state array. Used for the cubeful evaluation cache
+// keys and for validating shared cube-decision caches across rollout trials.
+uint64_t cube_state_fingerprint(const CubeInfo* cubes, int n);
 
 // Profiling counters for cubeful recursion (debug only)
 void reset_cubeful_counters();

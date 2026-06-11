@@ -360,15 +360,21 @@ private:
     struct DiceRoll { int d1, d2, weight; };
     static const std::array<DiceRoll, 21> ALL_ROLLS;
 
-    // Core recursive N-ply evaluation.
+    // Core N-ply cubeless evaluation.
     // Board is a post-move position from player 1's perspective.
     // pre_move_board is the board BEFORE the move (for game plan classification).
     // Returns 5 probabilities from player 1's perspective.
+    // Delegates to cubeless_tree_probs (the cubeful evaluation engine with a
+    // dead cube); the hybrid evaluator (filter_strat_ set) keeps the
+    // recursion in evaluate_probs_nply_impl.
     std::array<float, NUM_OUTPUTS> evaluate_probs_nply(
         const Board& board, const Board& pre_move_board, int plies) const;
     std::array<float, NUM_OUTPUTS> evaluate_probs_nply_impl(
         const Board& board, const Board& pre_move_board, int plies,
         bool allow_parallel) const;
+    std::array<float, NUM_OUTPUTS> cubeless_tree_probs(
+        const Board& board, const Board& pre_move_board,
+        int plies, int n_threads, bool deep_prefilter) const;
     int parallel_thread_count(int plies = 1) const;
 
     // Open-addressing position cache with power-of-2 sizing.

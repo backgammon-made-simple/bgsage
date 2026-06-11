@@ -157,6 +157,10 @@ class BearoffStrategy : public Strategy {
 public:
     BearoffStrategy(std::shared_ptr<Strategy> base, const BearoffDB* db);
 
+    // Bearoff interception doesn't change which evaluator the cache entries
+    // belong to — share them with the wrapped strategy.
+    uint64_t eval_identity() const override { return base_->eval_identity(); }
+
     double evaluate(const Board& board, bool pre_move_is_race) const override;
 
     std::array<float, NUM_OUTPUTS> evaluate_probs(

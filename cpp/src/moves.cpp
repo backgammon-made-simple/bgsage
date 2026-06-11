@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Mark Higgins
 #include "bgbot/moves.h"
 #include <algorithm>
+#include <cstdint>
 
 namespace bgbot {
 
@@ -253,6 +254,132 @@ void possible_boards(const Board& board, int die1, int die2,
     }
 
     sort_unique_boards(results);
+}
+
+namespace {
+
+uint64_t board_hash64(const Board& b) {
+    uint64_t h = 0x9e3779b97f4a7c15ULL;
+    for (int i = 0; i < 26; ++i) {
+        h ^= static_cast<uint32_t>(b[i] + 32);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Generation-stamped open-addressing table used to reject duplicate boards
+// at insertion time. begin() invalidates all entries in O(1) by bumping the
+// generation counter.
+struct MoveDedup {
+    static constexpr uint32_t TBL = 2048;     // power of 2
+    std::vector<int32_t> head = std::vector<int32_t>(TBL, -1);
+    std::vector<uint32_t> stamp = std::vector<uint32_t>(TBL, 0);
+    uint32_t gen = 0;
+
+    void begin() {
+        ++gen;
+        if (gen == 0) {
+            std::fill(stamp.begin(), stamp.end(), 0u);
+            gen = 1;
+        }
+    }
+
+    // Returns true if `b` is new; records `idx` (the board's position in the
+    // output vector) as its slot value.
+    bool insert(const Board& b, const std::vector<Board>& v, int idx) {
+        uint32_t slot = static_cast<uint32_t>(board_hash64(b)) & (TBL - 1);
+        for (;;) {
+            if (stamp[slot] != gen) {
+                stamp[slot] = gen;
+                head[slot] = idx;
+                return true;
+            }
+            if (v[head[slot]] == b) return false;
+            slot = (slot + 1) & (TBL - 1);
+        }
+    }
+};
+
+thread_local MoveDedup g_move_dedup;
+
+// Strict generator: only emits boards where ALL n_dice are used (or the game
+// ended mid-sequence). Leaves are dedup-checked at insertion, so duplicate
+// boards are never copied into the output.
+void generate_strict_dedup(const Board& b, const int* dice, int n_dice,
+                           std::vector<Board>& results,
+                           std::vector<Board>* scratch_by_depth,
+                           MoveDedup& dedup,
+                           int depth = 0)
+{
+    if (!has_checkers(b)) {
+        if (dedup.insert(b, results, static_cast<int>(results.size()))) {
+            results.push_back(b);
+        }
+        return;
+    }
+
+    std::vector<Board>& scratch = scratch_by_depth[depth];
+    scratch.clear();
+    possible_boards_one_die(b, dice[0], scratch);
+
+    if (n_dice == 1) {
+        for (const auto& nb : scratch) {
+            if (dedup.insert(nb, results, static_cast<int>(results.size()))) {
+                results.push_back(nb);
+            }
+        }
+        return;
+    }
+
+    for (const auto& nb : scratch) {
+        generate_strict_dedup(nb, dice + 1, n_dice - 1, results,
+                              scratch_by_depth, dedup, depth + 1);
+    }
+}
+
+} // namespace
+
+void possible_boards_unsorted(const Board& board, int die1, int die2,
+                              std::vector<Board>& results)
+{
+    results.clear();
+    thread_local std::array<std::vector<Board>, 4> scratch_by_depth;
+    for (auto& scratch : scratch_by_depth) {
+        if (scratch.capacity() < 16) scratch.reserve(16);
+    }
+    MoveDedup& dedup = g_move_dedup;
+    dedup.begin();
+
+    if (die1 == die2) {
+        int dice[4] = {die1, die1, die1, die1};
+        for (int n = 4; n >= 1; --n) {
+            generate_strict_dedup(board, dice, n, results,
+                                  scratch_by_depth.data(), dedup);
+            if (!results.empty()) break;
+        }
+    } else {
+        int dice_a[2] = {die1, die2};
+        int dice_b[2] = {die2, die1};
+        generate_strict_dedup(board, dice_a, 2, results,
+                              scratch_by_depth.data(), dedup);
+        generate_strict_dedup(board, dice_b, 2, results,
+                              scratch_by_depth.data(), dedup);
+
+        if (results.empty()) {
+            int large = std::max(die1, die2);
+            int small = std::min(die1, die2);
+            possible_boards_one_die(board, large, results);
+            if (results.empty()) {
+                possible_boards_one_die(board, small, results);
+            }
+            // One-die fallback bypasses the dedup table; duplicates are
+            // impossible there (each origin point yields a distinct board).
+        }
+    }
+
+    if (results.empty()) {
+        results.push_back(board);
+    }
 }
 
 } // namespace bgbot

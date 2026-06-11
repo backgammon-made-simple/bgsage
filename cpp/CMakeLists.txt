@@ -34,6 +34,7 @@ add_library(bgbot_lib STATIC
     src/multipy.cpp
     src/rollout.cpp
     src/cube.cpp
+    src/cube_eval.cpp
     src/match_equity.cpp
     src/bearoff.cpp
 )

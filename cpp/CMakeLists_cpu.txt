@@ -52,6 +52,7 @@ add_library(bgbot_lib STATIC
     ${BGBOT_CPU_ROOT}/src/multipy.cpp
     ${BGBOT_CPU_ROOT}/src/rollout.cpp
     ${BGBOT_CPU_ROOT}/src/cube.cpp
+    ${BGBOT_CPU_ROOT}/src/cube_eval.cpp
     ${BGBOT_CPU_ROOT}/src/match_equity.cpp
     ${BGBOT_CPU_ROOT}/src/bearoff.cpp
 )

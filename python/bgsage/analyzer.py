@@ -1021,7 +1021,6 @@ class BgBotAnalyzer:
         # ultra_late_threshold=9999 keeps cubeful active for ~50 half-moves.
         # 0 = inherit from ultra_late_threshold (no separate drop).
         self._cubeful_late_threshold = int(cubeful_late_threshold)
-
         # Load bearoff database
         self._bearoff_db = None
         if bearoff_db:
@@ -1357,6 +1356,12 @@ class BgBotAnalyzer:
             cubeless_equity=cl_eq,
             cubeful_equity=cf_eq,
             eval_level=eval_level,
+            cubeless_se=(float(r["std_error"])
+                         if isinstance(r, dict) and r.get("std_error") is not None
+                         else None),
+            cubeful_se=(float(r["cubeful_se"])
+                        if isinstance(r, dict) and r.get("cubeful_se") is not None
+                        else None),
         )
 
     def cube_action(

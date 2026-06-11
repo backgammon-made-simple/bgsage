@@ -10,7 +10,7 @@ It is a joint Python/C++ library that includes:
 * A neural network-based backgammon bot.
 * Neural network training framework using both self play and supervised learning, including training code, benchmark scoring, with customizable inputs. Uses your NVIDIA GPU (via CUDA) if you have one.
 * The post-training weights for several different versions of the bot engine.
-* Multi-ply and rollout calculations that efficiently parallelize on the CPU.
+* Multi-ply and rollout calculations that efficiently parallelize on the CPU. Full technical specifications of the algorithms are in MULTI-PLY.md (N-ply search and the cubeful evaluation engine) and ROLLOUT.md (truncated and full rollouts with variance reduction).
 * Test framework.
 * VIBING.md: information on how to use Claude Code-style tools to interact with and change it, and how to submit changes back to us (the maintainers). Most of this code was written by Anthropic's Claude Code and OpenAI's Codex.
 

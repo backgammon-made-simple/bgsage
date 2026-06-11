@@ -276,29 +276,36 @@ for each pair i:
         result[i] = expanded_equities[2i]   // No cube available
 ```
 
-### Core Recursion: cubeful_recursive_multi
+### Core Recursion
 
-The main recursive function evaluates a pre-roll position for all cci cube states
-simultaneously.
+The main recursive function evaluates a pre-roll position for all cci cube
+states simultaneously. It also accumulates the position's **cubeless
+probabilities** through the same traversal, so a single tree walk serves both
+the cubeful equities and the cubeless probs (callers that want probs pass a
+probs-out buffer — `cubeful_probs_nply`, `cubeful_probs_and_equity_nply`, and
+the rollout's truncation evaluation use this).
 
 **Inputs:**
 - `board`: pre-roll position from the roller's perspective
 - `aciCubePos[]`: array of cci cube states (all from roller's perspective)
 - `cci`: count of cube states
-- `strategy`: neural network evaluation strategy
+- `strategy`: neural network evaluation strategy (1-ply base)
 - `plies`: remaining search depth
 - `fTop`: true at the top level (suppresses DT expansion in make_cube_pos)
 
-**Output:** `arCubeful[]`: array of cci equity values (money) or MWC values (match).
+**Outputs:** `arCubeful[]`: array of cci equity values (money) or MWC values
+(match); optionally the node's cubeless pre-roll probs.
 
 **Algorithm:**
 
 ```
-function cubeful_recursive_multi(board, cubeStates, cci, plies, fTop):
+function cubeful_recursive(board, cubeStates, cci, plies, fTop):
 
-    // 1. Cache lookup
-    if cached(board, cci, plies, fTop):
-        return cached_values
+    // 1. Cache lookup (per-thread; key includes a fingerprint of the cube
+    //    states, so entries stay valid across calls — see Caching below).
+    //    Internal nodes only (plies >= 2).
+    if cached(board, plies, cci, fTop, fingerprint(cubeStates)):
+        return cached values (+ cached cubeless probs)
 
     // 2. Terminal check
     if game_over(board):
@@ -320,26 +327,33 @@ function cubeful_recursive_multi(board, cubeStates, cci, plies, fTop):
             else:
                 expanded_equity[i] = cl2cf_match(probs, state, x)
 
-        return get_ecf3(expanded_equities, cci, expanded_states)
+        return get_ecf3(expanded_equities, cci, expanded_states), probs
 
-    // 4. INTERNAL NODE (plies > 1): recurse over 21 dice rolls
+    // 4. INTERNAL NODE (plies > 1): iterate over 21 dice rolls
     expanded[] = make_cube_pos(cubeStates, cci, fTop, fInvert=true)
     expanded_cci = 2 * cci
-    accum[expanded_cci] = {0}
 
     for each of 21 dice rolls (d1, d2, weight):
-        candidates = legal_moves(board, d1, d2)
+        candidates = legal_moves(board, d1, d2)   // hash-dedup move generation
 
         if no legal moves:
             // Standing pat: flip board, recurse
-            recurse(flip(board), expanded[], expanded_cci, plies-1) into temp[]
+            recurse(flip(board), expanded[], expanded_cci, plies-1)
         else:
-            best = pick_best_move(candidates)     // by cubeless 1-ply equity
-            opp_board = flip(candidates[best])
-            recurse(opp_board, expanded[], expanded_cci, plies-1) into temp[]
+            optional cheap pre-filter (PubEval)            // see section 6
+            probs[c] = batched 1-ply NN eval of all candidates   // see section 6
+            best = argmax_c cl2cf(probs[c], cubeStates[0], x_c)  // cubeful pick
 
-        for i in 0..expanded_cci:
-            accum[i] += weight * temp[i]
+            if plies == 2:
+                // Leaf reuse: the leaf evaluation of the picked move is
+                // invert(NN(candidates[best])) — already computed by the
+                // pick batch. Apply Janowski + get_ecf3 directly; no leaf
+                // NN call, no recursive call.
+                leaf values from probs[best]
+            else:
+                recurse(flip(candidates[best]), expanded[], expanded_cci, plies-1)
+
+        accumulate weight * (per-state values, cubeless probs)
 
     // 5. Average and flip perspective
     for i in 0..expanded_cci:
@@ -347,14 +361,23 @@ function cubeful_recursive_multi(board, cubeStates, cci, plies, fTop):
             accum[i] = -accum[i] / 36       // negate for opponent→player
         else:
             accum[i] = 1 - accum[i] / 36    // MWC complement
+    probs = invert(probs_accum / 36)
 
     // 6. Un-invert cube states back to current player's perspective
     for each expanded state:
         flip_cube_perspective(state)
 
-    // 7. Collapse via optimal cube decisions
-    return get_ecf3(accum, cci, expanded_states)
+    // 7. Collapse via optimal cube decisions; store in cache
+    return get_ecf3(accum, cci, expanded_states), probs
 ```
+
+**Top-level parallelism:** when the caller passes `n_threads > 1` and
+`n_plies > 2` (standalone analytics calls), the 21 rolls at the top tree
+levels are distributed across the shared thread pool (children stay parallel
+while `plies - 1 > 2`). Each roll writes into its own slot and accumulation
+runs in fixed roll order, so results are independent of thread count.
+Rollout-internal calls run serial — trial dispatch already saturates the
+cores.
 
 ### Perspective Semantics
 
@@ -406,7 +429,7 @@ function cube_decision_nply(board, cube, strategy, n_plies):
     states[0] = cube                              // ND: current cube state
     states[1] = cube with (value=2*cv, owner=OPPONENT)  // DT: doubled cube
 
-    cubeful_recursive_multi(board, states, cci=2, n_plies, fTop=true)
+    cubeful_recursive(board, states, cci=2, n_plies, fTop=true)
     // fTop=true prevents make_cube_pos from creating additional DT branches
     // at the top level (we already have separate ND and DT states)
 
@@ -454,68 +477,127 @@ regardless of cube value, but winning scores more points).
 
 The `cubeful_equity_nply` function returns a single cubeful equity value for a
 position (not a full cube decision). It initializes cci=1 with the given cube state
-and calls `cubeful_recursive_multi` with fTop=false. The internal expansion/collapse
+and runs the cubeful recursion with fTop=false. The internal expansion/collapse
 handles all cube branching automatically.
 
 ## 6. Move Selection Within the Cubeful Recursion
 
-At each internal node of the cubeful recursion, the algorithm must pick the best move
-for each dice roll. Move selection uses **cubeless 1-ply equity** — the same move is
-used for all cube states simultaneously. This is a key simplification: cubeful move
-selection would require evaluating each candidate under each cube state independently,
-which is prohibitively expensive and produces negligible accuracy improvement.
+At each internal node of the cubeful recursion, the algorithm must pick the
+best move for each dice roll. The pick maximizes **1-ply cubeful equity
+against the primary cube state** `cubeStates[0]` (`cl2cf` applied to each
+candidate's 1-ply probs with the candidate's own cube efficiency). The same
+move is used for all cube states simultaneously — per-cube move forking would
+double the tree per state for negligible accuracy gain — but because the pick
+itself is cubeful, interior play is cube- and match-aware throughout the tree
+(e.g. match-defensive moves at extreme away scores are picked where a cubeless
+pick would not choose them).
 
-### Two-Stage Move Filtering
+### Batched Candidate Evaluation
 
-When a PubEval pre-filter strategy is provided and the number of legal moves exceeds
-a threshold (16), a two-stage filter is applied:
+The per-candidate 1-ply probabilities that feed the pick are computed by a
+batched kernel rather than one full NN forward pass per candidate:
 
-**Stage 1: PubEval pre-filter:**
-- Score all candidates with PubEval (fast linear evaluator)
-- Keep the top 15 candidates (by evaluation score)
-- Terminal positions (game over) always survive filtering
+1. **Terminal candidates** get `terminal_probs` without an NN call.
+2. **Bearoff candidates** get exact DB probabilities (when the strategy is
+   bearoff-wrapped).
+3. The rest are **classified per candidate** (game-plan NN selection from the
+   candidate board) and **grouped by NN index**. Within each group, the first
+   candidate runs a full forward pass that saves the pre-sigmoid hidden sums
+   and input vector; every sibling is then evaluated by **sparse delta
+   updates** — only the input columns that differ from the group's base
+   candidate touch the hidden layer (a backgammon move typically changes
+   4-12 of 196/244 inputs). This is the same incremental-evaluation kernel
+   the cubeless batch paths use.
 
-**Stage 2: Full model evaluation:**
-- Score survivors with the main neural network strategy
-- Pick the candidate with the highest cubeless equity
-- If a `GamePlanStrategy` is available, use batch evaluation for efficiency
+Probabilities are not clamped before the pick; the leaf conversion clamps
+(see section 2).
 
-The PubEval pre-filter is provided by default in the `cube_decision_nply_unified`
-binding. It reduces 1-ply NN evaluations on positions with many legal moves (doubles
-can generate 30-90 candidates), with negligible impact on move selection accuracy
-since PubEval's ranking correlates well with NN ranking for the top moves.
+### Leaf Reuse at 2-Ply Nodes
+
+At a `plies == 2` internal node, the leaf evaluation of the picked move would
+be `invert(NN(chosen))` — exactly the NN output the pick batch already
+computed for that candidate. The leaf's Janowski conversion and `get_ecf3`
+collapse therefore run directly on the pick batch's probs: 2-ply subtrees
+perform **no leaf NN evaluations at all** (their entire NN cost is the pick
+batches).
+
+### Move Pre-Filtering
+
+A cheap PubEval pre-filter narrows large candidate sets before the batched
+NN evaluation (terminal candidates always survive):
+
+- **Entry-ply nodes** (the node at the call's full depth): when the caller
+  provides a move-filter strategy, candidates beyond the PubEval-top-15 are
+  pruned when more than 16 exist.
+- **Deeper nodes** (`plies` strictly below the entry ply): when the caller
+  enables `deep_prefilter`, a built-in PubEval prunes to the top 14 when more
+  than 16 candidates exist. Rollout-internal evaluations (truncation,
+  in-trial cube decisions, cubeful move rescoring) enable this — the slight
+  per-call shift averages out over hundreds of trials. Standalone
+  deterministic N-ply analytics leave it off. Race nodes skip the deep
+  filter (their candidate evaluations hit the bearoff DB / cheap race NN, so
+  PubEval scoring would cost more than it saves).
 
 ### Move Selection Constants
 
 ```
-MOVE_FILTER_THRESHOLD = 16    // Apply pre-filter if > 16 candidates
-MOVE_FILTER_KEEP = 15         // Keep top 15 after pre-filtering
+MOVE_FILTER_THRESHOLD = 16     // Entry-ply: pre-filter if > 16 candidates
+MOVE_FILTER_KEEP = 15          // Entry-ply: keep top 15
+DEEP_FILTER_THRESHOLD = 16     // Deep nodes: pre-filter if > 16 candidates
+DEEP_FILTER_KEEP = 14          // Deep nodes: keep top 14
+// Deep values overridable via BGBOT_CUBEFUL_DEEP_THRESHOLD / _KEEP env vars
 ```
 
 ## 7. N-Ply Checker Play Evaluation
 
 The `MultiPlyStrategy` class implements N-ply lookahead for checker play (move
-selection and position evaluation). This is a separate system from the cubeful
-recursion in sections 4-6 — it evaluates **cubeless probabilities** at N-ply depth,
-producing the 5 standard NN outputs. The cubeful recursion calls this system's base
-strategy at leaf nodes, but this system is also used independently for checker play
-analysis.
+selection and position evaluation) — it evaluates **cubeless probabilities** at
+N-ply depth, producing the 5 standard NN outputs.
+
+### Delegation to the Cubeful Evaluation Engine
+
+`evaluate_probs_nply(board, pre_move_board, plies)` delegates to the cubeful
+evaluation engine (sections 4-6) with a single **dead cube** (`cube_value=1,
+max_cube_value=1`): with the cube dead, `cl2cf` bypasses Janowski everywhere
+and interior picks reduce to plain cubeless 1-ply equity, so the engine's tree
+is exactly a cubeless N-ply evaluation. The flow (`cubeless_tree_probs`):
+
+1. Bearoff DB short-circuit: exact probs via `lookup_probs(board, post_move=true)`.
+2. `plies <= 1`: direct base-strategy evaluation.
+3. Terminal check.
+4. `cubeful_equity_nply_multi(flip(board), dead_cube, 1, base, plies, …,
+   probs_out, deep_prefilter)` — the tree's accumulated probs, inverted and
+   clamped, are the post-move probs of `board`'s mover.
+
+The standalone entry uses `deep_prefilter=false` (conservative — no deep
+PubEval prune); the best-move rescoring in section 8 uses `deep_prefilter=true`
+(its band-level shifts were validated on the checker benchmark and the
+benchmark ER, which improved). Top-level 21-roll parallelism is requested via
+the engine's `n_threads` when `parallel_evaluate_` is set and `plies > 2`.
+
+**Classification convention:** the engine's candidate kernel classifies each
+candidate by its own board (per-candidate `nn_index_for`), whereas the
+recursion below classifies opponent candidates by the pre-move board. On
+candidates that cross a game-plan boundary the two conventions select
+different NNs, which shifts evaluations at the ~0.01-0.02 level on some
+contact positions. The per-candidate convention scores better on the
+benchmark ER (contact 2-ply 7.76 vs 7.99 for the recursion, stage9).
+
+**The recursion below (`evaluate_probs_nply_impl`) remains in use only for
+the hybrid evaluator** (`filter_strat_` set — a separate filter strategy for
+opponent picks, which the engine has no hook for).
 
 ### Relationship to the Cubeful Recursion
 
-The cubeful recursion (`cubeful_recursive_multi`) and the checker play evaluation
-(`MultiPlyStrategy`) are related but independent systems:
+- **Cubeful recursion** (section 4): Evaluates cube decisions. At leaf nodes
+  it evaluates the base 1-ply strategy once (and at 2-ply internal nodes the
+  leaf reuses the pick batch's NN output). At internal nodes it uses the
+  batched per-candidate evaluation kernel for move selection (section 6). It
+  carries cube state arrays and operates in equity/MWC space.
 
-- **Cubeful recursion** (section 4): Evaluates cube decisions. At leaf nodes it calls
-  `strategy.evaluate_probs()` which goes to the base `GamePlanStrategy` (1-ply NN
-  evaluation). At internal nodes it uses `strategy.evaluate_probs()` or
-  `batch_evaluate_candidates_best_prob()` for move selection. It carries cube state
-  arrays and operates in equity/MWC space.
-
-- **Checker play evaluation** (this section): Evaluates cubeless probabilities at
-  N-ply depth. Returns 5 probabilities. Used for checker play analysis ("which move
-  is best?"), and also used within the cubeful recursion when the strategy passed to
-  `cube_decision_nply` is a `MultiPlyStrategy` rather than a base `GamePlanStrategy`.
+- **Checker play evaluation** (this section): Evaluates cubeless probabilities
+  at N-ply depth via the same engine under a dead cube (above), with the
+  legacy recursion retained for the hybrid evaluator.
 
 ### Perspective Semantics
 
@@ -544,7 +626,10 @@ one tempo (being on roll is an advantage).
 
 ### Core Algorithm: evaluate_probs_nply_impl
 
-Evaluates a post-move position at N-ply depth, returning 5 cubeless probabilities.
+Evaluates a post-move position at N-ply depth, returning 5 cubeless
+probabilities. **Hybrid-evaluator path only** — non-hybrid strategies delegate
+to the cubeful evaluation engine (see "Delegation to the Cubeful Evaluation
+Engine" above).
 
 ```
 function evaluate_probs_nply_impl(board, pre_move_board, plies, allow_parallel):
@@ -683,8 +768,12 @@ evaluate(board, is_race) → equity
 best_move_index(candidates, pre_move_board) → index
 ```
 
-All public methods delegate to `evaluate_probs_nply_impl` at the configured ply depth,
-with `allow_parallel` set to true only at the outermost call level.
+All public methods route through `evaluate_probs_nply` at the configured ply
+depth — i.e. the dead-cube engine delegation for non-hybrid,
+non-full-depth-opponent strategies (see "Delegation to the Cubeful Evaluation
+Engine" above), with engine-internal roll parallelism requested only at the
+outermost call level; the recursion (`evaluate_probs_nply_impl`) serves the
+hybrid and full-depth-opponent modes.
 
 ## 8. Best Move Selection (Iterative Deepening)
 
@@ -711,10 +800,11 @@ function best_move_index(candidates, pre_move_board, n_plies):
             filter_s = filter_strategy ? filter_strategy : base_strategy
             filter_s.batch_evaluate_candidates_equity(candidates, pre_move_board, equities)
         else:
-            // N-ply evaluation for each survivor
+            // N-ply evaluation for each survivor — cubeless_tree_probs
+            // (the dead-cube engine, deep_prefilter=true); the recursion
+            // only in hybrid mode
             for idx in survivors:
-                probs = evaluate_probs_nply_impl(candidates[idx], pre_move_board,
-                                                  step.ply, allow_parallel=false)
+                probs = cubeless_nply(candidates[idx], pre_move_board, step.ply)
                 equities[idx] = cubeless_equity(probs)
 
         // Sort survivors by equity descending
@@ -732,11 +822,13 @@ function best_move_index(candidates, pre_move_board, n_plies):
 
     // Parallel evaluation of survivors (if enabled)
     for each survivor (parallel or serial):
-        probs = evaluate_probs_nply_impl(candidates[idx], pre_move_board,
-                                          n_plies, allow_parallel=false)
+        probs = cubeless_nply(candidates[idx], pre_move_board, n_plies)
         equity = cubeless_equity(probs)
 
     return argmax(equity)
+
+// cubeless_nply = cubeless_tree_probs(…, deep_prefilter=true) for
+// non-hybrid strategies, evaluate_probs_nply_impl for the hybrid evaluator.
 ```
 
 ### Filter Chain Construction
@@ -849,41 +941,42 @@ for potential future use with faster filter strategies.
 
 ### Cubeful Recursion Cache
 
-The cubeful recursion uses a thread-local open-addressing hash table with
-epoch-based invalidation.
+The cubeful recursion memoizes internal nodes in a per-thread open-addressing
+hash table.
 
 **Structure:**
-- Fixed-size table: 8,192 entries (power of 2)
+- Fixed-size table: 32,768 entries per thread (power of 2)
 - Linear probing with max 4 probe steps
-- Each entry stores: board, plies, cci, fTop, epoch, values[MAX_CCI]
+- Each entry stores: board, plies, cci, fTop, a fingerprint of the cube-state
+  array, up to 16 per-state cubeful values, and the node's cubeless probs
 
-**Hash function:**
-```
-h = plies * 0x9e3779b97f4a7c15
-h ^= cci * 0x517cc1b727220a95
-h ^= fTop * 0x6c62272e07bb0142
-for each board[i]:
-    h ^= board[i] * (0x9e3779b97f4a7c15 + i * 7)
-    h = rotate_left(h, 7)
-```
+**Key:** a 64-bit hash mixing the board, `plies`, `cci`, `fTop`, and the
+cube-state fingerprint. The fingerprint covers every field of every cube
+state (cube value, owner, match away scores, Crawford, Jacoby, beaver,
+max-cube cap, cube-x override), and its seed folds in two pieces of caller
+context: the **evaluator identity** (`Strategy::eval_identity()` — wrappers
+like `BearoffStrategy` resolve to the wrapped strategy, so equivalent
+evaluators share entries while distinct models never collide, even across
+strategy objects sharing a pool thread) and the **deep-prefilter flag** (the
+same node evaluated with and without the deep prune has different values).
+So two calls that reach the same board under different cube contexts,
+models, or prune contexts can never alias.
 
-**Epoch-based invalidation:** A global atomic epoch counter is incremented before each
-top-level cube decision call. Cache entries store the epoch they were written at.
-Lookups reject entries from stale epochs. This solves cross-thread invalidation:
-worker threads in the persistent thread pool retain their thread-local caches, but
-stale entries are automatically rejected when the epoch changes.
+**No epochs:** because the cube context is part of the key, entries remain
+valid across top-level calls, and threads never invalidate each other's
+caches. Entries persist for the lifetime of an evaluation batch;
+`clear_cubeful_eval_cache()` resets the calling thread's table (the rollout
+dispatch clears every worker's table at the start of each rollout, and
+`clear_internal_caches()` clears the calling thread's). This per-thread
+persistence is what lets repeated in-trial cube decisions on recurring
+(board, cube) nodes hit the cache under parallel trial dispatch.
 
-```
-// Before each top-level call:
-global_epoch.fetch_add(1)
+**Scope:** only internal nodes (`plies >= 2`, `cci <= 16`) are cached — leaf
+evaluations are nearly free (2-ply leaves reuse the pick batch's NN output),
+so caching them would cost more in key hashing than it saves.
 
-// On lookup: reject if entry.epoch != global_epoch
-// On insert: stamp entry with current global_epoch
-```
-
-**Replacement policy:** On collision, replace the first empty, stale, or matching
-slot (4 probe slots). If all 4 probe slots are occupied by current-epoch entries,
-evict the first slot.
+**Replacement policy:** on collision, replace the first empty or matching
+slot within the 4 probe slots; otherwise evict the first slot.
 
 ### Checker Play Position Cache (PosCache)
 
@@ -913,7 +1006,9 @@ key = h | 1    // ensure non-zero (0 is the empty marker)
 ### SharedPosCache (Cross-Thread)
 
 For parallel rollouts, a lock-free shared position cache prevents redundant
-evaluations across threads.
+evaluations across threads. It is fed both by this recursion's nodes and by
+the dead-cube (cubeless) nodes of the cubeful evaluation engine, under
+disjoint (salted) keys — see `ROLLOUT.md` §12.
 
 **Structure:**
 - 2M entries, lock-free via CAS (compare-and-swap)
@@ -969,11 +1064,14 @@ allow_parallel = (n_threads > 1) and (plies > 2)
 
 Parallelism is restricted to the top levels of the tree to avoid excessive thread
 overhead. Child nodes use parallel evaluation only when `plies - 1 > 2`.
+Rollout-internal calls pass `n_threads = 1` (trial dispatch already saturates
+the cores).
 
 **Implementation:** `multipy_parallel_for(21, n_threads, fn)` distributes the 21 roll
 evaluations across threads. The calling thread participates as worker 0. Each thread
-writes its results into a separate slot of a results array (no synchronization needed
-on the data). A completion counter + condition variable signal when all threads finish.
+writes its weighted contribution into its own roll slot, and accumulation runs
+in fixed roll order afterward — results are bit-identical regardless of thread
+count. A completion counter + condition variable signal when all threads finish.
 
 ### Parallel Checker Play Evaluation
 
@@ -1004,8 +1102,13 @@ n_threads = min(parallel_thread_count(n_plies), n_survivors)
 the evaluation of all opponent candidates at `(plies - 1)` depth can also be
 parallelized across threads.
 
-In all cases, each thread calls `evaluate_probs_nply_impl` with
-`allow_parallel = false`, so only one level of parallelism is active at a time.
+In all cases each parallel worker evaluates its item serially (the engine
+delegation is called with `n_threads = 1` from worker context; the hybrid
+recursion with `allow_parallel = false`). Engine-internal roll parallelism at
+4-ply+ only nests a second level when the requested thread count exceeds the
+21 top-level roll tasks, and `parallel_thread_count` is capped at hardware
+concurrency — a blocking nested `parallel_for` dispatch wider than the shared
+pool could otherwise deadlock it.
 
 ## 12. Match Play
 
@@ -1114,7 +1217,9 @@ level.
 
 The `cube_decision_nply_with_details` function captures per-roll cubeful equities for
 the first two turns of a cube decision analysis, providing visibility into the
-internal structure of the N-ply evaluation.
+internal structure of the N-ply evaluation. It runs on its own self-contained
+detail-capturing recursion (separate from the main cubeful engine) so that it
+can record per-roll boards and equities at both levels.
 
 ### Output Structure
 
@@ -1141,10 +1246,12 @@ All equities are normalized to per-initial-cube units. The DT section equities
 reflect the opponent's optimal cube action at the doubled cube level, scaled back to
 per-initial-cube units.
 
-Move selection at both levels uses 1-ply cubeless equity (matching the cubeful
-recursion's internal behavior). Equities are evaluated at (N-1)-ply for player rolls
-and (N-2)-ply for opponent rolls — so at 3-ply, player-roll equities are 2-ply
-accurate and opponent-roll equities use 1-ply Janowski.
+Move selection at both levels uses 1-ply cubeless equity (the main cubeful
+engine picks by 1-ply cubeful equity against the primary cube state; the
+detail recursion keeps the simpler cubeless pick). Equities are evaluated at
+(N-1)-ply for player rolls and (N-2)-ply for opponent rolls — so at 3-ply,
+player-roll equities are 2-ply accurate and opponent-roll equities use 1-ply
+Janowski.
 
 ### Verification
 
@@ -1159,15 +1266,18 @@ DT section.
 | Constant | Value | Description |
 |----------|-------|-------------|
 | MAX_CCI | 64 | Maximum simultaneous cube states |
-| CUBEFUL_CACHE_SIZE | 8,192 | Cubeful cache entries per thread |
-| Max probe distance | 4 | Linear probing for cubeful cache |
+| Cubeful eval cache | 32,768 / thread | Per-thread internal-node cache (no epochs; key includes cube-state fingerprint) |
+| Max probe distance | 4 | Linear probing for cubeful eval cache |
+| Cached-state cap | cci ≤ 16 | Nodes carrying more states are recomputed |
 
 ### Move Selection (Cubeful Recursion)
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| MOVE_FILTER_THRESHOLD | 16 | Apply PubEval pre-filter if > 16 candidates |
-| MOVE_FILTER_KEEP | 15 | Keep top 15 after pre-filtering |
+| MOVE_FILTER_THRESHOLD | 16 | Entry-ply nodes: PubEval pre-filter if > 16 candidates (caller-provided filter strategy) |
+| MOVE_FILTER_KEEP | 15 | Entry-ply nodes: keep top 15 |
+| DEEP_FILTER_THRESHOLD | 16 | Deep nodes (below entry ply, `deep_prefilter` on): built-in PubEval if > 16 candidates |
+| DEEP_FILTER_KEEP | 14 | Deep nodes: keep top 14 (env-overridable) |
 
 ### Move Selection (Checker Play)
 
@@ -1177,9 +1287,7 @@ DT section.
 | PREFILTER_KEEP | 15 (default) | Keep this many after pre-filtering |
 
 These defaults are configurable per `MultiPlyStrategy` instance via
-`set_prefilter_params(threshold, keep)`. The rollout truncation strategy
-uses aggressive values (8/6) since truncation evaluations are averaged
-over hundreds of trials.
+`set_prefilter_params(threshold, keep)`.
 
 ### Position Cache (Checker Play)
 

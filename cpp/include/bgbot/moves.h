@@ -23,4 +23,15 @@ std::vector<Board> possible_boards(const Board& board, int die1, int die2);
 void possible_boards(const Board& board, int die1, int die2,
                      std::vector<Board>& results);
 
+// Same legality rules as possible_boards, but duplicate boards are rejected
+// at insertion time via a generation-stamped hash table instead of the
+// insertion-sorted dedup pass, and the output is in first-seen generation
+// order rather than board-sorted order. Several times faster on rolls with
+// many candidates (no O(n^2) 104-byte board shifting). Downstream argmax
+// consumers treat candidates symmetrically, so only exact-tie picks can
+// differ from the sorted variant. Used by the evaluation hot paths (rollout
+// trials, the N-ply cubeful recursion).
+void possible_boards_unsorted(const Board& board, int die1, int die2,
+                              std::vector<Board>& results);
+
 } // namespace bgbot

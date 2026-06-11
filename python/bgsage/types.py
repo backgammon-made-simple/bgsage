@@ -150,6 +150,8 @@ class PostMoveAnalysis:
     cubeless_equity: float      # Cubeless equity
     cubeful_equity: float       # Cubeful equity (Janowski), or same as cubeless if cubeful=False
     eval_level: str             # "1-ply", "2-ply", "3-ply", ..., "Rollout"
+    cubeless_se: float | None = None  # Rollout standard error of cubeless equity
+    cubeful_se: float | None = None   # Rollout standard error of cubeful equity
 
 
 @dataclass

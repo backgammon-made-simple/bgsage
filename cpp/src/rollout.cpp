@@ -97,6 +97,10 @@ void RolloutStrategy::clear_internal_caches() const {
     if (shared_pos_cache_) {
         shared_pos_cache_->clear();
     }
+
+    // Clear this thread's cubeful evaluation cache (pool threads clear
+    // their own at the start of each parallel rollout dispatch).
+    clear_cubeful_eval_cache();
 }
 
 // Helper: propagate bearoff DB to a Strategy that may be MultiPly or Rollout.
@@ -265,29 +269,12 @@ static void build_rollout_strategies(
     cube_inner_rollout = make_inner_rollout(cube_eval_config);
     cube_late_inner_rollout = make_inner_rollout(cube_late_eval_config);
 
-    // Build truncation evaluation strategy. Always create a separate instance
-    // (not shared with checker_strat) so it can use more aggressive PubEval
-    // filtering. Truncation evaluations are averaged over hundreds of trials,
-    // so slightly noisier individual evaluations wash out in the mean.
-    int effective_trunc_ply = (config.truncation_ply >= 1) ? config.truncation_ply : config.decision_ply;
-    if (effective_trunc_ply > 1) {
-        std::shared_ptr<MultiPlyStrategy> trunc_mp;
-        if (filter_base) {
-            trunc_mp = std::make_shared<MultiPlyStrategy>(
-                base, filter_base, effective_trunc_ply, internal_filter);
-        } else {
-            trunc_mp = std::make_shared<MultiPlyStrategy>(
-                base, effective_trunc_ply, internal_filter);
-        }
-        // More aggressive PubEval filtering for truncation: activate earlier
-        // (threshold 8 vs 20) and keep fewer candidates (6 vs 15). This
-        // reduces the number of NN encodings per opponent roll in the N-ply
-        // recursion, which is the dominant cost of truncation evaluation.
-        trunc_mp->set_prefilter_params(8, 6);
-        truncation_strat = trunc_mp;
-    } else {
-        truncation_strat = base;
-    }
+    // Truncation evaluation strategy. N-ply truncation evaluations go
+    // through the cubeful evaluation engine (cube_eval.cpp) inside
+    // run_trial_unified — the fused cubeful walk and the dead-cube cubeless
+    // walk — so the only direct evaluate_probs use left is the 1-ply case,
+    // which is just the base strategy.
+    truncation_strat = base;
 }
 
 // Common post-construction init for both RolloutStrategy constructors.
@@ -418,6 +405,43 @@ void RolloutStrategy::generate_stratified_dice(
             }
         }
     }
+}
+
+// ======================== Cubeless N-Ply Selection ========================
+
+// A dead money cube: cube_is_dead() is true, so the cubeful evaluation
+// engine bypasses Janowski everywhere and its tree reduces exactly to a
+// cubeless N-ply evaluation.
+static const CubeInfo& dead_cube_info()
+{
+    static const CubeInfo dead = [] {
+        CubeInfo c;
+        c.cube_value = 1;
+        c.max_cube_value = 1;
+        return c;
+    }();
+    return dead;
+}
+
+// Cubeless N-ply move selection for trial moves. When the strategy is a
+// MultiPlyStrategy, route through best_move_index_cubeful_multi with a
+// single dead cube — with the cube dead, its 1-ply filter scores by plain
+// cubeless equity and its rescore runs the batched cubeful evaluation
+// engine (cube_eval.cpp) as a cubeless N-ply tree. Other strategies
+// (1-ply base, child truncated-rollout evaluators) keep their own
+// best_move_index.
+static int cubeless_best_move_index(const Strategy& strat,
+                                    const std::vector<Board>& candidates,
+                                    const Board& pre_move_board)
+{
+    if (dynamic_cast<const MultiPlyStrategy*>(&strat)) {
+        int pick = 0;
+        strat.best_move_index_cubeful_multi(candidates, pre_move_board,
+                                            &dead_cube_info(), 1,
+                                            0.0f, &pick);
+        return pick;
+    }
+    return strat.best_move_index(candidates, pre_move_board);
 }
 
 // ======================== VR Helper ========================
@@ -623,7 +647,8 @@ void RolloutStrategy::prefill_move0_cache(
     SharedPosCache* shared, const CubeInfo* select_cubes, int n_select_cubes) const
 {
     // Move0 uses checker strategy for move selection.
-    // This also warms the thread-local PosCache for truncation evaluation.
+    // This also warms the per-thread cubeful evaluation cache that later
+    // trial-move selection and truncation evaluation hit.
     const auto& current_strat = *checker_strat_;
     const bool using_base = (&current_strat == base_.get());
 
@@ -644,10 +669,10 @@ void RolloutStrategy::prefill_move0_cache(
 
         thread_local std::vector<Board> candidates;
         candidates.clear();
-        possible_boards(start_board,
-                        ALL_ROLLS[roll_idx].d1,
-                        ALL_ROLLS[roll_idx].d2,
-                        candidates);
+        possible_boards_unsorted(start_board,
+                                 ALL_ROLLS[roll_idx].d1,
+                                 ALL_ROLLS[roll_idx].d2,
+                                 candidates);
 
         Board chosen;
         if (candidates.empty()) {
@@ -667,7 +692,10 @@ void RolloutStrategy::prefill_move0_cache(
         } else if (using_base) {
             chosen = candidates[base_->best_move_index(candidates, start_board)];
         } else {
-            chosen = candidates[current_strat.best_move_index(candidates, start_board)];
+            // Matches the trial loop's cubeless fallback exactly so the
+            // cache value is byte-identical to per-trial recomputation.
+            chosen = candidates[cubeless_best_move_index(
+                current_strat, candidates, start_board)];
         }
 
         cache.chosen[roll_idx] = chosen;
@@ -742,10 +770,10 @@ void RolloutStrategy::populate_move1_cache_entry(
 
     for (size_t second_roll = 0; second_roll < ALL_ROLLS.size(); ++second_roll) {
         candidates.clear();
-        possible_boards(move1_board,
-                        ALL_ROLLS[second_roll].d1,
-                        ALL_ROLLS[second_roll].d2,
-                        candidates);
+        possible_boards_unsorted(move1_board,
+                                 ALL_ROLLS[second_roll].d1,
+                                 ALL_ROLLS[second_roll].d2,
+                                 candidates);
 
         int best_idx = -1;
         entry.roll_best_probs[second_roll] = best_move_probs_for_candidates(
@@ -1141,10 +1169,75 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                     }
                     if (n_cd > 0) {
                         const Strategy& cf_base = base_bearoff_ ? *base_bearoff_ : *base_;
-                        cube_decision_nply_multi(
-                            board, cubes_in, n_cd, cf_base,
-                            cube_cfg->ply, cds, cube_filter,
-                            1 /*serial*/, move_filter_.get());
+                        {
+                            // Shared per-first-roll decision cache at move 1
+                            // (board and branch cube states are deterministic
+                            // across trials there — see Move1Cache::cd*).
+                            bool served = false;
+                            if (move_num == 1 && move1_cache &&
+                                move0_roll_idx >= 0 &&
+                                move0_roll_idx < Move0Cache::N_ROLLS &&
+                                n_branches <= 2) {
+                                auto& cdst = move1_cache->cd_state[move0_roll_idx];
+                                int st = cdst.load(std::memory_order_acquire);
+                                if (st != 2) {
+                                    int expected = 0;
+                                    if (cdst.compare_exchange_strong(
+                                            expected, 1,
+                                            std::memory_order_acq_rel)) {
+                                        CubeDecision tmp[8];
+                                        cube_decision_nply_multi(
+                                            board, cubes_in, n_cd, cf_base,
+                                            cube_cfg->ply, tmp, cube_filter,
+                                            1 /*serial*/, move_filter_.get(),
+                                            /*deep_prefilter=*/true);
+                                        uint8_t mask = 0;
+                                        for (int k = 0; k < n_cd; ++k) {
+                                            int b = cd_branch[k];
+                                            move1_cache->cd[move0_roll_idx][b] = tmp[k];
+                                            move1_cache->cd_fp[move0_roll_idx][b] =
+                                                cube_state_fingerprint(&cubes_in[k], 1);
+                                            mask |= static_cast<uint8_t>(1u << b);
+                                        }
+                                        move1_cache->cd_mask[move0_roll_idx] = mask;
+                                        cdst.store(2, std::memory_order_release);
+                                        for (int k = 0; k < n_cd; ++k) cds[k] = tmp[k];
+                                        served = true;
+                                    } else {
+                                        while (cdst.load(std::memory_order_acquire) != 2) {
+                                            std::this_thread::yield();
+                                        }
+                                        st = 2;
+                                    }
+                                }
+                                if (!served && st == 2) {
+                                    bool ok = true;
+                                    for (int k = 0; k < n_cd; ++k) {
+                                        int b = cd_branch[k];
+                                        if (!(move1_cache->cd_mask[move0_roll_idx] &
+                                              (1u << b)) ||
+                                            move1_cache->cd_fp[move0_roll_idx][b] !=
+                                                cube_state_fingerprint(&cubes_in[k], 1)) {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if (ok) {
+                                        for (int k = 0; k < n_cd; ++k) {
+                                            cds[k] = move1_cache->cd[move0_roll_idx][cd_branch[k]];
+                                        }
+                                        served = true;
+                                    }
+                                }
+                            }
+                            if (!served) {
+                                cube_decision_nply_multi(
+                                    board, cubes_in, n_cd, cf_base,
+                                    cube_cfg->ply, cds, cube_filter,
+                                    1 /*serial*/, move_filter_.get(),
+                                    /*deep_prefilter=*/true);
+                            }
+                        }
                     }
                 } else {
                     // Truncated-rollout cube decisions: still per-branch.
@@ -1282,12 +1375,14 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
             // actual roll to re-pick via cubeful BMI.
             if (use_cubeful_select) {
                 move_candidates[actual_idx].clear();
-                possible_boards(board, d1, d2, move_candidates[actual_idx]);
+                possible_boards_unsorted(board, d1, d2,
+                                         move_candidates[actual_idx]);
             }
         } else if (do_vr) {
             for (size_t i = 0; i < ALL_ROLLS.size(); ++i) {
                 move_candidates[i].clear();
-                possible_boards(board, ALL_ROLLS[i].d1, ALL_ROLLS[i].d2, move_candidates[i]);
+                possible_boards_unsorted(board, ALL_ROLLS[i].d1, ALL_ROLLS[i].d2,
+                                         move_candidates[i]);
             }
             // No VR candidate prefiltering — evaluating all candidates at 1-ply
             // is fast and avoids the bias that prefiltering introduces (selecting
@@ -1295,7 +1390,8 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
             // VR mean, biasing luck positive and the VR-corrected result negative).
         } else {
             move_candidates[actual_idx].clear();
-            possible_boards(board, d1, d2, move_candidates[actual_idx]);
+            possible_boards_unsorted(board, d1, d2,
+                                     move_candidates[actual_idx]);
         }
 
 
@@ -1455,8 +1551,8 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                             }
                         }
                         if (n_active == 0) {
-                            chosen = candidates[current_strat.best_move_index(
-                                candidates, board)];
+                            chosen = candidates[cubeless_best_move_index(
+                                current_strat, candidates, board)];
                         } else {
                             std::array<int, 4> picks{0, 0, 0, 0};
                             current_strat.best_move_index_cubeful_multi(
@@ -1487,7 +1583,8 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                     }
                 }
                 if (n_active == 0) {
-                    chosen = candidates[current_strat.best_move_index(candidates, board)];
+                    chosen = candidates[cubeless_best_move_index(
+                        current_strat, candidates, board)];
                 } else {
                     std::array<int, 2> picks{0, 0};
                     current_strat.best_move_index_cubeful_multi(
@@ -1515,7 +1612,8 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                     } else if (candidates.size() == 1) {
                         chosen = candidates[0];
                     } else {
-                        chosen = candidates[current_strat.best_move_index(candidates, board)];
+                        chosen = candidates[cubeless_best_move_index(
+                            current_strat, candidates, board)];
                     }
                     move0_cache->chosen[actual_idx] = chosen;
                     move0_cache->state[actual_idx].store(2, std::memory_order_release);
@@ -1543,7 +1641,8 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                         chosen = candidates[base_->best_move_index(candidates, board)];
                     }
                 } else {
-                    chosen = candidates[current_strat.best_move_index(candidates, board)];
+                    chosen = candidates[cubeless_best_move_index(
+                        current_strat, candidates, board)];
                 }
             }
         }
@@ -1717,88 +1816,111 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
     bool trunc_race = is_race(last_mover_board);
     const auto& trunc_strat = *truncation_strat_;
 
-    auto last_mover_probs = trunc_strat.evaluate_probs(last_mover_board, last_mover_board);
-    // Sanity-clamp the truncation probabilities against `last_mover_board`
-    // so impossible outcomes (gammon/backgammon when the player has borne
-    // off, backgammon when contact has been broken and no checker is in
-    // the danger zone) are exactly zero. This is the canonical "amend the
-    // cubeless probabilities at the truncation point" behavior — the
-    // resulting probs feed both the cubeless VR-corrected return and the
-    // 1-ply Janowski branch of the cubeful truncation path.
-    clamp_probs_to_board(last_mover_probs, last_mover_board);
+    // SP parity at truncation: last mover at trunc_move-1.
+    bool last_mover_is_sp = ((trunc_move - 1) % 2 == sp_parity_offset);
+
+    // Fused N-ply truncation: when any cube branch is live and the
+    // truncation ply is > 1, ONE cubeful tree walk produces both the
+    // per-branch cubeful equities and the trial's cubeless probs (the probs
+    // are accumulated through the same traversal — see cube_eval.cpp). The
+    // 21-roll tree is evaluated serially here; rollout parallelism is across
+    // trials. All active branches share the truncation board, so they are
+    // batched into a single call and differ only in cube state.
+    std::array<float, NUM_OUTPUTS> last_mover_probs;
+    bool cubeful_done = false;
+    if (cube_active && truncation_ply_ > 1) {
+        int active_idx[8];
+        CubeInfo active_cubes[8];
+        int n_active = 0;
+        for (int b = 0; b < n_branches; ++b) {
+            if (branches[b].finished) continue;
+            active_idx[n_active] = b;
+            active_cubes[n_active] = branches[b].cube;
+            ++n_active;
+        }
+        if (n_active > 0) {
+            float cfs[8];
+            std::array<float, NUM_OUTPUTS> tree_probs{};
+            const Strategy& cf_strat = base_bearoff_ ? *base_bearoff_ : *base_;
+            cubeful_equity_nply_multi(
+                board, active_cubes, n_active, cf_strat,
+                truncation_ply_, cfs, MoveFilters::TINY,
+                1 /*serial*/, move_filter_.get(),
+                false, &tree_probs, /*deep_prefilter=*/true);
+            // tree_probs are pre-roll probs in the NEXT mover's perspective;
+            // invert to the last mover's POV and clamp (the convention of
+            // the cubeless truncation output below).
+            last_mover_probs = invert_probs(tree_probs);
+            clamp_probs_to_board(last_mover_probs, last_mover_board);
+
+            for (int k = 0; k < n_active; ++k) {
+                int b = active_idx[k];
+                float cf = cfs[k];
+                double sp_val;
+                if (is_match) {
+                    float mwc = eq2mwc(cf,
+                        branches[b].cube.match.away1,
+                        branches[b].cube.match.away2,
+                        branches[b].cube.cube_value,
+                        branches[b].cube.match.is_crawford);
+                    sp_val = last_mover_is_sp ? (1.0 - static_cast<double>(mwc))
+                                              : static_cast<double>(mwc);
+                } else {
+                    double points = cf * branches[b].cube.cube_value;
+                    sp_val = points / branches[b].basis_cube;
+                    if (last_mover_is_sp) sp_val = -sp_val;
+                }
+                branches[b].final_equity = sp_val - branches[b].vr_luck;
+                branches[b].finished = true;
+            }
+            cubeful_done = true;
+        }
+    }
+
+    if (!cubeful_done) {
+        if (bearoff_db_ && bearoff_db_->is_bearoff(last_mover_board)) {
+            // Exact DB probs for bearoff truncation positions.
+            last_mover_probs =
+                bearoff_db_->lookup_probs(last_mover_board, /*post_move=*/true);
+        } else if (truncation_ply_ > 1) {
+            // Cubeless N-ply truncation through the cubeful evaluation
+            // engine: a single dead cube reduces the tree to a cubeless
+            // N-ply evaluation, with the probs accumulated through the same
+            // batched walk the fused cubeful truncation above uses.
+            float cf_unused;
+            std::array<float, NUM_OUTPUTS> tree_probs{};
+            const Strategy& cf_strat = base_bearoff_ ? *base_bearoff_ : *base_;
+            cubeful_equity_nply_multi(
+                board, &dead_cube_info(), 1, cf_strat,
+                truncation_ply_, &cf_unused, MoveFilters::TINY,
+                1 /*serial*/, move_filter_.get(),
+                false, &tree_probs, /*deep_prefilter=*/true);
+            // tree_probs are pre-roll probs in the next mover's perspective;
+            // invert to the last mover's POV (the convention below).
+            last_mover_probs = invert_probs(tree_probs);
+        } else {
+            last_mover_probs =
+                trunc_strat.evaluate_probs(last_mover_board, last_mover_board);
+        }
+        // Sanity-clamp the truncation probabilities against `last_mover_board`
+        // so impossible outcomes (gammon/backgammon when the player has borne
+        // off, backgammon when contact has been broken and no checker is in
+        // the danger zone) are exactly zero. This is the canonical "amend the
+        // cubeless probabilities at the truncation point" behavior — the
+        // resulting probs feed both the cubeless VR-corrected return and the
+        // 1-ply Janowski branch of the cubeful truncation path.
+        clamp_probs_to_board(last_mover_probs, last_mover_board);
+    }
     ROLLOUT_TIMER_ADD(trunc_time_ns);
 #ifdef ROLLOUT_PROFILE
     rollout_profile::trial_count.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-    // SP parity at truncation: last mover at trunc_move-1.
-    bool last_mover_is_sp = ((trunc_move - 1) % 2 == sp_parity_offset);
-
-    // Cubeful branch truncation (only when cube_active)
-    if (cube_active) {
-        if (truncation_ply_ > 1) {
-            // N-ply cubeful evaluation at truncation point.
-            // `board` is the next mover's pre-roll position; branches[b].cube
-            // is from the next mover's perspective.
-            //
-            // Use a single-candidate filter {1, 0.0} instead of {2, 0.03} to
-            // reduce the cubeful tree size by ~8x. Move selection is already
-            // 1-ply cubeless at each node, so keeping only the 1-ply best move
-            // per roll introduces negligible error while avoiding redundant
-            // evaluation of the 2nd-best candidate through the full cubeful tree.
-            //
-            // All active branches share the same truncation board and dice
-            // sequence -- only the cube state differs.  Batch them into a
-            // single cubeful_equity_nply_multi call so the N-ply cubeless
-            // recursion tree (move selection + NN evaluation) is shared
-            // across branches.  This is numerically equivalent to calling
-            // the single-cube variant per branch, but roughly ~n_active x
-            // cheaper because the dominant per-node cost (1-ply scoring of
-            // ~15 candidates) is done once instead of per-branch.
-            MoveFilter trunc_filter = {1, 0.0f};
-            const Strategy& cf_strat = base_bearoff_ ? *base_bearoff_ : *base_;
-
-            // Collect active branches.
-            int active_idx[8];  // n_branches is small (2 in practice)
-            CubeInfo active_cubes[8];
-            int n_active = 0;
-            for (int b = 0; b < n_branches; ++b) {
-                if (branches[b].finished) continue;
-                active_idx[n_active] = b;
-                active_cubes[n_active] = branches[b].cube;
-                ++n_active;
-            }
-
-            if (n_active > 0) {
-                float cfs[8];
-                cubeful_equity_nply_multi(
-                    board, active_cubes, n_active, cf_strat,
-                    truncation_ply_, cfs, trunc_filter,
-                    1 /*serial*/, move_filter_.get());
-
-                for (int k = 0; k < n_active; ++k) {
-                    int b = active_idx[k];
-                    float cf = cfs[k];
-                    double sp_val;
-                    if (is_match) {
-                        float mwc = eq2mwc(cf,
-                            branches[b].cube.match.away1,
-                            branches[b].cube.match.away2,
-                            branches[b].cube.cube_value,
-                            branches[b].cube.match.is_crawford);
-                        sp_val = last_mover_is_sp ? (1.0 - static_cast<double>(mwc))
-                                                  : static_cast<double>(mwc);
-                    } else {
-                        double points = cf * branches[b].cube.cube_value;
-                        sp_val = points / branches[b].basis_cube;
-                        if (last_mover_is_sp) sp_val = -sp_val;
-                    }
-                    branches[b].final_equity = sp_val - branches[b].vr_luck;
-                    branches[b].finished = true;
-                }
-            }
-        } else {
-            // 1-ply: Janowski on cubeless probs (original behavior)
+    // Cubeful branch truncation at 1-ply (truncation_ply == 1): Janowski on
+    // the truncation cubeless probs. (N-ply cubeful truncation was handled
+    // above in the fused tree walk.)
+    if (!cubeful_done && cube_active) {
+        {
             auto [last_pp, last_op] = pip_counts(last_mover_board);
             float trunc_x = cube_efficiency(last_mover_probs, trunc_race, last_pp, last_op);
             for (int b = 0; b < n_branches; ++b) {
@@ -1825,7 +1947,7 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
                 branches[b].finished = true;
             }
         }
-    } else if (n_branches > 0) {
+    } else if (!cubeful_done && n_branches > 0) {
         // Dead-cube branches at truncation
         std::array<float, NUM_OUTPUTS> sp_probs_t;
         if (last_mover_is_sp) { sp_probs_t = last_mover_probs; }
@@ -1862,6 +1984,7 @@ RolloutResult RolloutStrategy::run_trials_parallel(
     // strategies (which share the same persistent thread pool) from persisting
     // across independent rollout evaluations.
     MultiPlyStrategy::get_cache().clear();
+    clear_cubeful_eval_cache();
 
     const int n_trials = config_.n_trials;
     const int max_moves = (config_.truncation_depth > 0)
@@ -1973,6 +2096,7 @@ RolloutResult RolloutStrategy::run_trials_parallel(
             // previous evaluations (other strategies sharing the same pool
             // threads) from accumulating and causing memory corruption.
             MultiPlyStrategy::get_cache().clear();
+            clear_cubeful_eval_cache();
             MultiPlyStrategy::set_shared_cache(shared_cache);
             int start;
             while ((start = next_trial.fetch_add(kTrialChunkSize, std::memory_order_relaxed))
@@ -2061,6 +2185,7 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
 {
     // Clear thread-local N-ply cache (same rationale as run_trials_parallel).
     MultiPlyStrategy::get_cache().clear();
+    clear_cubeful_eval_cache();
 
     const int n_trials = config_.n_trials;
     const int max_moves = (config_.truncation_depth > 0)
@@ -2163,6 +2288,7 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
         multipy_parallel_run(n_threads, [&]() {
             // Clear thread-local N-ply cache (same as cubeless path).
             MultiPlyStrategy::get_cache().clear();
+            clear_cubeful_eval_cache();
             MultiPlyStrategy::set_shared_cache(shared_cache);
 
             // Phase 1+2: Combined move0 + move1 prefill per roll.
@@ -2181,7 +2307,8 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
                 thread_local std::vector<Board> candidates;
                 candidates.clear();
                 const auto& roll = ALL_ROLLS[r];
-                possible_boards(pre_roll_board, roll.d1, roll.d2, candidates);
+                possible_boards_unsorted(pre_roll_board,
+                                         roll.d1, roll.d2, candidates);
                 Board chosen;
                 if (candidates.empty()) {
                     chosen = pre_roll_board;
@@ -2194,9 +2321,16 @@ RolloutStrategy::CubefulRolloutResult RolloutStrategy::cubeful_cube_decision(
                         select_cubes_ptr, n_select_cubes,
                         cube_x_stamp, picks.data());
                     chosen = candidates[picks[0]];
-                } else {
-                    chosen = candidates[m0_strat->best_move_index(
+                } else if (m0_strat == base_.get()) {
+                    chosen = candidates[base_->best_move_index(
                         candidates, pre_roll_board)];
+                } else {
+                    // Matches the trial loop's cubeless fallback exactly so
+                    // the cache value is byte-identical to per-trial
+                    // recomputation (the trial-side CAS fallback uses the
+                    // same dead-cube selection).
+                    chosen = candidates[cubeless_best_move_index(
+                        *m0_strat, candidates, pre_roll_board)];
                 }
                 move0_cache.chosen[r] = chosen;
                 move0_cache.state[r].store(2, std::memory_order_release);

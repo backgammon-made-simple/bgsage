@@ -5,6 +5,8 @@
 #include "types.h"
 #include "board.h"
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 namespace bgbot {
@@ -120,6 +122,17 @@ class Strategy {
 public:
     virtual ~Strategy() = default;
 
+    // Identity of the underlying evaluator, used to key shared evaluation
+    // caches (the cubeful evaluation engine's per-thread cache). Wrappers
+    // that don't change evaluation results for non-intercepted positions
+    // (e.g. BearoffStrategy) forward to the wrapped strategy so equivalent
+    // evaluators share cache entries. The id is a process-unique monotonic
+    // counter (NOT the object address — a freed strategy's address can be
+    // reused by a different model's strategy, which would silently serve
+    // the old model's cached values), so distinct strategy objects never
+    // collide even across construct/destroy cycles.
+    virtual uint64_t eval_identity() const { return eval_id_; }
+
     // Evaluate a post-move board position. Higher = better for player 1.
     // The board is from player 1's perspective.
     // `pre_move_is_race` is the race classification of the board BEFORE
@@ -221,6 +234,13 @@ public:
         const Board& pre_move_board,
         double* equities,
         std::array<float, NUM_OUTPUTS>* best_probs_out) const;
+
+private:
+    static uint64_t next_eval_id() {
+        static std::atomic<uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    const uint64_t eval_id_ = next_eval_id();
 };
 
 } // namespace bgbot

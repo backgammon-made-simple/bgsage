@@ -342,6 +342,13 @@ void MultiPlyStrategy::set_bearoff_db(const BearoffDB* db) {
 
 void MultiPlyStrategy::clear_cache() const {
     get_cache().clear();
+    // The cubeful evaluation engine's per-thread cache backs the delegated
+    // cubeless N-ply paths — clear it too so the documented "call
+    // clear_cache() between strategy comparisons" idiom keeps working.
+    // (Engine keys also carry a process-unique evaluator id, so this is
+    // belt-and-braces for the calling thread; pool threads are protected
+    // by the id alone.)
+    clear_cubeful_eval_cache();
     // Salt is derived from base strategy pointer — no need to bump.
     // Clearing the cache (memset to 0) is sufficient to prevent stale lookups.
     // Also reset global atomic counters
@@ -373,13 +380,21 @@ std::size_t MultiPlyStrategy::cache_key_for(const Board& b, int plies) const {
 int MultiPlyStrategy::parallel_thread_count(int plies) const {
     if (!parallel_evaluate_) return 1;
 
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw <= 0) hw = 1;
+
     int n_threads = parallel_threads_;
     if (n_threads <= 0) {
-        n_threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (n_threads <= 0) n_threads = 1;
+        n_threads = hw;
     } else if (n_threads < 1) {
         n_threads = 1;
     }
+    // Never request more workers than the shared pool has threads: a
+    // parallel_for caller blocks waiting for its queued chunks, so
+    // oversubscribed nested dispatch (4-ply trees nest a second level of
+    // blocking parallel_for) can otherwise fill the pool with waiting
+    // chunks and deadlock.
+    n_threads = std::min(n_threads, hw);
 
     if (plies > 1) {
         const int target_cores = 4 * std::max(1, plies - 1);
@@ -406,12 +421,75 @@ int MultiPlyStrategy::parallel_thread_count(int plies) const {
 //   - We do NOT flip the board back — that would change the semantic meaning
 //
 // GAME PLAN CLASSIFICATION:
-//   - The NN used must be determined by the PRE-MOVE board (before the player moves)
-//   - This is the `pre_move_board` parameter throughout
+//   - The hybrid recursion (evaluate_probs_nply_impl) selects the NN by the
+//     PRE-MOVE board — the `pre_move_board` parameter throughout.
+//   - The cubeful evaluation engine's candidate kernel (the non-hybrid path)
+//     classifies each candidate by its own board instead; on plan-boundary
+//     candidates the two conventions pick different NNs (the per-candidate
+//     convention scores better on the benchmark ER). `pre_move_board` still
+//     drives the 1-ply base case.
+
+// Cubeless N-ply evaluation through the cubeful evaluation engine
+// (cube_eval.cpp): a single dead cube (cube_value=1, max_cube_value=1)
+// makes cl2cf bypass Janowski everywhere and interior picks reduce to
+// cubeless 1-ply equity, so the tree is exactly a cubeless N-ply
+// evaluation of flip(board); its accumulated probs, inverted, are the
+// post-move probs of `board`'s mover. Mirrors the dead-cube paths the
+// rollout trial loop uses for cubeless move selection and truncation.
+std::array<float, NUM_OUTPUTS> MultiPlyStrategy::cubeless_tree_probs(
+    const Board& board, const Board& pre_move_board,
+    int plies, int n_threads, bool deep_prefilter) const
+{
+    // Exact-DB short-circuit and 1-ply base case mirror the recursion's.
+    if (bearoff_db_ && bearoff_db_->is_bearoff(board)) {
+        auto probs = bearoff_db_->lookup_probs(board, /*post_move=*/true);
+        clamp_probs_to_board(probs, board);
+        return probs;
+    }
+    if (plies <= 1) {
+        auto probs = base_->evaluate_probs(board, pre_move_board);
+        clamp_probs_to_board(probs, board);
+        return probs;
+    }
+    GameResult result = check_game_over(board);
+    if (result != GameResult::NOT_OVER) {
+        return terminal_probs(result);
+    }
+
+    static const CubeInfo dead = [] {
+        CubeInfo c;
+        c.cube_value = 1;
+        c.max_cube_value = 1;
+        return c;
+    }();
+    float cf_unused;
+    std::array<float, NUM_OUTPUTS> tree_probs{};
+    cubeful_equity_nply_multi(
+        flip(board), &dead, 1, *base_, plies, &cf_unused,
+        MoveFilters::TINY, n_threads,
+        move_prefilter_ ? move_prefilter_.get() : nullptr,
+        /*fTop=*/false, &tree_probs, deep_prefilter);
+    auto probs = invert_probs(tree_probs);
+    clamp_probs_to_board(probs, board);
+    return probs;
+}
 
 std::array<float, NUM_OUTPUTS> MultiPlyStrategy::evaluate_probs_nply(
     const Board& board, const Board& pre_move_board, int plies) const
 {
+    if (!filter_strat_ && !full_depth_opponent_) {
+        // Standalone N-ply evaluation: conservative (no deep prune), like
+        // the standalone cubeful entry points. BMI rescoring below uses the
+        // deep prune (its band-level shifts were validated on the checker
+        // benchmark and the benchmark ER).
+        int n_threads = (parallel_evaluate_ && plies == n_plies_ && plies > 2)
+            ? parallel_thread_count(plies) : 1;
+        return cubeless_tree_probs(board, pre_move_board, plies, n_threads,
+                                   /*deep_prefilter=*/false);
+    }
+    // Hybrid evaluator (separate filter strategy for opponent picks) and
+    // the full-depth-opponent reference mode: the engine has no hook for
+    // either, so keep the recursion.
     return evaluate_probs_nply_impl(
         board, pre_move_board, plies,
         parallel_evaluate_ && plies == n_plies_ && plies > 2);
@@ -756,8 +834,12 @@ int MultiPlyStrategy::best_move_index_impl(
         } else {
             // N-ply evaluation for each survivor
             for (int idx : survivors) {
-                auto probs = evaluate_probs_nply_impl(
-                    candidates[idx], pre_move_board, step.ply, false);
+                auto probs = (filter_strat_ || full_depth_opponent_)
+                    ? evaluate_probs_nply_impl(
+                          candidates[idx], pre_move_board, step.ply, false)
+                    : cubeless_tree_probs(
+                          candidates[idx], pre_move_board, step.ply, 1,
+                          /*deep_prefilter=*/true);
                 equities[idx] = compute_equity(probs);
             }
         }
@@ -795,7 +877,12 @@ int MultiPlyStrategy::best_move_index_impl(
                 static_cast<int>(survivors.size()), n_threads,
                 [&](int local_i) {
                     int idx = survivors[local_i];
-                    auto probs = evaluate_probs_nply_impl(candidates[idx], pre_move_board, n_plies_, false);
+                    auto probs = (filter_strat_ || full_depth_opponent_)
+                        ? evaluate_probs_nply_impl(
+                              candidates[idx], pre_move_board, n_plies_, false)
+                        : cubeless_tree_probs(
+                              candidates[idx], pre_move_board, n_plies_, 1,
+                              /*deep_prefilter=*/true);
                     survivor_eq[local_i] = compute_equity(probs);
                 });
 
@@ -811,7 +898,11 @@ int MultiPlyStrategy::best_move_index_impl(
     }
 
     for (int idx : survivors) {
-        auto probs = evaluate_probs_nply_impl(candidates[idx], pre_move_board, n_plies_, false);
+        auto probs = (filter_strat_ || full_depth_opponent_)
+            ? evaluate_probs_nply_impl(candidates[idx], pre_move_board,
+                                       n_plies_, false)
+            : cubeless_tree_probs(candidates[idx], pre_move_board,
+                                  n_plies_, 1, /*deep_prefilter=*/true);
         double eq = compute_equity(probs);
         if (eq > best_nply) {
             best_nply = eq;
@@ -880,21 +971,17 @@ void MultiPlyStrategy::best_move_index_cubeful_multi(
     // survivor set. Each cube's cubeful-1-ply best is guaranteed in the
     // set that reaches the N-ply rescore.
     //
-    // Implementation note: this loops evaluate_probs per candidate (one NN
-    // call) rather than calling batch_evaluate_candidates_equity_probs. The
-    // batched variant in GamePlanStrategy segfaults under parallel trial
-    // dispatch (see comment in Strategy::best_move_index_cubeful_multi).
-
     Strategy* filter_s = filter_strat_ ? filter_strat_.get() : base_.get();
 
+    // Batched scoring (delta evaluation); classification follows the
+    // pre-move board. Terminal candidates get terminal_probs inside the
+    // batch call.
     std::vector<std::array<float, NUM_OUTPUTS>> probs_per(n);
+    thread_local std::vector<double> eq_tmp;
+    eq_tmp.resize(n);
+    filter_s->batch_evaluate_candidates_equity_probs(
+        candidates, pre_move_board, eq_tmp.data(), probs_per.data());
     for (int i = 0; i < n; ++i) {
-        GameResult r = check_game_over(candidates[i]);
-        if (r != GameResult::NOT_OVER) {
-            probs_per[i] = terminal_probs(r);
-        } else {
-            probs_per[i] = filter_s->evaluate_probs(candidates[i], pre_move_board);
-        }
         clamp_probs_to_board(probs_per[i], candidates[i]);
     }
 
@@ -953,8 +1040,12 @@ void MultiPlyStrategy::best_move_index_cubeful_multi(
         const auto& step = filter_chain_[step_idx];
 
         for (int idx : survivors) {
-            auto probs = evaluate_probs_nply_impl(
-                candidates[idx], pre_move_board, step.ply, false);
+            auto probs = (filter_strat_ || full_depth_opponent_)
+                ? evaluate_probs_nply_impl(
+                      candidates[idx], pre_move_board, step.ply, false)
+                : cubeless_tree_probs(
+                      candidates[idx], pre_move_board, step.ply, 1,
+                      /*deep_prefilter=*/true);
             equities[idx] = compute_equity(probs);
         }
         std::sort(survivors.begin(), survivors.end(),
@@ -1005,13 +1096,16 @@ void MultiPlyStrategy::best_move_index_cubeful_multi(
 
     auto eval_one = [&](int i) {
         Board opp_board = flip(candidates[survivors[i]]);
+        // Serial inside (trial-level parallelism is across trials). The deep
+        // pre-filter is appropriate here: cubeful BMI rescoring runs inside
+        // rollout trials, where per-call shifts average out over many trials.
         cubeful_equity_nply_multi(
             opp_board, opp_cubes.data(), n_cubes,
             *base_, n_plies_,
             cf_equities[i].data(),
-            MoveFilters::TINY, 1,           // serial inside; trial-level parallelism is across trials
+            MoveFilters::TINY, 1,
             move_prefilter_ ? move_prefilter_.get() : nullptr,
-            /*fTop=*/false);
+            /*fTop=*/false, nullptr, /*deep_prefilter=*/true);
     };
 
     bool use_parallel = parallel_evaluate_ && n_plies_ > 2;

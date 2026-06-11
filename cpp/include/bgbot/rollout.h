@@ -61,9 +61,9 @@ struct RolloutConfig {
     int late_threshold = 20;     // Half-move index where we switch to late strategies
     int ultra_late_threshold = 2; // Half-move where checker/cube drop to 1-ply (set high to disable)
 
-    // When true, trial-level checker move selection uses CUBEFUL equity
-    // (cl2cf) against the branch's current cube state instead of cubeless
-    // equity. Default false (existing behavior). When on with a single active
+    // When true (default), trial-level checker move selection uses CUBEFUL
+    // equity (cl2cf) against the branch's current cube state instead of
+    // cubeless equity. With a single active
     // cube branch (e.g. cubeful_rollout_position), the chosen move maximizes
     // cubeful equity for that branch's cube. With multiple branches
     // (cubeful_cube_decision: ND + DT), the ND branch's cube state currently
@@ -125,8 +125,11 @@ struct RolloutResult {
 //   - Truncated rollout (inner RolloutStrategy with n_threads=1) for higher accuracy
 // Both support late/ultra-late fallback to cheaper strategies at depth.
 //
-// Truncation evaluation uses truncation_strat_ (truncation_ply, defaults to
-// decision_ply). Race positions use base_ at truncation.
+// Truncation evaluation runs through the cubeful evaluation engine
+// (cube_eval.cpp) at truncation_ply (defaults to decision_ply) — a fused
+// cubeful walk for live cube branches, a dead-cube walk for cubeless
+// trials. Bearoff truncation positions short-circuit to exact DB probs;
+// 1-ply truncation uses the base strategy directly.
 //
 // Move-0 caching: all trials share the same starting position, so there are
 // only 21 possible first-roll decisions. These are computed once and shared
@@ -303,9 +306,9 @@ private:
     std::shared_ptr<RolloutStrategy> cube_inner_rollout_;
     std::shared_ptr<RolloutStrategy> cube_late_inner_rollout_;
 
-    // Truncation evaluation strategy. If truncation_ply < 0, same as checker_strat_.
-    // Allows using a lower ply for truncation evaluation (faster) while keeping
-    // a higher ply for move selection (move0 BMI).
+    // Truncation evaluation strategy — always the base (1-ply) strategy,
+    // used only when truncation_ply == 1. N-ply truncation evaluations go
+    // through the cubeful evaluation engine instead (see run_trial_unified).
     std::shared_ptr<Strategy> truncation_strat_;
 
     // Effective truncation ply level (for N-ply cubeful evaluation at truncation).
@@ -365,9 +368,21 @@ private:
         std::atomic<int> state[Move0Cache::N_ROLLS];  // 0=empty, 1=computing, 2=ready
         std::array<Entry, Move0Cache::N_ROLLS> entries = {};
 
+        // Per-first-roll cube-decision cache. At half-move 1 the board (one
+        // per first roll) and both branch cube states are identical across
+        // all trials, so the escalated N-ply cube decisions can be computed
+        // once per first roll instead of once per trial. cd_fp stores each
+        // branch's cube fingerprint for defensive validation.
+        std::atomic<int> cd_state[Move0Cache::N_ROLLS];  // 0=empty,1=computing,2=ready
+        uint8_t cd_mask[Move0Cache::N_ROLLS] = {};       // bit b: cd[r][b] valid
+        uint64_t cd_fp[Move0Cache::N_ROLLS][2] = {};
+        CubeDecision cd[Move0Cache::N_ROLLS][2] = {};
+
         Move1Cache() {
-            for (int i = 0; i < Move0Cache::N_ROLLS; ++i)
+            for (int i = 0; i < Move0Cache::N_ROLLS; ++i) {
                 state[i].store(0, std::memory_order_relaxed);
+                cd_state[i].store(0, std::memory_order_relaxed);
+            }
         }
     };
 

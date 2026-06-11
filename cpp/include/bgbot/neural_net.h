@@ -395,6 +395,10 @@ public:
 
     std::shared_ptr<NeuralNetwork> nn(int idx) const { return nns_[idx]; }
 
+    // Public accessor for the per-board NN selection (used by the cubeful
+    // evaluation engine's batched candidate kernel to group candidates by NN).
+    int nn_index_for(const Board& board) const { return select_nn_idx(board); }
+
 private:
     std::array<std::shared_ptr<NeuralNetwork>, NUM_PAIR_NNS> nns_;
 
@@ -465,6 +469,10 @@ public:
         std::array<float, NUM_OUTPUTS>* best_probs_out) const override;
 
     std::shared_ptr<NeuralNetwork> nn(int idx) const { return nns_[idx]; }
+
+    // Public accessor for the per-board NN selection (used by the cubeful
+    // evaluation engine's batched candidate kernel to group candidates by NN).
+    int nn_index_for(const Board& board) const { return select_nn_idx(board); }
 
 private:
     std::array<std::shared_ptr<NeuralNetwork>, NUM_BACKGAME_PAIR_NNS> nns_;

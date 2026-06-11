@@ -1618,26 +1618,13 @@ float cubeful_equity_nply(
     int n_threads,
     const Strategy* move_filter)
 {
-    if (n_plies <= 1) {
-        CubeInfo cube;
-        cube.cube_value = 1;
-        cube.owner = owner;
-        return eval_pre_roll_cubeful_1ply(board, cube, strategy);
-    }
-
-    begin_cubeful_cache_epoch();
-
-    CubeInfo aciCubePos[1];
-    aciCubePos[0].cube_value = 1;
-    aciCubePos[0].owner = owner;
-    // match defaults to {0,0,false} = money game
-
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[1];
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
-                            n_threads, allow_parallel, false, arCubeful, move_filter);
-    return arCubeful[0];
+    CubeInfo cube;
+    cube.cube_value = 1;
+    cube.owner = owner;
+    float out = 0.0f;
+    cubeful_equity_nply_multi(board, &cube, 1, strategy, n_plies, &out,
+                              filter, n_threads, move_filter);
+    return out;
 }
 
 // Match play overload: returns cubeful equity (NOT MWC).
@@ -1650,32 +1637,16 @@ float cubeful_equity_nply(
     int n_threads,
     const Strategy* move_filter)
 {
-    if (n_plies <= 1) {
-        float val = eval_pre_roll_cubeful_1ply(board, cube, strategy);
-        if (cube.is_money()) return val;
-        return mwc2eq(val, cube.match.away1, cube.match.away2,
-                      cube.cube_value, cube.match.is_crawford);
-    }
-
-    begin_cubeful_cache_epoch();
-
-    CubeInfo aciCubePos[1] = {cube};
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[1];
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
-                            n_threads, allow_parallel, false, arCubeful, move_filter);
-
-    if (cube.is_money()) return arCubeful[0];
-    return mwc2eq(arCubeful[0], cube.match.away1, cube.match.away2,
-                  cube.cube_value, cube.match.is_crawford);
+    float out = 0.0f;
+    cubeful_equity_nply_multi(board, &cube, 1, strategy, n_plies, &out,
+                              filter, n_threads, move_filter);
+    return out;
 }
 
 // Returns post-roll probabilities from the N-ply CUBE-AWARE tree, in the
-// player-on-roll's perspective at `board`. Mirrors `cubeful_equity_nply` (CubeInfo
-// overload) but extracts probs from the same tree — the move picks at each
-// interior level use 1-ply cubeful equity against `cube` (Phase 1 shared-cube
-// MVP), so the resulting probs reflect match-aware play throughout.
+// player-on-roll's perspective at `board`. Same traversal as
+// cubeful_equity_nply (the probs are accumulated through the tree), so the
+// returned probs reflect cube/match-aware interior move picks throughout.
 //
 // Used by `post_move_analytics` when the inner analyzer is N-ply and the
 // caller wants probs that depend on cube state (e.g. for a 1-away match score).
@@ -1688,27 +1659,11 @@ std::array<float, NUM_OUTPUTS> cubeful_probs_nply(
     int n_threads,
     const Strategy* move_filter)
 {
-    if (n_plies <= 1) {
-        // 1-ply: NN eval on the flipped board → invert to player-on-roll's POV.
-        Board flipped = flip(board);
-        bool race = is_race(board);
-        auto post_probs = strategy.evaluate_probs(flipped, race);
-        auto pre_roll_probs = invert_probs(post_probs);
-        clamp_probs_to_board(pre_roll_probs, board);
-        return pre_roll_probs;
-    }
-
-    begin_cubeful_cache_epoch();
-
-    CubeInfo aciCubePos[1] = {cube};
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[1];
-    std::array<float, NUM_OUTPUTS> arProbs{};
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
-                            n_threads, allow_parallel, false, arCubeful,
-                            move_filter, &arProbs);
-    return arProbs;
+    float out = 0.0f;
+    std::array<float, NUM_OUTPUTS> probs{};
+    cubeful_equity_nply_multi(board, &cube, 1, strategy, n_plies, &out,
+                              filter, n_threads, move_filter, false, &probs);
+    return probs;
 }
 
 // Returns BOTH the cube-aware probs and the cubeful equity from a single
@@ -1723,259 +1678,11 @@ CubefulProbsAndEquity cubeful_probs_and_equity_nply(
     int n_threads,
     const Strategy* move_filter)
 {
-    if (n_plies <= 1) {
-        // 1-ply path: single NN eval, derive probs and 1-ply Janowski equity.
-        Board flipped = flip(board);
-        bool race = is_race(board);
-        GameResult result = check_game_over(flipped);
-        std::array<float, NUM_OUTPUTS> pre_roll_probs;
-        if (result != GameResult::NOT_OVER) {
-            pre_roll_probs = invert_probs(terminal_probs(result));
-        } else {
-            auto post_probs = strategy.evaluate_probs(flipped, race);
-            pre_roll_probs = invert_probs(post_probs);
-        }
-        clamp_probs_to_board(pre_roll_probs, board);
-
-        float eq;
-        if (cube.is_money()) {
-            if (result != GameResult::NOT_OVER) {
-                eq = cube.jacoby_active()
-                    ? (2.0f * pre_roll_probs[0] - 1.0f)
-                    : cubeless_equity(pre_roll_probs);
-            } else {
-                auto [pp, op] = pip_counts(board);
-                float x = cube_efficiency(pre_roll_probs, race, pp, op);
-                eq = cl2cf_money(pre_roll_probs, cube.owner, x,
-                                 cube.jacoby_active());
-            }
-        } else {
-            float mwc;
-            if (result != GameResult::NOT_OVER) {
-                mwc = cubeless_mwc(pre_roll_probs,
-                                   cube.match.away1, cube.match.away2,
-                                   cube.cube_value, cube.match.is_crawford);
-            } else {
-                auto [pp, op] = pip_counts(board);
-                float x = cube_efficiency(pre_roll_probs, race, pp, op);
-                mwc = cl2cf_match(pre_roll_probs, cube, x);
-            }
-            eq = mwc2eq(mwc, cube.match.away1, cube.match.away2,
-                        cube.cube_value, cube.match.is_crawford);
-        }
-        return {pre_roll_probs, eq};
-    }
-
-    begin_cubeful_cache_epoch();
-
-    CubeInfo aciCubePos[1] = {cube};
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[1];
-    std::array<float, NUM_OUTPUTS> arProbs{};
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, 1, strategy, base_gps, n_plies, filter,
-                            n_threads, allow_parallel, false, arCubeful,
-                            move_filter, &arProbs);
-    float eq = cube.is_money()
-        ? arCubeful[0]
-        : mwc2eq(arCubeful[0], cube.match.away1, cube.match.away2,
-                 cube.cube_value, cube.match.is_crawford);
-    return {arProbs, eq};
-}
-
-// Batched version: evaluate multiple cube states against the same board in a
-// single recursion.  Writes one cubeful equity per cube state into `out`.
-//
-// The cubeful recursion already supports multiple simultaneous cube states
-// (up to MAX_CCI=64) via the `aciCubePos[]` / `cci` interface, so this just
-// forwards `cubes` into a single call to `cubeful_recursive_multi` with
-// cci=n_cubes.  Move selection (cubeless 1-ply) and the recursive tree are
-// shared across all cube states; only the Janowski leaf conversions and the
-// `get_ecf3` cube-decision collapses differ per state.  Numerically
-// equivalent to calling `cubeful_equity_nply` separately on each cube.
-void cubeful_equity_nply_multi(
-    const Board& board,
-    const CubeInfo* cubes,
-    int n_cubes,
-    const Strategy& strategy,
-    int n_plies,
-    float* out,
-    const MoveFilter& filter,
-    int n_threads,
-    const Strategy* move_filter,
-    bool fTop)
-{
-    if (n_cubes <= 0) return;
-    if (n_cubes > MAX_CCI) n_cubes = MAX_CCI;   // defensive cap
-
-    if (n_plies <= 1) {
-        // 1-ply fast path: evaluate pre-roll board ONCE, then apply Janowski
-        // per cube state.  Mirrors eval_pre_roll_cubeful_1ply but shares the
-        // NN evaluation across cubes.
-        for (int i = 0; i < n_cubes; ++i) {
-            float val = eval_pre_roll_cubeful_1ply(board, cubes[i], strategy);
-            if (cubes[i].is_money()) {
-                out[i] = val;
-            } else {
-                out[i] = mwc2eq(val, cubes[i].match.away1, cubes[i].match.away2,
-                                cubes[i].cube_value, cubes[i].match.is_crawford);
-            }
-        }
-        return;
-    }
-
-    begin_cubeful_cache_epoch();
-
-    // Copy cubes into a stack buffer for cubeful_recursive_multi.
-    CubeInfo aciCubePos[MAX_CCI];
-    for (int i = 0; i < n_cubes; ++i) aciCubePos[i] = cubes[i];
-
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[MAX_CCI];
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, n_cubes, strategy, base_gps, n_plies,
-                            filter, n_threads, allow_parallel, fTop,
-                            arCubeful, move_filter);
-
-    // Convert MWC -> equity for match-play states; leave money-game states as-is.
-    for (int i = 0; i < n_cubes; ++i) {
-        if (cubes[i].is_money()) {
-            out[i] = arCubeful[i];
-        } else {
-            out[i] = mwc2eq(arCubeful[i], cubes[i].match.away1, cubes[i].match.away2,
-                            cubes[i].cube_value, cubes[i].match.is_crawford);
-        }
-    }
-}
-
-// Batched cube decision.  For each of n_cubes input cube states, compute the
-// same ND/DT/DP equities and decision that the single-branch cube_decision_nply
-// would.  Runs a single cubeful_recursive_multi call with cci = 2*n_cubes and
-// fTop=true: pairs [cubes[i], cubes[i]_doubled_opp] are laid out consecutively
-// so that make_cube_pos expansion at the top level is skipped (via fTop), and
-// the shared recursive tree handles move selection and NN evaluations once for
-// all branches.  Output[i] contains the decision for cubes[i].
-void cube_decision_nply_multi(
-    const Board& board,
-    const CubeInfo* cubes,
-    int n_cubes,
-    const Strategy& strategy,
-    int n_plies,
-    CubeDecision* out,
-    const MoveFilter& filter,
-    int n_threads,
-    const Strategy* move_filter)
-{
-    if (n_cubes <= 0) return;
-    // Cap to MAX_CCI / 2 (since we expand to 2*n_cubes states).
-    if (n_cubes > MAX_CCI / 2) n_cubes = MAX_CCI / 2;
-
-    if (n_plies <= 1) {
-        // 1-ply path: get pre-roll probs ONCE (shared), then Janowski per cube.
-        Board flipped = flip(board);
-        bool race = is_race(board);
-        auto post_probs = strategy.evaluate_probs(flipped, race);
-        auto pre_roll_probs = invert_probs(post_probs);
-        // Clamp once (shared across all cube states).
-        clamp_probs_to_board(pre_roll_probs, board);
-        for (int i = 0; i < n_cubes; ++i) {
-            float x = resolve_cube_x(pre_roll_probs, cubes[i], board, race);
-            out[i] = cube_decision_1ply(pre_roll_probs, cubes[i], x);
-        }
-        return;
-    }
-
-    begin_cubeful_cache_epoch();
-
-    // Build 2 * n_cubes states: for each input cube, [ND variant, DT variant].
-    // Using fTop=true suppresses make_cube_pos's top-level DT expansion so the
-    // caller-supplied DT variants are used directly.
-    const int n_states = 2 * n_cubes;
-    CubeInfo aciCubePos[MAX_CCI];
-    for (int i = 0; i < n_cubes; ++i) {
-        aciCubePos[2 * i]     = cubes[i];                                // ND
-        aciCubePos[2 * i + 1] = cubes[i];                                // DT
-        aciCubePos[2 * i + 1].cube_value = 2 * cubes[i].cube_value;
-        aciCubePos[2 * i + 1].owner      = CubeOwner::OPPONENT;
-    }
-
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[MAX_CCI];
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-    cubeful_recursive_multi(board, aciCubePos, n_states, strategy, base_gps, n_plies,
-                            filter, n_threads, allow_parallel, /*fTop=*/true,
-                            arCubeful, move_filter);
-
-    // Unpack per-branch decisions.  Mirrors the decision logic in
-    // cube_decision_nply(single).  Each branch consumes arCubeful[2i..2i+1].
-    for (int i = 0; i < n_cubes; ++i) {
-        const CubeInfo& cube = cubes[i];
-        float nd_raw = arCubeful[2 * i];
-        float dt_raw = arCubeful[2 * i + 1];
-        bool is_money = cube.is_money();
-
-        CubeDecision result = {};
-
-        if (is_money) {
-            result.equity_nd = nd_raw;
-            float actual_dt = 2.0f * dt_raw;   // Scale doubled-cube value back to cube=1
-            result.equity_dp = 1.0f;
-
-            if (cube.beaver && actual_dt < 0.0f) {
-                result.equity_dt = 2.0f * actual_dt;   // DB equity
-                result.is_beaver = true;
-            } else {
-                result.equity_dt = actual_dt;
-            }
-        } else {
-            int away1 = cube.match.away1;
-            int away2 = cube.match.away2;
-            int cv = cube.cube_value;
-            bool craw = cube.match.is_crawford;
-            float dp_m = dp_mwc(away1, away2, cv, craw);
-            result.equity_nd = mwc2eq(nd_raw, away1, away2, cv, craw);
-            result.equity_dt = mwc2eq(dt_raw, away1, away2, cv, craw);
-            result.equity_dp = mwc2eq(dp_m,   away1, away2, cv, craw);
-        }
-
-        bool player_can_double = can_double(cube);
-        bool auto_double = (!is_money && !cube.match.is_crawford &&
-                            player_can_double &&
-                            cube.match.away1 > 1 && cube.match.away2 == 1);
-
-        if (!player_can_double) {
-            result.should_double = false;
-            result.should_take = true;
-            result.optimal_equity = result.equity_nd;
-        } else if (is_money) {
-            float best_double = std::min(result.equity_dt, result.equity_dp);
-            result.should_double = (best_double > result.equity_nd);
-            result.should_take = (result.equity_dt <= result.equity_dp);
-            result.optimal_equity = result.should_double
-                ? std::min(result.equity_dt, result.equity_dp)
-                : result.equity_nd;
-        } else if (auto_double) {
-            float dt_m = dt_raw;
-            float dp_m_val = dp_mwc(cube.match.away1, cube.match.away2,
-                                    cube.cube_value, cube.match.is_crawford);
-            result.should_double = true;
-            result.should_take = (dt_m <= dp_m_val);
-            result.optimal_equity = std::min(result.equity_dt, result.equity_dp);
-        } else {
-            float nd_m = nd_raw;
-            float dt_m = dt_raw;
-            float dp_m_val = dp_mwc(cube.match.away1, cube.match.away2,
-                                    cube.cube_value, cube.match.is_crawford);
-            float best_double = std::min(dt_m, dp_m_val);
-            result.should_double = (best_double > nd_m);
-            result.should_take = (dt_m <= dp_m_val);
-            result.optimal_equity = result.should_double
-                ? std::min(result.equity_dt, result.equity_dp)
-                : result.equity_nd;
-        }
-
-        out[i] = result;
-    }
+    float out = 0.0f;
+    std::array<float, NUM_OUTPUTS> probs{};
+    cubeful_equity_nply_multi(board, &cube, 1, strategy, n_plies, &out,
+                              filter, n_threads, move_filter, false, &probs);
+    return {probs, out};
 }
 
 // ---------------------------------------------------------------------------
@@ -2730,111 +2437,12 @@ CubeDecision cube_decision_nply(
     int n_threads,
     const Strategy* move_filter)
 {
-    if (n_plies <= 1) {
-        // Use 1-ply path: get pre-roll probs, apply Janowski
-        Board flipped = flip(board);
-        bool race = is_race(board);
-        auto post_probs = strategy.evaluate_probs(flipped, race);
-        auto pre_roll_probs = invert_probs(post_probs);
-        clamp_probs_to_board(pre_roll_probs, board);
-        float x = resolve_cube_x(pre_roll_probs, cube, board, race);
-        return cube_decision_1ply(pre_roll_probs, cube, x);
-    }
-
-    begin_cubeful_cache_epoch();
-
-    bool is_money = cube.is_money();
-    bool allow_parallel = (n_threads > 1 && n_plies > 2);
-
-    // Two initial cube states: ND (current) and DT (doubled, opponent owns)
-    CubeInfo aciCubePos[2];
-    aciCubePos[0] = cube;                                // ND state
-    aciCubePos[1] = cube;                                // DT state
-    aciCubePos[1].cube_value = 2 * cube.cube_value;
-    aciCubePos[1].owner = CubeOwner::OPPONENT;
-
-    const auto* base_gps = dynamic_cast<const GamePlanStrategy*>(&strategy);
-    float arCubeful[2];
-    cubeful_recursive_multi(board, aciCubePos, 2, strategy, base_gps, n_plies, filter,
-                            n_threads, allow_parallel, /*fTop=*/true, arCubeful, move_filter);
-
-    // arCubeful[0] = ND value, arCubeful[1] = DT value (at doubled cube scale)
-    CubeDecision result;
-
-    if (is_money) {
-        result.equity_nd = arCubeful[0];
-        float actual_dt = 2.0f * arCubeful[1];  // Scale DT to cube=1
-        result.equity_dp = 1.0f;
-
-        // Beaver: if enabled and DT < 0, opponent beavers (DB = 2*DT).
-        if (cube.beaver && actual_dt < 0.0f) {
-            result.equity_dt = 2.0f * actual_dt;  // DB equity
-            result.is_beaver = true;
-        } else {
-            result.equity_dt = actual_dt;
-        }
-    } else {
-        int away1 = cube.match.away1;
-        int away2 = cube.match.away2;
-        int cv = cube.cube_value;
-        bool craw = cube.match.is_crawford;
-
-        float dp_m = dp_mwc(away1, away2, cv, craw);
-
-        result.equity_nd = mwc2eq(arCubeful[0], away1, away2, cv, craw);
-        result.equity_dt = mwc2eq(arCubeful[1], away1, away2, cv, craw);
-        result.equity_dp = mwc2eq(dp_m, away1, away2, cv, craw);
-    }
-
-    // Decision logic
-    bool player_can_double = can_double(cube);
-    // Post-Crawford automatic double: trailing player should always double
-    bool auto_double = (!is_money && !cube.match.is_crawford &&
-                        player_can_double &&
-                        cube.match.away1 > 1 && cube.match.away2 == 1);
-
-    if (!player_can_double) {
-        result.should_double = false;
-        result.should_take = true;
-        result.optimal_equity = result.equity_nd;
-    } else if (is_money) {
-        // Money: compare equities (all at same scale)
-        float best_double = std::min(result.equity_dt, result.equity_dp);
-        result.should_double = (best_double > result.equity_nd);
-        result.should_take = (result.equity_dt <= result.equity_dp);
-
-        if (result.should_double) {
-            result.optimal_equity = std::min(result.equity_dt, result.equity_dp);
-        } else {
-            result.optimal_equity = result.equity_nd;
-        }
-    } else if (auto_double) {
-        // Post-Crawford trailer: always double, opponent decides take/pass
-        float nd_m = arCubeful[0];
-        float dt_m = arCubeful[1];
-        float dp_m_val = dp_mwc(cube.match.away1, cube.match.away2,
-                                 cube.cube_value, cube.match.is_crawford);
-        result.should_double = true;
-        result.should_take = (dt_m <= dp_m_val);
-        result.optimal_equity = std::min(result.equity_dt, result.equity_dp);
-    } else {
-        // Match: compare in MWC space (canonical for match play decisions)
-        float nd_m = arCubeful[0];
-        float dt_m = arCubeful[1];
-        float dp_m_val = dp_mwc(cube.match.away1, cube.match.away2,
-                                 cube.cube_value, cube.match.is_crawford);
-        float best_double_mwc = std::min(dt_m, dp_m_val);
-        result.should_double = (best_double_mwc > nd_m);
-        result.should_take = (dt_m <= dp_m_val);
-
-        if (result.should_double) {
-            result.optimal_equity = std::min(result.equity_dt, result.equity_dp);
-        } else {
-            result.optimal_equity = result.equity_nd;
-        }
-    }
-
-    return result;
+    // The multi entry with n=1 applies the identical 1-ply path, money/match
+    // unpack and post-Crawford auto-double logic.
+    CubeDecision out{};
+    cube_decision_nply_multi(board, &cube, 1, strategy, n_plies, &out,
+                             filter, n_threads, move_filter);
+    return out;
 }
 
 } // namespace bgbot

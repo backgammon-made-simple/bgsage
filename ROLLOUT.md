@@ -391,20 +391,37 @@ whenever the evaluator supports it. Three cube evaluation modes are supported:
 
 - **1-ply Janowski:** Get pre-roll probs once at 1-ply, then apply Janowski per
   branch via `cube_decision_1ply(probs, branches[b].cube, cube_x)`. Fastest.
-- **N-ply cubeful recursion:** Call `cube_decision_nply_multi(board, cubes[],
-  n, base, ply, …)` once over all active branches. One shared `cubeful_recursive_multi`
-  call with `cci = 2*n` and `fTop=true` produces ND/DT equities for every
-  branch in a single pass, sharing move selection and NN evaluations across
-  branches.
+- **N-ply cubeful recursion (screen + escalate):** A cheap 1-ply Janowski
+  screen runs first on shared pre-roll probs; only branches the screen flags
+  as doubles escalate to a single batched `cube_decision_nply_multi(board,
+  cubes[], n, base, ply, …)` call over all flagged branches (one shared
+  cubeful recursion with `cci = 2*n` and `fTop=true`, with the deep PubEval
+  pre-filter enabled — see `MULTI-PLY.md` section 6). A 1-ply false-negative
+  merely misses a double — a safe, conservative under-count — and the cube
+  can only turn via the deep decision, so the screen never introduces
+  take-quality errors. This keeps the deep recursion off the common
+  no-double moves.
+
+  At half-move 1 the board (one of 21, determined by the first roll) and the
+  branch cube states are identical across every trial, so escalated move-1
+  decisions are computed once per first roll and shared through the move-1
+  cube-decision cache (see section 10).
 - **Truncated rollout:** Per-branch, call inner
   `RolloutStrategy.cubeful_cube_decision(board, branch.cube)` (single-threaded).
   This mode is not batched across branches because each inner rollout has its
   own dice sequence and internal state; branches are processed sequentially.
 
-The cube evaluation strategy depends on the move number:
-- Ultra-late (>= `ultra_late_threshold`): always 1-ply Janowski
-- Normal: use the configured `cube_eval_config`
-- Late (>= `late_threshold`): use `cube_late_eval_config`
+Cube take/pass decisions are evaluated at the configured `cube` strategy
+(defaulting to `decision_ply`) for the **entire trial** — unlike checker-play
+move selection, they are NOT dropped to cheaper strategies at the late /
+ultra-late thresholds. The trial's outcome is scored by the N-ply truncation
+at `decision_ply`, so deciding take/pass at a shallower ply creates a
+decision-vs-evaluation mismatch: the opponent takes doubles that a
+consistent-depth evaluation would pass, and the deeper continuation then
+over-credits the doubler (visible under Jacoby with a centered cube as a
+No-Double equity above the +1.0 cash ceiling). The 1-ply screen keeps this
+affordable. The `cube_late` config is accepted for compatibility but does not
+affect take/pass decisions.
 
 If the mover doubles:
 - **Take:** `cube_value *= 2`, opponent now owns
@@ -427,6 +444,13 @@ legal moves for all 21 possible rolls (needed for the VR mean computation).
 
 When VR is skipped for this move, only the actual roll's candidates are generated.
 
+Move generation throughout the trial loop (and inside the cubeful recursion)
+uses the hash-dedup generator `possible_boards_unsorted`: duplicates are
+rejected at insertion time via a generation-stamped hash table, and output is
+in first-seen generation order. This avoids the O(n²) insertion-sorted dedup
+of the board-sorted generator, which matters on doubles rolls with 30-90
+candidates.
+
 **Phase 3 — VR Mean Computation:**
 
 When VR is active, evaluate the best move for all 21 rolls at 1-ply:
@@ -447,7 +471,12 @@ Pick the best move for the actual dice roll:
 - **Move0 cache miss:** Compute via CAS (compare-and-swap): first thread to claim
   the slot computes the result; others spin-wait.
 - **1-ply (using base):** Reuse the VR computation's best candidate index.
-- **N-ply (using checker strategy):** Call the full checker strategy's
+- **N-ply cubeless (checker strategy is a `MultiPlyStrategy`):** call
+  `best_move_index_cubeful_multi` with a single **dead cube**. With the cube
+  dead the 1-ply filter scores by plain cubeless equity and the rescore runs
+  the batched cubeful evaluation engine as a cubeless N-ply tree — so
+  cubeless and cubeful trials select moves through the same engine. Other
+  strategy types (child truncated-rollout evaluators) keep their own
   `best_move_index`.
 - **Move1 cache hit:** At move 1, use the precomputed result.
 
@@ -476,20 +505,25 @@ cube ownership (PLAYER <-> OPPONENT) and, for match play, swap away scores.
 ### After the Loop: Truncation
 
 If the trial reaches `truncation_depth` without terminating:
-1. Evaluate the last mover's post-move position using the truncation strategy
-   (a separate `MultiPlyStrategy` instance with aggressive PubEval prefiltering;
-   see §11 for details).
-2. Clamp the truncation probabilities against `last_mover_board` so impossible
-   outcomes (gammon/backgammon when bearoff has begun, backgammon when contact
-   is broken and the danger zone is empty) are exactly zero.
-3. For cubeful branches with N-ply truncation (`truncation_ply > 1`): make a
-   single `cubeful_equity_nply_multi` call over all unfinished branches with
-   a tight single-candidate move filter `{1, 0.0}` so the cubeful tree and
-   its move selection are shared across branches (see §11). The clamp is
-   applied inside the cubeful recursion at every NN leaf (see `MULTI-PLY.md`).
-4. For cubeful branches with 1-ply truncation: apply Janowski to the clamped
+1. **Cubeful branches with N-ply truncation (`truncation_ply > 1`):** make a
+   single `cubeful_equity_nply_multi` call over all unfinished branches (they
+   share the truncation board and differ only in cube state) with the deep
+   PubEval pre-filter enabled. The same tree walk also returns the node's
+   **cubeless probabilities** (accumulated through the cubeful recursion —
+   see `MULTI-PLY.md` section 4), which become the trial's cubeless
+   truncation result after inverting to the last mover's perspective and
+   clamping against `last_mover_board`. One tree walk serves both outputs;
+   no separate cubeless evaluation runs.
+2. **Otherwise** (cubeless trials, dead-cube branches, or 1-ply truncation):
+   evaluate the last mover's post-move position cubelessly — exact DB probs
+   for bearoff positions; the cubeful evaluation engine with a single dead
+   cube when `truncation_ply > 1` (see §11, "Cubeless Truncation"); a 1-ply
+   base evaluation otherwise — and clamp against `last_mover_board` so
+   impossible outcomes (gammon/backgammon when bearoff has begun, backgammon
+   when contact is broken and the danger zone is empty) are exactly zero.
+   For cubeful branches with 1-ply truncation, apply Janowski to the clamped
    cubeless probs.
-5. Convert to SP perspective, VR-correct, and return.
+3. Convert to SP perspective, VR-correct, and return.
 
 ## 6. Position Rollouts (Cubeless and Cubeful)
 
@@ -680,12 +714,14 @@ survivors across cubes. This guarantees every cube's 1-ply cubeful favorite
 reaches the N-ply rescore — a pure cubeless filter would drop candidates
 whose cubeless equity sits well below the cubeless-best, including the
 match-defensive plays preferred at extreme away scores (e.g. 1-away with
-cube=2). The filter loops `evaluate_probs` per candidate because the batched
-`batch_evaluate_candidates_equity_probs` variant in `GamePlanStrategy` is
-not thread-safe under parallel trial dispatch.
+cube=2). The filter scores all candidates with the batched delta-evaluation
+kernel (`batch_evaluate_candidates_equity_probs`), classified from the
+pre-move board.
 
 The union survivors are then evaluated at the configured N-ply via
-`cubeful_equity_nply_multi`, **after flipping the candidate board and cube
+`cubeful_equity_nply_multi` (serial, with the deep PubEval pre-filter
+enabled — rescoring runs inside rollout trials, where per-call shifts
+average out), **after flipping the candidate board and cube
 states to the opponent's perspective** — `cubeful_equity_nply_multi`
 expects a pre-roll position from the player-on-roll's POV and returns the
 equity in that POV, so for a post-move candidate (mover already moved) we
@@ -768,21 +804,24 @@ independently from checker play strategy.
   per-branch Janowski conversion runs per branch.
 - Fastest mode, using the standard Janowski interpolation.
 
-**N-ply cubeful recursion (batched across active branches):**
-- Collect the cube state of every active branch that `can_double()`.
-- Call `cube_decision_nply_multi(board, cubes[], n, base, ply, out[], filter, 1, …)`.
-- Internally this runs a single `cubeful_recursive_multi` with
-  `cci = 2*n` and `fTop=true`. The state layout is
+**N-ply cubeful recursion (screen + escalate, batched across branches):**
+- A 1-ply Janowski screen on shared pre-roll probs flags candidate doubles;
+  branches the screen clears keep their cube unchanged (no double). The cube
+  can only turn via the deep evaluation below, so a screen false-negative is
+  a safe, conservative miss.
+- For the flagged branches, call `cube_decision_nply_multi(board, cubes[], n,
+  base, ply, out[], …, deep_prefilter=true)`.
+- Internally this runs a single cubeful recursion with `cci = 2*n` and
+  `fTop=true`. The state layout is
   `[branch0_ND, branch0_DT, branch1_ND, branch1_DT, …]`; `fTop=true` suppresses
   `make_cube_pos`'s top-level DT expansion so the caller-constructed DT
   variants are used directly.
-- Move selection (cubeless 1-ply, see §8 and `MULTI-PLY.md` §6) and the
-  recursive cubeless NN evaluations are shared across all branches; only the
-  per-state Janowski leaf conversions and `get_ecf3` cube-decision collapses
-  differ per state.
-- Numerically equivalent to calling `cube_decision_nply` individually per
-  branch, up to floating-point ordering in the cubeful cache.
-- Uses internal filter `{max_moves=2, threshold=0.03}`.
+- Move selection (1-ply cubeful against the primary state, batched — see
+  `MULTI-PLY.md` §6) and the per-roll NN evaluations are shared across all
+  branches; only the per-state Janowski leaf conversions and `get_ecf3`
+  cube-decision collapses differ per state.
+- At half-move 1, escalated decisions are computed once per first roll and
+  shared via the move-1 cube-decision cache (§10).
 - Serial (1 thread) to avoid nested parallelism within trials.
 
 **Truncated rollout (per-branch):**
@@ -795,20 +834,23 @@ independently from checker play strategy.
 
 ### Strategy Selection
 
-Same late/ultra-late chain as checker play:
-1. Ultra-late: always 1-ply Janowski.
-2. Late: `cube_late_eval_config_` (resolved from config).
-3. Normal: `cube_eval_config_`.
+Cube take/pass decisions use the configured `cube` strategy for the entire
+trial — there is no late / ultra-late drop for cube decisions (see the
+rationale in §5, Phase 1). The 1-ply screen keeps the configured-depth
+evaluations off the common no-double moves.
 
 ### Configuration Resolution
 
-Cube configs default to inheriting `decision_ply` from the legacy fields. When
-explicit `TrialEvalConfig` is provided for cube, it overrides the default.
+The cube config defaults to inheriting `decision_ply` from the legacy fields.
+When an explicit `TrialEvalConfig` is provided for cube, it overrides the
+default.
 
 ```
 cube_eval_config = resolve(config.cube, default=decision_ply)
-cube_late_eval_config = resolve(config.cube_late or config.cube, default=late_ply)
 ```
+
+The `cube_late` config is accepted for compatibility but does not affect
+take/pass decisions.
 
 ## 10. Move Caches (Move0 and Move1)
 
@@ -884,6 +926,17 @@ unnecessary — the VR correction dominates the accuracy gain. In cube-aware
 mode the 1-ply BMI is the cubeful variant against the active cube states;
 in cubeless mode it is the standard `best_move_index`.
 
+### Move-1 Cube-Decision Cache
+
+At half-move 1 the board (one per first roll) and both branch cube states are
+identical across all trials, so escalated N-ply cube decisions there are
+deterministic per first roll. The first trial to need the decision for a
+given first roll computes it (CAS-claimed) and stores the per-branch
+`CubeDecision` results alongside each branch's cube-state fingerprint; every
+later trial with the same first roll reads the cached decisions after
+validating the fingerprints. This turns up to `n_trials` deep cube
+evaluations at move 1 into at most 21.
+
 ### No-Barrier Design
 
 Prefilling and trial execution are not separated by a barrier. Threads proceed
@@ -909,8 +962,8 @@ move0/move1 cache prefill. The clamp enforces the same four position
 invariants documented in `MULTI-PLY.md` §2 (player or opponent already has
 bearoff progress; contact broken with the player or opponent absent from
 the danger zone). Cubeful N-ply truncation goes through
-`cubeful_equity_nply_multi` → `cubeful_recursive_multi`, where the leaf NN
-output is clamped inside the multi-ply evaluator itself.
+`cubeful_equity_nply_multi`, where the leaf NN output is clamped inside the
+cubeful recursion itself.
 
 The result: at every truncation point and at every NN-driven step inside a
 trial, gammon and backgammon outcomes that the position rules out are
@@ -920,28 +973,29 @@ player has cleared the opponent's home board), the per-trial backgammon
 probabilities are deterministically zero too — so VR-corrected per-trial
 probs are exact rather than "approximately exact."
 
-### Truncation Strategy (Separate Instance)
-
-The truncation strategy is always a separate `MultiPlyStrategy` instance (never
-shared with `checker_strat_`), even when `truncation_ply == decision_ply`. This
-allows truncation-specific tuning: the truncation strategy uses more aggressive
-PubEval prefilter parameters (threshold=8, keep=6 vs the default 20/15) to reduce
-the number of NN encodings per opponent roll in the N-ply recursion. This is safe
-because truncation evaluations are averaged over hundreds of trials, so slightly
-noisier individual evaluations wash out in the mean.
-
 ### Cubeless Truncation
 
-The truncation strategy evaluates the last mover's post-move board:
-```
-last_mover_board = flip(current_board)
-probs = truncation_strat.evaluate_probs(last_mover_board, last_mover_board)
-```
+For trials with no active cube branches (cubeless rollouts, dead-cube
+branches, branches that all finished before the truncation point) — and for
+the cubeless probs when `truncation_ply == 1` — the truncation evaluation of
+the last mover's post-move board (`last_mover_board = flip(current_board)`)
+is, in priority order:
 
-The truncation strategy can be:
-- 1-ply (base) when `truncation_ply = 1`
-- N-ply when `truncation_ply > 1` (wraps base in `MultiPlyStrategy` with
-  aggressive PubEval prefiltering)
+1. **Bearoff positions:** exact DB probs via
+   `bearoff_db->lookup_probs(last_mover_board, post_move=true)`.
+2. **`truncation_ply > 1`:** the cubeful evaluation engine with a single
+   **dead cube** (`cube_value=1, max_cube_value=1`). With the cube dead,
+   `cl2cf` bypasses Janowski everywhere, interior picks reduce to cubeless
+   1-ply equity, and the tree is exactly a cubeless N-ply evaluation —
+   the same batched walk (and the same `deep_prefilter=true` PubEval prune)
+   the fused cubeful truncation uses. The tree's accumulated probs are
+   inverted to the last mover's perspective.
+3. **`truncation_ply == 1`:** `base.evaluate_probs(last_mover_board, …)`
+   (the truncation strategy member is just the base strategy; N-ply
+   truncation never goes through it).
+
+Trials with active cube branches and `truncation_ply > 1` do not use this
+path — their cubeless probs come from the cubeful tree walk (above).
 
 ### Cubeful Truncation
 
@@ -953,16 +1007,15 @@ therefore evaluated together in a single batched call.
 **N-ply cubeful truncation** (`truncation_ply > 1`):
 - Collect the cube state of every unfinished branch into an array `cubes[n]`.
 - Call `cubeful_equity_nply_multi(board, cubes[], n, base, truncation_ply,
-  out[], filter, 1, …)`.
-- Internally this runs a single `cubeful_recursive_multi` with `cci = n` and
-  `fTop = false`. Move selection (cubeless 1-ply) and the recursive cubeless
-  NN evaluations are shared across branches; only the per-state Janowski leaf
-  conversions and `get_ecf3` cube-decision collapses differ per state.
-- Uses a tight single-candidate move filter `{max_moves=1, threshold=0.0}` instead
-  of the usual `{2, 0.03}`. Since move selection inside the cubeful recursion is
-  always 1-ply cubeless, keeping only the 1-ply best move per roll at each node
-  reduces the cubeful tree by up to 2^depth while producing the same result.
-- Returns a cubeful equity per branch that accounts for future cube actions.
+  out[], …, probs_out, deep_prefilter=true)`.
+- Internally this runs a single cubeful recursion with `cci = n` and
+  `fTop = false`. Move selection (1-ply cubeful against `cubes[0]`, via the
+  batched candidate kernel) and the per-roll NN evaluations are shared across
+  branches; only the per-state Janowski leaf conversions and `get_ecf3`
+  cube-decision collapses differ per state.
+- Returns a cubeful equity per branch that accounts for future cube actions,
+  **and** the tree's cubeless probabilities from the same traversal — used as
+  the trial's cubeless truncation result (see §5).
 - The `board` is the **next mover's** pre-roll position (after Phase 6 flip).
 
 **1-ply Janowski truncation** (`truncation_ply == 1`):
@@ -1014,7 +1067,7 @@ const chunk_size = 8
 atomic<int> next_trial = 0
 
 thread_function:
-    clear_thread_local_caches()
+    clear_thread_local_caches()          // N-ply PosCache + cubeful eval cache
     enable_shared_pos_cache()
 
     while (start = next_trial.fetch_add(chunk_size)) < n_trials:
@@ -1030,6 +1083,24 @@ thread_function:
 When multiple threads run trials, a `SharedPosCache` (2M entries, lock-free CAS)
 is activated to share N-ply position evaluations across threads. This prevents
 redundant expensive evaluations when different trials reach the same positions.
+
+Two producers feed it:
+- `MultiPlyStrategy::evaluate_probs_nply_impl` nodes (the hybrid-evaluator
+  cubeless N-ply recursion), keyed by (board, plies).
+- **Dead-cube nodes of the cubeful evaluation engine** (the cubeless trial
+  paths: trial move selection and cubeless truncation). When every valid cube
+  state at a tree node is dead, the node's equities are fully determined by
+  its cubeless probs (`equity == cubeless_equity(probs)`, which is linear in
+  the probs), so only the probs need to be stored. Keys are the engine's
+  (board, plies, cci, cube-fingerprint) cache key XOR a producer salt, so the
+  two producers' entries can never be confused. Dead-node equities are always
+  re-derived from the node probs — locally computed or shared-cache served —
+  so results are bit-identical regardless of which thread computed an entry.
+
+This cross-thread sharing is what makes 16-thread cubeless rollouts scale:
+trial subtrees overlap heavily (especially the early-move N-ply selections,
+whose position space is bounded by the stratified first rolls), and a per-
+thread cache alone would re-evaluate each shared subtree once per thread.
 
 The shared cache is cleared when load exceeds 75% capacity.
 
@@ -1107,12 +1178,23 @@ pass — no redundant NN calls. (When a candidate is in the bearoff range, the V
 mean ranks candidates by exact DB equity instead; see "Bearoff Database
 Integration".)
 
+### Batched Interior Picks in the Cubeful Recursion
+
+The in-trial N-ply cube decisions, the N-ply cubeful truncation, and the
+cubeful BMI rescore all run on the cubeful evaluation engine described in
+`MULTI-PLY.md` sections 4-6: batched delta-evaluation interior picks (grouped
+by per-candidate NN classification), leaf reuse at 2-ply nodes, hash-dedup
+move generation, the deep PubEval pre-filter (enabled for these
+rollout-internal calls), and a per-thread cube-state-keyed memoization cache
+that persists across calls within a rollout.
+
 ### Ultra-Late Threshold
 
 Positions deep in a trial have diminishing impact on the final result. The
-`ultra_late_threshold` (default 2 for truncated rollouts) drops both checker play
-and cube decisions to 1-ply at depth, eliminating expensive N-ply evaluations for
-moves that barely affect the outcome.
+`ultra_late_threshold` (default 2 for truncated rollouts) drops checker play
+to 1-ply at depth, eliminating expensive N-ply evaluations for moves that
+barely affect the outcome. (Cube take/pass decisions do not drop — see §5,
+Phase 1.)
 
 For full rollouts with N-ply cube/checker strategies, set
 `ultra_late_threshold = 9999` to disable ply reductions and use configured
@@ -1152,14 +1234,15 @@ Other bearoff-DB use points:
   position, every per-trial evaluation hits the DB directly, so the rollout
   returns exact results (the simulation still runs, but VR luck is
   deterministically zero so the trial-mean is the exact value).
-- **At truncation:** Cubeless truncation evaluation uses the truncation
-  strategy with the DB wired through; cubeful N-ply truncation
-  (`cubeful_equity_nply_multi`) uses `base_bearoff_` so its 1-ply leaves are
-  DB-exact.
+- **At truncation:** bearoff truncation positions short-circuit to exact DB
+  probs (`lookup_probs(last_mover_board, post_move=true)`); both the cubeful
+  N-ply truncation and the dead-cube cubeless truncation
+  (`cubeful_equity_nply_multi`) use `base_bearoff_` so their 1-ply leaves
+  are DB-exact (see §11).
 
-The bearoff database is also propagated to all internal strategies (checker,
-late checker, truncation, inner rollouts for cube decisions) so that their
-N-ply evaluations use exact bearoff probs at leaf nodes.
+The bearoff database is also propagated to the internal N-ply strategies
+(checker, late checker, inner rollouts for cube decisions) so that their
+evaluations use exact bearoff probs at leaf nodes.
 
 ### Move Filter for N-ply Cube Decisions
 
@@ -1309,7 +1392,7 @@ into it.
 | `checker_late` | unset | TrialEvalConfig: late-game checker play override |
 | `cube` | unset | TrialEvalConfig: cube decision strategy override |
 | `cube_late` | unset | TrialEvalConfig: late-game cube decision override |
-| `cubeful_trial_moves` | true | When true, trial-level checker moves are picked by cubeful equity (cl2cf) against the branch cube state. See §8 "Cube-Aware Selection". Set false for the legacy cubeless-trials behavior. |
+| `cubeful_trial_moves` | true | When true, trial-level checker moves are picked by cubeful equity (cl2cf) against the branch cube state. See §8 "Cube-Aware Selection". Set false for cubeless trial move selection. |
 | `cubeful_late_threshold` | 0 | When `cubeful_trial_moves` is on, drop to cubeless BMI at half-moves >= this value. 0 = inherit from `ultra_late_threshold`. Set lower than `ultra_late_threshold` (e.g. 12) for full rollouts to bound cube-aware work to the early game. |
 | `cancel_flag` | null | Atomic bool for rollout cancellation |
 
@@ -1328,9 +1411,7 @@ into it.
 |----------|-------|-------------|
 | Trial chunk size | 8 | Work-stealing granularity |
 | Internal filter (N-ply trials) | {2, 0.03} | MoveFilter inside trial MultiPly strategies |
-| Cubeful truncation filter | {1, 0.0} | MoveFilter for `cubeful_equity_nply_multi` at truncation |
-| Truncation PubEval threshold | 8 | PubEval activates at this many opponent candidates |
-| Truncation PubEval keep | 6 | PubEval keeps this many after filtering |
+| Deep pre-filter (cubeful recursion) | 16 → 14 | Built-in PubEval prune at sub-entry-ply nodes of rollout-internal cubeful evaluations, including the dead-cube cubeless trees (see `MULTI-PLY.md` §6) |
 | VR pre-filter threshold | 0.12 | 1-ply threshold for N-ply VR candidate narrowing |
 | VR pre-filter max | 8 | Maximum candidates after VR pre-filter |
 | PosCache capacity | 256K | Thread-local N-ply position cache entries |
