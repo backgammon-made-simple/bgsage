@@ -1295,6 +1295,7 @@ def benchmark_pr(
     label: str = "bot",
     cache_path: Path | str | None = None,
     progress: bool = True,
+    max_seed: int | None = None,
 ) -> dict:
     """Score ``bot`` against the benchmark data set; return the PR breakdown.
 
@@ -1316,6 +1317,9 @@ def benchmark_pr(
         label: names the resume cache (use distinct labels for distinct bots).
         cache_path: override the cache location (defaults to ``scores/<label>.jsonl``).
         progress: log progress periodically.
+        max_seed: if set, only score decisions from the first ``max_seed`` games
+            (those with ``seed <= max_seed``); decisions with a larger seed are skipped.
+            Lets you benchmark the first N games while the full set is still building.
 
     Returns:
         Dict with ``total_pr``, ``checker_pr``, ``cube_pr``, decision/blunder counts,
@@ -1324,6 +1328,11 @@ def benchmark_pr(
     dataset_path = Path(dataset_path)
     data = json.loads(dataset_path.read_text(encoding="utf-8"))
     all_entries = data["decisions"]
+    if max_seed is not None:
+        n_all = len(all_entries)
+        all_entries = [e for e in all_entries if e.get("seed", 0) <= max_seed]
+        _log(f"Limiting to the first {max_seed} games (seed <= {max_seed}): "
+             f"{len(all_entries)} of {n_all} decisions.")
 
     # Skip decisions whose reference is below the precision their closeness
     # requires (e.g. a rollout-eligible decision whose rollout isn't done yet).
@@ -1473,6 +1482,8 @@ def _main(argv: Optional[list[str]] = None) -> None:
                          help="Threads scoring decisions concurrently")
     p_score.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     p_score.add_argument("--label", default=None, help="Resume-cache label")
+    p_score.add_argument("--max-seed", type=int, default=None,
+                         help="Only score the first N games (decisions with seed <= MAX_SEED)")
 
     args = parser.parse_args(argv)
 
@@ -1487,7 +1498,8 @@ def _main(argv: Optional[list[str]] = None) -> None:
         # Internal threads = 1 so benchmark_pr's n_threads parallelizes across positions.
         bot = SageBot(eval_level=args.level, model=args.model, parallel_threads=1)
         label = args.label or f"sage_{args.level}" + (f"_{args.model}" if args.model else "")
-        result = benchmark_pr(bot, dataset_path=args.dataset, n_threads=args.n_threads, label=label)
+        result = benchmark_pr(bot, dataset_path=args.dataset, n_threads=args.n_threads,
+                              label=label, max_seed=args.max_seed)
         _print_report(result)
 
 

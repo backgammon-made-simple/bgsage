@@ -160,7 +160,7 @@ def _score_xg_cube(refined: dict, should_double: bool, should_take: bool) -> lis
 
 def benchmark_pr(xg_dir: Path | str = _XG_DIR,
                  dataset_path: Path | str = DEFAULT_DATASET,
-                 progress: bool = True) -> dict:
+                 progress: bool = True, max_seed: int | None = None) -> dict:
     """Score XG against the benchmark for every game that has a ``.xg`` file.
 
     Returns the same result dict as ``benchmark_money.benchmark_pr`` (total/checker/cube
@@ -172,8 +172,11 @@ def benchmark_pr(xg_dir: Path | str = _XG_DIR,
                       json.loads(Path(dataset_path).read_text(encoding="utf-8"))["decisions"]}
 
     seeds = _seeds_with_xg(xg_dir)
+    if max_seed is not None:
+        seeds = [s for s in seeds if s <= max_seed]
     if not seeds:
-        raise SystemExit(f"No .xg files found in {xg_dir}")
+        raise SystemExit(f"No .xg files found in {xg_dir}"
+                         + (f" with seed <= {max_seed}" if max_seed is not None else ""))
     log.info("Found .xg files for %d games: seeds %d-%d", len(seeds), seeds[0], seeds[-1])
 
     seen: set = set()
@@ -241,12 +244,14 @@ def main(argv=None):
     parser.add_argument("--xg-dir", type=Path, default=_XG_DIR,
                         help="Folder of seed_<N>.xg files (default: data/money_benchmark/xg)")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET, help="Benchmark dataset JSON")
+    parser.add_argument("--max-seed", type=int, default=None,
+                        help="Only score the first N games (.xg files with seed <= MAX_SEED)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
 
-    result = benchmark_pr(xg_dir=args.xg_dir, dataset_path=args.dataset)
+    result = benchmark_pr(xg_dir=args.xg_dir, dataset_path=args.dataset, max_seed=args.max_seed)
     print(f"\nScored: XG (eXtreme Gammon) over {result['n_games']} games")
     bm._print_report(result)
     if result.get("unmatched"):
