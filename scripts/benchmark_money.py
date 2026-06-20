@@ -1222,6 +1222,23 @@ def _aggregate(entry_results: Iterable[dict]) -> dict:
     }
 
 
+def _missing_tier(entry: dict) -> Optional[str]:
+    """Whether a decision lacks the precision its closeness requires.
+
+    A decision whose best-vs-2nd-best gap is below a refinement threshold should
+    carry analytics at that tier; if it doesn't (e.g. its rollout hasn't been
+    computed yet), its stored reference is too coarse to score against fairly.
+    Returns the missing tier (``"rollout"`` or ``"2t"``), or ``None`` if complete.
+    """
+    gap = _gap_for(entry)
+    tier = entry.get("tier")
+    if gap < ROLLOUT_GAP and tier != TIER_ROLLOUT:
+        return "rollout"
+    if gap < TWO_T_GAP and tier == TIER_3P:
+        return "2t"
+    return None
+
+
 def benchmark_pr(
     bot: BenchmarkBot,
     dataset_path: Path | str = DEFAULT_DATASET,
@@ -1257,7 +1274,20 @@ def benchmark_pr(
     """
     dataset_path = Path(dataset_path)
     data = json.loads(dataset_path.read_text(encoding="utf-8"))
-    entries = data["decisions"]
+    all_entries = data["decisions"]
+
+    # Skip decisions whose reference is below the precision their closeness
+    # requires (e.g. a rollout-eligible decision whose rollout isn't done yet).
+    # Scoring those against a coarser 2T/3P reference would be unfair.
+    entries = []
+    skipped_missing = {"rollout": 0, "2t": 0}
+    for e in all_entries:
+        miss = _missing_tier(e)
+        if miss is None:
+            entries.append(e)
+        else:
+            skipped_missing[miss] += 1
+    n_skipped = skipped_missing["rollout"] + skipped_missing["2t"]
 
     if cache_path is None:
         _SCORES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1312,9 +1342,17 @@ def benchmark_pr(
     if mismatches:
         _log(f"WARNING: {mismatches} decisions skipped - the bot's chosen checker play "
              f"was not a legal reference move (not counted toward PR).")
+    if n_skipped:
+        _log(f"NOTE: skipped {n_skipped} positions with a missing higher-precision "
+             f"reference ({skipped_missing['rollout']} missing rollout, "
+             f"{skipped_missing['2t']} missing 2T) -- not scored.")
 
-    result = _aggregate(cached.values())
+    scoreable_keys = {e["key"] for e in entries}
+    result = _aggregate(r for k, r in cached.items() if k in scoreable_keys)
     result["mismatches"] = mismatches
+    result["skipped"] = n_skipped
+    result["skipped_missing_rollout"] = skipped_missing["rollout"]
+    result["skipped_missing_2t"] = skipped_missing["2t"]
     if progress:
         _log(f"{label}: total PR={result['total_pr']:.2f} "
              f"(checker={result['checker_pr']:.2f}, cube={result['cube_pr']:.2f}) "
@@ -1330,6 +1368,12 @@ def _print_report(result: dict) -> None:
     print(f"Cube PR:    {result['cube_pr']:7.2f}   ({result['n_cube']} decisions)")
     print(f"Blunders:   {result['blunders']['total']} "
           f"(checker {result['blunders']['checker']}, cube {result['blunders']['cube']})")
+    if result.get("skipped"):
+        print(f"Skipped:    {result['skipped']} positions (missing reference: "
+              f"{result.get('skipped_missing_rollout', 0)} rollout, "
+              f"{result.get('skipped_missing_2t', 0)} 2T)")
+    if result.get("mismatches"):
+        print(f"Mismatches: {result['mismatches']} (bot move not a legal reference move)")
     print(f"{'-'*60}")
     print(f"{'Game plan':>10}  {'PR':>7}  {'N':>6}  {'chk':>6}  {'cube':>5}  {'blnd':>5}")
     for plan in GAME_PLANS:
