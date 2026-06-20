@@ -138,7 +138,7 @@ ROLLOUT_N_TRIALS = 1296
 #: 95% band is ~0.005 (1.96 x 0.00255).
 ROLLOUT_TARGET_SE = 0.00255
 #: Safety cap on the number of 1,296-path batches per rolled-out decision.
-ROLLOUT_MAX_BATCHES = 50
+ROLLOUT_MAX_BATCHES = 16
 #: Base RNG seed for rollout batches; batch b uses (base + b*step) mod 2^32.
 _ROLLOUT_BASE_SEED = 42
 _SEED_STEP = 0x9E3779B9
