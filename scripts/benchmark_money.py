@@ -1394,7 +1394,7 @@ def benchmark_pr(
     if n_skipped:
         _log(f"NOTE: skipped {n_skipped} positions with a missing higher-precision "
              f"reference ({skipped_missing['rollout']} missing rollout, "
-             f"{skipped_missing['2t']} missing 3T) -- not scored.")
+             f"{skipped_missing['3t']} missing 3T) -- not scored.")
 
     scoreable_keys = {e["key"] for e in entries}
     result = _aggregate(r for k, r in cached.items() if k in scoreable_keys)
