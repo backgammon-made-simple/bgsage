@@ -941,7 +941,14 @@ def _assemble_dataset(unique: dict[str, dict], dataset_path: Path, n_games: int,
 _ROLLOUT_JOBS_FILE = _DATA_DIR / "rollout_jobs.jsonl"
 
 
-def _export_rollout_jobs(unique: dict[str, dict]) -> Path:
+def _seed_in_range(dec: dict, min_seed: int | None, max_seed: int | None) -> bool:
+    """Whether a decision's seed falls in the optional [min_seed, max_seed] export window."""
+    s = dec.get("seed", 0)
+    return (min_seed is None or s >= min_seed) and (max_seed is None or s <= max_seed)
+
+
+def _export_rollout_jobs(unique: dict[str, dict],
+                         min_seed: int | None = None, max_seed: int | None = None) -> Path:
     """Write the positions that Pass 3 would roll out, with all rollout inputs.
 
     Used by ``rollout_mode="export"``: instead of running the (expensive) rollouts
@@ -957,7 +964,7 @@ def _export_rollout_jobs(unique: dict[str, dict]) -> Path:
     done = _load_jsonl_by_key(_STAGE3_FILE)
     jobs: list[dict] = []
     for key, dec in unique.items():
-        if key in done or _gap_for(dec) >= ROLLOUT_GAP:
+        if key in done or _gap_for(dec) >= ROLLOUT_GAP or not _seed_in_range(dec, min_seed, max_seed):
             continue
         jobs.append({
             "key": key,
@@ -994,7 +1001,8 @@ def _export_rollout_jobs(unique: dict[str, dict]) -> Path:
 _THREET_JOBS_FILE = _DATA_DIR / "threet_jobs.jsonl"
 
 
-def _export_threet_jobs(unique: dict[str, dict]) -> Path:
+def _export_threet_jobs(unique: dict[str, dict],
+                        min_seed: int | None = None, max_seed: int | None = None) -> Path:
     """Write the positions that Pass 2 would re-evaluate at 3T, with all inputs.
 
     The 3T analogue of ``_export_rollout_jobs`` (used by ``threet_mode="export"``):
@@ -1008,7 +1016,7 @@ def _export_threet_jobs(unique: dict[str, dict]) -> Path:
     done = _load_jsonl_by_key(_STAGE2_FILE)
     jobs: list[dict] = []
     for key, dec in unique.items():
-        if key in done or _gap_for(dec) >= THREE_T_GAP:
+        if key in done or _gap_for(dec) >= THREE_T_GAP or not _seed_in_range(dec, min_seed, max_seed):
             continue
         jobs.append({
             "key": key,
@@ -1041,6 +1049,8 @@ def build_benchmark_data(
     dataset_path: Path | str = DEFAULT_DATASET,
     rollout_mode: str = "compute",
     threet_mode: str = "compute",
+    export_min_seed: int | None = None,
+    export_max_seed: int | None = None,
     stages: tuple = ("pass1", "pass2", "pass3"),
 ) -> dict:
     """Build the money-game benchmark data set (three adaptive-precision passes).
@@ -1097,7 +1107,7 @@ def build_benchmark_data(
             for key, refined in _load_jsonl_by_key(_STAGE2_FILE).items():
                 if key in unique:
                     unique[key] = _apply_refined(unique[key], refined, TIER_3T)
-            _export_threet_jobs(unique)
+            _export_threet_jobs(unique, export_min_seed, export_max_seed)
         else:
             analyzer_3t = _make_3t_analyzer(n_threads)
             unique = _run_refinement_pass(
@@ -1119,7 +1129,7 @@ def build_benchmark_data(
             for key, refined in _load_jsonl_by_key(_STAGE3_FILE).items():
                 if key in unique:
                     unique[key] = _apply_refined(unique[key], refined, TIER_ROLLOUT)
-            _export_rollout_jobs(unique)
+            _export_rollout_jobs(unique, export_min_seed, export_max_seed)
         else:
             # Each rolled-out decision runs to ROLLOUT_TARGET_SE -- cube decisions
             # batch internally in C++; checker decisions use the Python lockstep.
@@ -1471,6 +1481,10 @@ def _main(argv: Optional[list[str]] = None) -> None:
                          help="comma-separated passes to run this invocation "
                               "(pass1=self-play+3P, pass2=3T, pass3=rollout). "
                               "e.g. 'pass1' to only simulate games")
+    p_build.add_argument("--min-seed", type=int, default=None,
+                         help="In export modes, only emit jobs for positions with seed >= this")
+    p_build.add_argument("--max-seed", type=int, default=None,
+                         help="In export modes, only emit jobs for positions with seed <= this")
     p_build.add_argument("--dataset", type=Path, default=DEFAULT_DATASET,
                          help="Output dataset path")
 
@@ -1492,6 +1506,7 @@ def _main(argv: Optional[list[str]] = None) -> None:
             n_games=args.n_games, seed=args.seed, n_threads=args.n_threads,
             write_txt=args.write_txt, workers=args.workers, dataset_path=args.dataset,
             rollout_mode=args.rollout_mode, threet_mode=args.threet_mode,
+            export_min_seed=args.min_seed, export_max_seed=args.max_seed,
             stages=tuple(s.strip() for s in args.stages.split(",") if s.strip()),
         )
     elif args.command == "score":
