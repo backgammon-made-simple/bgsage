@@ -1864,7 +1864,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         .def_readwrite("seed", &RolloutConfig::seed)
         .def_readwrite("ultra_late_threshold", &RolloutConfig::ultra_late_threshold)
         .def_readwrite("cubeful_trial_moves", &RolloutConfig::cubeful_trial_moves)
-        .def_readwrite("cubeful_late_threshold", &RolloutConfig::cubeful_late_threshold);
+        .def_readwrite("cubeful_late_threshold", &RolloutConfig::cubeful_late_threshold)
+        .def_readwrite("target_se", &RolloutConfig::target_se)
+        .def_readwrite("max_batches", &RolloutConfig::max_batches);
 
     // TrialEvalConfig: per-purpose evaluation config for rollout trials
     py::class_<TrialEvalConfig>(m, "TrialEvalConfig")
@@ -2007,6 +2009,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
            py::arg("beaver") = true,
            py::arg("max_cube_value") = 0,
            py::arg("progress") = py::none())
+        .def("set_seed", &RolloutStrategy::set_seed, py::arg("seed"))
         .def("cube_decision", [](RolloutStrategy& self,
                                   const std::vector<int>& checkers,
                                   int cube_value,
@@ -2035,7 +2038,10 @@ PYBIND11_MODULE(bgbot_cpp, m) {
             RolloutStrategy::CubefulRolloutResult cfr;
             {
                 py::gil_scoped_release release;
-                cfr = self.cubeful_cube_decision(board, ci, cpp_progress);
+                if (self.config().target_se > 0.0)
+                    cfr = self.cubeful_cube_decision_batched(board, ci, cpp_progress);
+                else
+                    cfr = self.cubeful_cube_decision(board, ci, cpp_progress);
             }
 
             const auto& cl = cfr.cubeless;
@@ -5192,7 +5198,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                                               const TrialEvalConfig& cube_late,
                                               int ultra_late_threshold,
                                               bool cubeful_trial_moves,
-                                              int cubeful_late_threshold) {
+                                              int cubeful_late_threshold,
+                                              double target_se,
+                                              int max_batches) {
         auto base = make_strategy_from_type(strategy_type, weight_paths, hidden_sizes);
         RolloutConfig rc;
         rc.n_trials = n_trials;
@@ -5212,6 +5220,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         rc.ultra_late_threshold = ultra_late_threshold;
         rc.cubeful_trial_moves = cubeful_trial_moves;
         rc.cubeful_late_threshold = cubeful_late_threshold;
+        rc.target_se = target_se;
+        rc.max_batches = max_batches;
         return std::make_shared<RolloutStrategy>(base, rc);
     }, "Create RolloutStrategy from any base strategy type",
        py::arg("strategy_type"),
@@ -5234,7 +5244,9 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("cube_late") = TrialEvalConfig{},
        py::arg("ultra_late_threshold") = 2,
        py::arg("cubeful_trial_moves") = true,
-       py::arg("cubeful_late_threshold") = 0);
+       py::arg("cubeful_late_threshold") = 0,
+       py::arg("target_se") = 0.0,
+       py::arg("max_batches") = 50);
 
     // --- Unified cubeful_equity_nply (accepts any Strategy via shared_ptr) ---
     m.def("cubeful_equity_nply", [](const std::vector<int>& board_vec,

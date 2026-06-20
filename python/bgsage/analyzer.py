@@ -352,6 +352,8 @@ class _RolloutAnalyzer(_CubelessBase):
         cubeful_trial_moves=True,
         cubeful_late_threshold=0,
         prefilter_threshold=0.0,
+        target_se=0.0,
+        max_batches=50,
     ):
         super().__init__(weights)
         # Two-stage candidate filter for checker_play_analytics: when
@@ -412,7 +414,14 @@ class _RolloutAnalyzer(_CubelessBase):
             ultra_late_threshold=ultra_late_threshold,
             cubeful_trial_moves=cubeful_trial_moves,
             cubeful_late_threshold=cubeful_late_threshold,
+            target_se=target_se,
+            max_batches=max_batches,
         )
+
+    def set_seed(self, seed):
+        """Reseed the rollout RNG (for independent seeded batches; keeps the
+        SharedPosCache warm). Clears the strategy's cached stratified dice."""
+        self._rollout_strategy.set_seed(int(seed))
 
     def cancel(self):
         """Request cancellation of in-progress rollout."""
@@ -631,6 +640,11 @@ class _CubefulAnalyzer:
             self._cubeful_ply = max(dp, 1)
         else:
             self._cubeful_ply = 1
+
+    def set_seed(self, seed):
+        """Delegate reseeding to the wrapped (rollout) analyzer if supported."""
+        if hasattr(self._inner, "set_seed"):
+            self._inner.set_seed(seed)
 
     def _cubeful_equity(
         self, post_move_board, probs, owner,
@@ -989,6 +1003,8 @@ class BgBotAnalyzer:
         cubeful_trial_moves: bool = True,
         cubeful_late_threshold: int = 0,
         prefilter_threshold: float | None = None,
+        target_se: float = 0.0,
+        max_batches: int = 50,
     ):
         if weights is None:
             weights = default_weights()
@@ -1100,6 +1116,8 @@ class BgBotAnalyzer:
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
                 prefilter_threshold=self._prefilter_threshold,
+                target_se=target_se,
+                max_batches=max_batches,
             )
         else:
             raise ValueError(f"Unknown eval_level: {eval_level!r}")
@@ -1165,6 +1183,17 @@ class BgBotAnalyzer:
         if self._bearoff_db is None or not self._bearoff_db.is_bearoff(board):
             return None
         return self._bearoff_db.lookup_epc(board, player)
+
+    def set_seed(self, seed: int) -> None:
+        """Reseed the underlying rollout RNG, if this analyzer is rollout-based.
+
+        Used to run independent seeded batches of the same position while
+        keeping the rollout SharedPosCache warm (e.g. lockstep target-SE checker
+        rollouts). No-op for non-rollout eval levels.
+        """
+        inner = getattr(self, "_analyzer", None)
+        if inner is not None and hasattr(inner, "set_seed"):
+            inner.set_seed(seed)
 
     def checker_play(
         self,

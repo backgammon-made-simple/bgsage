@@ -93,6 +93,16 @@ struct RolloutConfig {
     // between trial chunks. Checked by run_trials_parallel() and
     // cubeful_cube_decision(). Thread-safe: read with relaxed ordering.
     std::atomic<bool>* cancel_flag = nullptr;
+
+    // Target-standard-error batch mode (opt-in). When target_se > 0, the
+    // cube-decision rollout treats n_trials as a BATCH size and runs repeated
+    // batches with different seeds (sharing all caches), accumulating per-trial
+    // statistics until the ND-equity standard error drops below target_se (or
+    // max_batches batches have run). 0 = disabled (single batch, existing
+    // behavior). Only the cube-decision path consults this; the per-candidate
+    // checker rollout is driven by a separate lockstep loop.
+    double target_se = 0.0;
+    int max_batches = 50;   // safety cap on the number of batches
 };
 
 // Result of rolling out a single position.
@@ -201,6 +211,11 @@ public:
 
         // Cubeless pre-roll rollout (from player-on-roll's perspective)
         RolloutResult cubeless;
+
+        // Target-SE batch mode bookkeeping (target_se mode only).
+        int n_batches = 1;            // batches actually run
+        long long total_trials = 0;   // total trials across batches (0 => n_trials)
+        bool se_converged = true;     // false if max_batches hit before target_se
     };
 
     // Cubeful rollout for cube decisions. Rolls out two branches (ND and DT)
@@ -208,6 +223,17 @@ public:
     // are simulated at each half-move using the configured cube strategy + Janowski.
     // `pre_roll_board` is from the player-on-roll's perspective (before rolling).
     CubefulRolloutResult cubeful_cube_decision(
+        const Board& pre_roll_board,
+        const CubeInfo& cube,
+        RolloutProgressCallback progress = nullptr) const;
+
+    // Target-standard-error variant of cubeful_cube_decision. Treats n_trials
+    // as a batch size and runs repeated batches with different seeds (sharing
+    // the Move0/Move1 caches, prefilled once, and the SharedPosCache),
+    // accumulating until the ND-equity SE <= config.target_se or
+    // config.max_batches batches have run. Batch 0 uses config.seed, so with
+    // max_batches==1 the result is identical to cubeful_cube_decision().
+    CubefulRolloutResult cubeful_cube_decision_batched(
         const Board& pre_roll_board,
         const CubeInfo& cube,
         RolloutProgressCallback progress = nullptr) const;
@@ -242,6 +268,16 @@ public:
         RolloutProgressCallback progress = nullptr) const;
 
     const RolloutConfig& config() const { return config_; }
+
+    // Reseed the rollout RNG (changes the stratified dice). Used to run
+    // independent seeded batches of the same position while keeping the
+    // SharedPosCache warm (e.g. lockstep target-SE checker rollouts driven
+    // from Python). Clears the cached dice so the next rollout regenerates them.
+    void set_seed(uint32_t seed) {
+        config_.seed = seed;
+        cached_dice_.clear();
+        cached_max_moves_ = 0;
+    }
 
     // Bearoff DB: when set, positions in the DB are evaluated exactly.
     // Input positions that are bearoff get immediate results (no simulation).
