@@ -12,7 +12,7 @@ cached data set of decisions whose analytics are computed at adaptive precision:
 
   * **3-ply** for clear decisions (the next-best move is far away, so the precise
     error of an alternative barely matters and most bots get these right anyway),
-  * **2T** (XG Roller+ truncated rollout) for closer decisions,
+  * **3T** (XG Roller++ truncated rollout) for closer decisions,
   * **full rollout** (1,296 paths, variance reduction, 3-ply checker + cube
     decisions) for the closest decisions, where errors actually show up.
 
@@ -100,7 +100,7 @@ if sys.platform == "win32":
 _DATA_DIR = _PROJECT_ROOT / "data" / "money_benchmark"
 _BUILD_SUBDIR = _DATA_DIR / "build"
 _STAGE1_DIR = _BUILD_SUBDIR / "stage1"            # per-seed game decisions (3P)
-_STAGE2_FILE = _BUILD_SUBDIR / "stage2_2t.jsonl"  # 2T re-evals, keyed by decision hash
+_STAGE2_FILE = _BUILD_SUBDIR / "stage2_3t.jsonl"  # 3T re-evals, keyed by decision hash
 _STAGE3_FILE = _BUILD_SUBDIR / "stage3_rollout.jsonl"  # rollouts, keyed by decision hash
 _XG_DIR = _DATA_DIR / "xg"                        # XG-import .txt transcripts
 _SCORES_DIR = _DATA_DIR / "scores"                # per-bot scoring caches
@@ -116,8 +116,8 @@ DEFAULT_DATASET = _DATA_DIR / "benchmark.json"
 #: when it is non-trivial (see ``_is_trivial_cube``). Matches the app's PR filters.
 TRIVIAL_SPREAD = 0.001
 
-#: Pass 2: re-evaluate a decision at 2T when its 3-ply best-vs-2nd-best gap < this.
-TWO_T_GAP = 0.05
+#: Pass 2: re-evaluate a decision at 3T when its 3-ply best-vs-2nd-best gap < this.
+THREE_T_GAP = 0.05
 #: Pass 3: roll a decision out when its best-available best-vs-2nd-best gap < this.
 ROLLOUT_GAP = 0.02
 
@@ -148,9 +148,9 @@ GAME_PLANS = ["purerace", "racing", "attacking", "priming", "anchoring"]
 
 #: Tiers, weakest to strongest. The final entry uses the strongest tier reached.
 TIER_3P = "3P"
-TIER_2T = "2T"
+TIER_3T = "3T"
 TIER_ROLLOUT = "rollout"
-_TIER_RANK = {TIER_3P: 0, TIER_2T: 1, TIER_ROLLOUT: 2}
+_TIER_RANK = {TIER_3P: 0, TIER_3T: 1, TIER_ROLLOUT: 2}
 
 #: Self-play guard rail (4 events/turn * generous turn cap).
 _MAX_TURNS = 600
@@ -661,7 +661,7 @@ def _unique_by_key(decisions: list[dict]) -> dict[str, dict]:
 
 
 # ===========================================================================
-# Passes 2 & 3 - adaptive-precision re-evaluation (2T, then rollout)
+# Passes 2 & 3 - adaptive-precision re-evaluation (3T, then rollout)
 # ===========================================================================
 
 
@@ -860,10 +860,10 @@ def _run_refinement_pass(
     return unique
 
 
-def _make_2t_analyzer(n_threads: int):
+def _make_3t_analyzer(n_threads: int):
     from bgsage import BgBotAnalyzer
 
-    return BgBotAnalyzer(eval_level="truncated2", cubeful=True, parallel_threads=n_threads)
+    return BgBotAnalyzer(eval_level="truncated3", cubeful=True, parallel_threads=n_threads)
 
 
 def _make_rollout_analyzer(n_threads: int):
@@ -896,7 +896,7 @@ def _assemble_dataset(unique: dict[str, dict], dataset_path: Path, n_games: int,
     """Write the final benchmark JSON from the most-refined analytics per decision."""
     decisions = sorted(unique.values(), key=lambda d: (d.get("seed", 0), d.get("turn", 0), d["kind"]))
 
-    tier_counts = {TIER_3P: 0, TIER_2T: 0, TIER_ROLLOUT: 0}
+    tier_counts = {TIER_3P: 0, TIER_3T: 0, TIER_ROLLOUT: 0}
     n_checker = n_cube_entries = n_double = n_take = 0
     for d in decisions:
         tier_counts[d["tier"]] += 1
@@ -920,7 +920,7 @@ def _assemble_dataset(unique: dict[str, dict], dataset_path: Path, n_games: int,
         "n_cube_take": n_take,
         "n_cube_entries": n_cube_entries,
         "tier_counts": tier_counts,           # per dataset entry (position)
-        "two_t_gap": TWO_T_GAP,
+        "three_t_gap": THREE_T_GAP,
         "rollout_gap": ROLLOUT_GAP,
         "rollout_n_trials": ROLLOUT_N_TRIALS,
         "trivial_spread": TRIVIAL_SPREAD,
@@ -990,25 +990,25 @@ def _export_rollout_jobs(unique: dict[str, dict]) -> Path:
     return _ROLLOUT_JOBS_FILE
 
 
-#: Export-mode output: the list of positions that need a 2T re-eval (Pass 2).
-_TWOT_JOBS_FILE = _DATA_DIR / "twot_jobs.jsonl"
+#: Export-mode output: the list of positions that need a 3T re-eval (Pass 2).
+_THREET_JOBS_FILE = _DATA_DIR / "threet_jobs.jsonl"
 
 
-def _export_twot_jobs(unique: dict[str, dict]) -> Path:
-    """Write the positions that Pass 2 would re-evaluate at 2T, with all inputs.
+def _export_threet_jobs(unique: dict[str, dict]) -> Path:
+    """Write the positions that Pass 2 would re-evaluate at 3T, with all inputs.
 
-    The 2T analogue of ``_export_rollout_jobs`` (used by ``twot_mode="export"``):
-    instead of running the 2T re-evals in-process, dump one self-contained job per
-    position needing 2T so they can be computed elsewhere (distributed workers). A
-    worker re-evaluates the position at ``truncated2`` and writes a record
+    The 3T analogue of ``_export_rollout_jobs`` (used by ``threet_mode="export"``):
+    instead of running the 3T re-evals in-process, dump one self-contained job per
+    position needing 3T so they can be computed elsewhere (distributed workers). A
+    worker re-evaluates the position at ``truncated3`` and writes a record
     ``{key, kind, moves|<cube fields>}`` (the shape ``_reeval_decision`` returns) into
-    ``stage2_2t.jsonl``; re-running the build then ingests them. Skips positions
+    ``stage2_3t.jsonl``; re-running the build then ingests them. Skips positions
     already present in the stage-2 file (resumable).
     """
     done = _load_jsonl_by_key(_STAGE2_FILE)
     jobs: list[dict] = []
     for key, dec in unique.items():
-        if key in done or _gap_for(dec) >= TWO_T_GAP:
+        if key in done or _gap_for(dec) >= THREE_T_GAP:
             continue
         jobs.append({
             "key": key,
@@ -1018,18 +1018,18 @@ def _export_twot_jobs(unique: dict[str, dict]) -> Path:
             "cube_value": dec["cube_value"],
             "cube_owner": dec["cube_owner"],
             "game_plan": dec.get("game_plan"),
-            "level": "truncated2",
+            "level": "truncated3",
         })
-    _TWOT_JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _TWOT_JOBS_FILE.with_suffix(".jsonl.tmp")
+    _THREET_JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _THREET_JOBS_FILE.with_suffix(".jsonl.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         for j in jobs:
             f.write(json.dumps(j, separators=(",", ":")) + "\n")
-    tmp.replace(_TWOT_JOBS_FILE)
+    tmp.replace(_THREET_JOBS_FILE)
     n_ck = sum(1 for j in jobs if j["kind"] == "checker")
-    _log(f"Export: wrote {len(jobs)} 2T jobs ({n_ck} checker, {len(jobs) - n_ck} cube) "
-         f"to {_TWOT_JOBS_FILE} -- no 2T evals computed.")
-    return _TWOT_JOBS_FILE
+    _log(f"Export: wrote {len(jobs)} 3T jobs ({n_ck} checker, {len(jobs) - n_ck} cube) "
+         f"to {_THREET_JOBS_FILE} -- no 3T evals computed.")
+    return _THREET_JOBS_FILE
 
 
 def build_benchmark_data(
@@ -1040,7 +1040,7 @@ def build_benchmark_data(
     workers: int = 6,
     dataset_path: Path | str = DEFAULT_DATASET,
     rollout_mode: str = "compute",
-    twot_mode: str = "compute",
+    threet_mode: str = "compute",
     stages: tuple = ("pass1", "pass2", "pass3"),
 ) -> dict:
     """Build the money-game benchmark data set (three adaptive-precision passes).
@@ -1048,24 +1048,24 @@ def build_benchmark_data(
     Pass 1: simulate ``n_games`` Sage-3P vs Sage-3P money games, capturing 3-ply
     analytics for every real decision (optionally writing an XG-import ``.txt`` per
     game). Pass 2: re-evaluate decisions whose 3-ply best-vs-2nd-best gap < 0.05 at
-    2T. Pass 3: roll out (1,296 paths, VR, 3-ply checker + cube) decisions whose
+    3T. Pass 3: roll out (1,296 paths, VR, 3-ply checker + cube) decisions whose
     best-available gap < 0.02. The final entry for each decision uses the strongest
     tier reached.
 
     Every stage persists its results as they are produced; a re-run skips ahead to
-    the first uncomputed work. ``n_threads`` is the thread count for the 2T and
+    the first uncomputed work. ``n_threads`` is the thread count for the 3T and
     rollout passes (each evaluation parallelizes internally). ``workers`` is the
     number of parallel **processes** for the cheap pass-1 self-play.
 
     ``rollout_mode``: ``"compute"`` (default) runs Pass 3 in-process. ``"export"``
     skips the rollouts and instead writes the positions that need rolling out to
     ``rollout_jobs.jsonl`` (so they can be computed elsewhere), then assembles a
-    provisional dataset using the best tier reached so far (3P/2T). Once the
+    provisional dataset using the best tier reached so far (3P/3T). Once the
     external rollout results are written into ``stage3_rollout.jsonl``, re-running
     in ``"compute"`` mode ingests them and finalizes the dataset.
 
     ``stages``: which passes to run this invocation, e.g. ``("pass1",)`` to only
-    simulate + capture 3P, ``("pass2",)`` to only run the 2T pass later, or
+    simulate + capture 3P, ``("pass2",)`` to only run the 3T pass later, or
     ``("pass3",)`` for only the rollout pass. Skipped passes still apply any results
     already on disk, so the assembled dataset always reflects the best tier reached.
     Each pass is independently resumable, so the passes can be run separately.
@@ -1090,27 +1090,27 @@ def build_benchmark_data(
     unique = _unique_by_key(all_decisions)
     _log(f"Captured {len(all_decisions)} decisions ({len(unique)} unique positions).")
 
-    # Pass 2 - 2T refinement. Run it, or (when skipped) just apply any 2T results
+    # Pass 2 - 3T refinement. Run it, or (when skipped) just apply any 3T results
     # already on disk so the gap/tier reflect prior work.
     if "pass2" in stages:
-        if twot_mode == "export":
+        if threet_mode == "export":
             for key, refined in _load_jsonl_by_key(_STAGE2_FILE).items():
                 if key in unique:
-                    unique[key] = _apply_refined(unique[key], refined, TIER_2T)
-            _export_twot_jobs(unique)
+                    unique[key] = _apply_refined(unique[key], refined, TIER_3T)
+            _export_threet_jobs(unique)
         else:
-            analyzer_2t = _make_2t_analyzer(n_threads)
+            analyzer_3t = _make_3t_analyzer(n_threads)
             unique = _run_refinement_pass(
-                unique, analyzer_2t, _STAGE2_FILE, TWO_T_GAP, TIER_2T, "Pass 2/3 (2T refine)")
+                unique, analyzer_3t, _STAGE2_FILE, THREE_T_GAP, TIER_3T, "Pass 2/3 (3T refine)")
     else:
         done2 = _load_jsonl_by_key(_STAGE2_FILE)
         for key, refined in done2.items():
             if key in unique:
-                unique[key] = _apply_refined(unique[key], refined, TIER_2T)
+                unique[key] = _apply_refined(unique[key], refined, TIER_3T)
         pending2 = sum(1 for key, dec in unique.items()
-                       if key not in done2 and _gap_for(dec) < TWO_T_GAP)
-        _log(f"Pass 2 (2T) not run: {pending2} positions want 2T "
-             f"(3P gap < {TWO_T_GAP}); {len(done2)} already done. Run with --stages pass2.")
+                       if key not in done2 and _gap_for(dec) < THREE_T_GAP)
+        _log(f"Pass 2 (3T) not run: {pending2} positions want 3T "
+             f"(3P gap < {THREE_T_GAP}); {len(done2)} already done. Run with --stages pass2.")
 
     # Pass 3 - rollout (compute or export). When skipped, apply any rollout results
     # already on disk.
@@ -1277,14 +1277,14 @@ def _missing_tier(entry: dict) -> Optional[str]:
     A decision whose best-vs-2nd-best gap is below a refinement threshold should
     carry analytics at that tier; if it doesn't (e.g. its rollout hasn't been
     computed yet), its stored reference is too coarse to score against fairly.
-    Returns the missing tier (``"rollout"`` or ``"2t"``), or ``None`` if complete.
+    Returns the missing tier (``"rollout"`` or ``"3t"``), or ``None`` if complete.
     """
     gap = _gap_for(entry)
     tier = entry.get("tier")
     if gap < ROLLOUT_GAP and tier != TIER_ROLLOUT:
         return "rollout"
-    if gap < TWO_T_GAP and tier == TIER_3P:
-        return "2t"
+    if gap < THREE_T_GAP and tier == TIER_3P:
+        return "3t"
     return None
 
 
@@ -1327,16 +1327,16 @@ def benchmark_pr(
 
     # Skip decisions whose reference is below the precision their closeness
     # requires (e.g. a rollout-eligible decision whose rollout isn't done yet).
-    # Scoring those against a coarser 2T/3P reference would be unfair.
+    # Scoring those against a coarser 3T/3P reference would be unfair.
     entries = []
-    skipped_missing = {"rollout": 0, "2t": 0}
+    skipped_missing = {"rollout": 0, "3t": 0}
     for e in all_entries:
         miss = _missing_tier(e)
         if miss is None:
             entries.append(e)
         else:
             skipped_missing[miss] += 1
-    n_skipped = skipped_missing["rollout"] + skipped_missing["2t"]
+    n_skipped = skipped_missing["rollout"] + skipped_missing["3t"]
 
     if cache_path is None:
         _SCORES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1394,14 +1394,14 @@ def benchmark_pr(
     if n_skipped:
         _log(f"NOTE: skipped {n_skipped} positions with a missing higher-precision "
              f"reference ({skipped_missing['rollout']} missing rollout, "
-             f"{skipped_missing['2t']} missing 2T) -- not scored.")
+             f"{skipped_missing['2t']} missing 3T) -- not scored.")
 
     scoreable_keys = {e["key"] for e in entries}
     result = _aggregate(r for k, r in cached.items() if k in scoreable_keys)
     result["mismatches"] = mismatches
     result["skipped"] = n_skipped
     result["skipped_missing_rollout"] = skipped_missing["rollout"]
-    result["skipped_missing_2t"] = skipped_missing["2t"]
+    result["skipped_missing_3t"] = skipped_missing["3t"]
     if progress:
         _log(f"{label}: total PR={result['total_pr']:.2f} "
              f"(checker={result['checker_pr']:.2f}, cube={result['cube_pr']:.2f}) "
@@ -1420,7 +1420,7 @@ def _print_report(result: dict) -> None:
     if result.get("skipped"):
         print(f"Skipped:    {result['skipped']} positions (missing reference: "
               f"{result.get('skipped_missing_rollout', 0)} rollout, "
-              f"{result.get('skipped_missing_2t', 0)} 2T)")
+              f"{result.get('skipped_missing_3t', 0)} 3T)")
     if result.get("mismatches"):
         print(f"Mismatches: {result['mismatches']} (bot move not a legal reference move)")
     print(f"{'-'*60}")
@@ -1446,7 +1446,7 @@ def _main(argv: Optional[list[str]] = None) -> None:
     p_build.add_argument("--n-games", type=int, default=200, help="Games to simulate")
     p_build.add_argument("--seed", type=int, default=1, help="First game seed")
     p_build.add_argument("--n-threads", type=int, default=0,
-                         help="Threads for the 2T and rollout passes (0=auto)")
+                         help="Threads for the 3T and rollout passes (0=auto)")
     p_build.add_argument("--workers", type=int, default=6,
                          help="Parallel processes for the pass-1 self-play")
     p_build.add_argument("--write-txt", action=argparse.BooleanOptionalAction, default=True,
@@ -1455,12 +1455,12 @@ def _main(argv: Optional[list[str]] = None) -> None:
     p_build.add_argument("--rollout-mode", choices=["compute", "export"], default="compute",
                          help="compute: run Pass-3 rollouts in-process; "
                               "export: write rollout_jobs.jsonl instead (no rollouts)")
-    p_build.add_argument("--twot-mode", choices=["compute", "export"], default="compute",
-                         help="compute: run the Pass-2 2T re-evals in-process; "
-                              "export: write twot_jobs.jsonl instead (no 2T evals)")
+    p_build.add_argument("--threet-mode", choices=["compute", "export"], default="compute",
+                         help="compute: run the Pass-2 3T re-evals in-process; "
+                              "export: write threet_jobs.jsonl instead (no 3T evals)")
     p_build.add_argument("--stages", default="pass1,pass2,pass3",
                          help="comma-separated passes to run this invocation "
-                              "(pass1=self-play+3P, pass2=2T, pass3=rollout). "
+                              "(pass1=self-play+3P, pass2=3T, pass3=rollout). "
                               "e.g. 'pass1' to only simulate games")
     p_build.add_argument("--dataset", type=Path, default=DEFAULT_DATASET,
                          help="Output dataset path")
@@ -1480,7 +1480,7 @@ def _main(argv: Optional[list[str]] = None) -> None:
         build_benchmark_data(
             n_games=args.n_games, seed=args.seed, n_threads=args.n_threads,
             write_txt=args.write_txt, workers=args.workers, dataset_path=args.dataset,
-            rollout_mode=args.rollout_mode, twot_mode=args.twot_mode,
+            rollout_mode=args.rollout_mode, threet_mode=args.threet_mode,
             stages=tuple(s.strip() for s in args.stages.split(",") if s.strip()),
         )
     elif args.command == "score":

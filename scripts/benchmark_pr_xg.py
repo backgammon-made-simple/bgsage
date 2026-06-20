@@ -178,7 +178,7 @@ def benchmark_pr(xg_dir: Path | str = _XG_DIR,
 
     seen: set = set()
     records: list = []
-    skipped = {"rollout": 0, "2t": 0}
+    skipped = {"rollout": 0, "3t": 0}
     unmatched = 0
     mismatches = 0
     n_xg_decisions = 0
@@ -220,10 +220,10 @@ def benchmark_pr(xg_dir: Path | str = _XG_DIR,
                     refined, choice["should_double"], choice["should_take"])})
 
     result = bm._aggregate(records)
-    n_skipped = skipped["rollout"] + skipped["2t"]
+    n_skipped = skipped["rollout"] + skipped["3t"]
     result["skipped"] = n_skipped
     result["skipped_missing_rollout"] = skipped["rollout"]
-    result["skipped_missing_2t"] = skipped["2t"]
+    result["skipped_missing_3t"] = skipped["3t"]
     result["mismatches"] = mismatches
     result["unmatched"] = unmatched
     result["n_games"] = len(seeds)
