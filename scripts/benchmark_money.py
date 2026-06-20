@@ -990,6 +990,48 @@ def _export_rollout_jobs(unique: dict[str, dict]) -> Path:
     return _ROLLOUT_JOBS_FILE
 
 
+#: Export-mode output: the list of positions that need a 2T re-eval (Pass 2).
+_TWOT_JOBS_FILE = _DATA_DIR / "twot_jobs.jsonl"
+
+
+def _export_twot_jobs(unique: dict[str, dict]) -> Path:
+    """Write the positions that Pass 2 would re-evaluate at 2T, with all inputs.
+
+    The 2T analogue of ``_export_rollout_jobs`` (used by ``twot_mode="export"``):
+    instead of running the 2T re-evals in-process, dump one self-contained job per
+    position needing 2T so they can be computed elsewhere (distributed workers). A
+    worker re-evaluates the position at ``truncated2`` and writes a record
+    ``{key, kind, moves|<cube fields>}`` (the shape ``_reeval_decision`` returns) into
+    ``stage2_2t.jsonl``; re-running the build then ingests them. Skips positions
+    already present in the stage-2 file (resumable).
+    """
+    done = _load_jsonl_by_key(_STAGE2_FILE)
+    jobs: list[dict] = []
+    for key, dec in unique.items():
+        if key in done or _gap_for(dec) >= TWO_T_GAP:
+            continue
+        jobs.append({
+            "key": key,
+            "kind": dec["kind"],
+            "board": dec["board"],
+            "dice": dec.get("dice"),
+            "cube_value": dec["cube_value"],
+            "cube_owner": dec["cube_owner"],
+            "game_plan": dec.get("game_plan"),
+            "level": "truncated2",
+        })
+    _TWOT_JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _TWOT_JOBS_FILE.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for j in jobs:
+            f.write(json.dumps(j, separators=(",", ":")) + "\n")
+    tmp.replace(_TWOT_JOBS_FILE)
+    n_ck = sum(1 for j in jobs if j["kind"] == "checker")
+    _log(f"Export: wrote {len(jobs)} 2T jobs ({n_ck} checker, {len(jobs) - n_ck} cube) "
+         f"to {_TWOT_JOBS_FILE} -- no 2T evals computed.")
+    return _TWOT_JOBS_FILE
+
+
 def build_benchmark_data(
     n_games: int,
     seed: int = 1,
@@ -998,6 +1040,7 @@ def build_benchmark_data(
     workers: int = 6,
     dataset_path: Path | str = DEFAULT_DATASET,
     rollout_mode: str = "compute",
+    twot_mode: str = "compute",
     stages: tuple = ("pass1", "pass2", "pass3"),
 ) -> dict:
     """Build the money-game benchmark data set (three adaptive-precision passes).
@@ -1050,9 +1093,15 @@ def build_benchmark_data(
     # Pass 2 - 2T refinement. Run it, or (when skipped) just apply any 2T results
     # already on disk so the gap/tier reflect prior work.
     if "pass2" in stages:
-        analyzer_2t = _make_2t_analyzer(n_threads)
-        unique = _run_refinement_pass(
-            unique, analyzer_2t, _STAGE2_FILE, TWO_T_GAP, TIER_2T, "Pass 2/3 (2T refine)")
+        if twot_mode == "export":
+            for key, refined in _load_jsonl_by_key(_STAGE2_FILE).items():
+                if key in unique:
+                    unique[key] = _apply_refined(unique[key], refined, TIER_2T)
+            _export_twot_jobs(unique)
+        else:
+            analyzer_2t = _make_2t_analyzer(n_threads)
+            unique = _run_refinement_pass(
+                unique, analyzer_2t, _STAGE2_FILE, TWO_T_GAP, TIER_2T, "Pass 2/3 (2T refine)")
     else:
         done2 = _load_jsonl_by_key(_STAGE2_FILE)
         for key, refined in done2.items():
@@ -1406,6 +1455,9 @@ def _main(argv: Optional[list[str]] = None) -> None:
     p_build.add_argument("--rollout-mode", choices=["compute", "export"], default="compute",
                          help="compute: run Pass-3 rollouts in-process; "
                               "export: write rollout_jobs.jsonl instead (no rollouts)")
+    p_build.add_argument("--twot-mode", choices=["compute", "export"], default="compute",
+                         help="compute: run the Pass-2 2T re-evals in-process; "
+                              "export: write twot_jobs.jsonl instead (no 2T evals)")
     p_build.add_argument("--stages", default="pass1,pass2,pass3",
                          help="comma-separated passes to run this invocation "
                               "(pass1=self-play+3P, pass2=2T, pass3=rollout). "
@@ -1428,7 +1480,7 @@ def _main(argv: Optional[list[str]] = None) -> None:
         build_benchmark_data(
             n_games=args.n_games, seed=args.seed, n_threads=args.n_threads,
             write_txt=args.write_txt, workers=args.workers, dataset_path=args.dataset,
-            rollout_mode=args.rollout_mode,
+            rollout_mode=args.rollout_mode, twot_mode=args.twot_mode,
             stages=tuple(s.strip() for s in args.stages.split(",") if s.strip()),
         )
     elif args.command == "score":
