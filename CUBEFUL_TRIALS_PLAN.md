@@ -421,7 +421,7 @@ Estimated wall-clock impact on standard configs:
 
 | Config | Today | Expected (single-branch) | Expected (two-branch, Option A) |
 |---|---|---|---|
-| 1T (XG Roller, 42 trials) | 1× | 1.05–1.10× | 1.3–1.5× |
+| 1T (XG Roller, 72 trials) | 1× | 1.05–1.10× | 1.3–1.5× |
 | 2T (360 trials, 2-ply) | 1× | 1.05–1.10× | 1.3–1.5× |
 | 3T (360 trials, 3-ply) | 1× | 1.10–1.20× | 1.4–1.6× |
 | Full R (1296 trials, play-to-end) | 1× | 1.15–1.25× | 1.5–1.7× |

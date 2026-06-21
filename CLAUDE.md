@@ -1101,7 +1101,7 @@ search but faster than full rollouts, making them the best speed/accuracy tradeo
 for position evaluation.
 
 **Key parameters:**
-- `n_trials`: Number of trial games per candidate (42-360 typical for truncated rollouts)
+- `n_trials`: Number of trial games per candidate (72-360 typical for truncated rollouts)
 - `truncation_depth`: Half-moves before truncating and evaluating with NN (0 = play to completion)
 - `decision_ply`: Ply depth for move selection during early trial moves
 - `truncation_ply`: Ply depth for evaluation at the truncation point (-1 = same as `decision_ply`).
@@ -1144,7 +1144,10 @@ rollout (child RolloutStrategy).
 | XGRoller++ Checker | 360 | 5 | 3 | 2  | 2  |
 | XGRoller++ Cube    | 360 | 7 | 3 | 2  | 2  |
 
-**App level names**: `truncated1` = XG Roller, `truncated2` = XG Roller+,
+**App level names**: `truncated1` is XG-Roller-style but uses **72** trials (2×36),
+not XG's 42 — 42 isn't a multiple of 36, so it over-weights 6 ordered first rolls and
+biases the rollout (benchmark PR 2.23 → 0.50 going 42 → 72). The `XGRoller` row above
+(42) still shows how to replicate XG Roller exactly. `truncated2` = XG Roller+,
 `rollout` = full rollout (1296 trials, play to completion). `truncated3` no longer
 maps to a single XG level: it uses `truncation_depth=7`, `decision_ply=3`,
 `late_ply=2`, `late_threshold=2`, **`ultra_late_threshold=9999`** (3-ply early, then

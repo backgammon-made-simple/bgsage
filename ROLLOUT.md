@@ -81,7 +81,7 @@ faster than full rollout because games are cut short, but less accurate because
 the truncation evaluation introduces NN bias.
 
 - `truncation_depth > 0` (e.g., 5 or 7 half-moves)
-- Typical configuration: 42-360 trials
+- Typical configuration: 72-360 trials
 - The truncation evaluation can use 1-ply, N-ply, or even a nested truncated
   rollout
 
@@ -93,6 +93,10 @@ the truncation evaluation introduces NN bias.
 | XG Roller+ (2T)   | 360 | 7 | 2 | 1  | 2  |
 | XG Roller++ (3T)  | 360 | 7 | 3 | 2  | 2  |
 | Full Rollout (R)  | 1,296 | 0 | 1 | -1 | 20 |
+
+These are the params to **replicate XG** exactly. Sage's own `truncated1` (1T) uses
+**72** trials (2×36), not 42 — see Standard Configurations (App Levels) below; 42 is
+not a multiple of 36 and mis-weights the first roll.
 
 > **3T note:** 3T also uses `ultra_late_threshold=9999` (3-ply early, then 2-ply for
 > the rest of each trial — no 1-ply drop), which this 5-column table can't show; see
@@ -1363,7 +1367,7 @@ cheap loose 1-ply cull first and then a stricter 2-ply filter recovers
 those moves at low cost: the 2-ply rescore runs on a small surviving set
 (typically ~3–8 candidates), and 2-ply is accurate enough that the TINY
 gate at that depth rarely drops the rollout winner. 1T isn't worth the
-extra 2-ply scoring because the rollout itself is only 1-ply at 42
+extra 2-ply scoring because the rollout itself is only 1-ply at 72
 trials — the filter's accuracy ceiling is already the bottleneck.
 
 A 2-ply strategy instance is lazily created on `_RolloutAnalyzer` only
@@ -1424,7 +1428,7 @@ into it.
 
 | Level | n_trials | trunc_depth | decision_ply | late_ply | late_threshold | ultra_late | prefilter |
 |-------|----------|-------------|-------------|----------|----------------|------------|-----------|
-| 1T (XG Roller) | 42 | 5 | 1 | -1 | 20 | 2 | 0 (off) |
+| 1T (XG Roller) | 72 | 5 | 1 | -1 | 20 | 2 | 0 (off) |
 | 2T (XG Roller+) | 360 | 7 | 2 | 1 | 2 | 2 | 0.15 |
 | 3T (XG Roller++) | 360 | 7 | 3 | 2 | 2 | 9999 | 0.15 |
 | R (Full Rollout) | 1,296 | 0 | 1 | -1 | 20 | 9999 | 0.15 |

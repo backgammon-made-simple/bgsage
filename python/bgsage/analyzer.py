@@ -343,7 +343,7 @@ class _RolloutAnalyzer(_CubelessBase):
 
     def __init__(
         self, weights, n_trials=1296, truncation_depth=0,
-        decision_ply=1, n_threads=0, seed=42,
+        decision_ply=1, truncation_ply=-1, n_threads=0, seed=42,
         late_ply=-1, late_threshold=20,
         parallelize_trials=True,
         checker=None, checker_late=None,
@@ -383,6 +383,7 @@ class _RolloutAnalyzer(_CubelessBase):
             "n_trials": n_trials,
             "truncation_depth": truncation_depth,
             "decision_ply": decision_ply,
+            "truncation_ply": truncation_ply,
             "n_threads": self._parallel_threads,
             "seed": seed,
             "late_ply": late_ply,
@@ -402,6 +403,7 @@ class _RolloutAnalyzer(_CubelessBase):
             n_trials=n_trials,
             truncation_depth=truncation_depth,
             decision_ply=decision_ply,
+            truncation_ply=truncation_ply,
             n_threads=self._parallel_threads,
             seed=seed,
             late_ply=late_ply,
@@ -961,6 +963,9 @@ class BgBotAnalyzer:
         n_trials: Rollout trial count.
         truncation_depth: Rollout truncation (0 = play to completion).
         decision_ply: Ply depth for move selection during rollout trials.
+        truncation_ply: Ply depth for evaluation at the truncation point
+            (-1 = same as ``decision_ply``). Only used by ``eval_level='rollout'``;
+            the named ``truncated1/2/3`` levels fix their own truncation ply.
         late_ply: Ply for move selection after ``late_threshold`` half-moves
             (-1 = same as ``decision_ply``).
         late_threshold: Half-move index where decision ply switches to ``late_ply``.
@@ -991,6 +996,7 @@ class BgBotAnalyzer:
         n_trials: int = 1296,
         truncation_depth: int = 0,
         decision_ply: int = 1,
+        truncation_ply: int = -1,
         late_ply: int = -1,
         late_threshold: int = 20,
         seed: int = 42,
@@ -1055,9 +1061,13 @@ class BgBotAnalyzer:
                 parallel_threads=parallel_threads,
             )
         elif eval_level == "truncated1":
+            # 1T: 72 trials (2x36) -- a multiple of 36, so the first roll is
+            # exactly stratified. XG Roller's 42 is not, which 2x over-weights
+            # 6 ordered first rolls and biases the result (benchmark PR 2.23 ->
+            # 0.50 going 42 -> 72). Otherwise XG-Roller-style: trunc-5, 1-ply.
             inner = _RolloutAnalyzer(
                 weights,
-                n_trials=42,
+                n_trials=72,
                 truncation_depth=5,
                 decision_ply=1,
                 n_threads=parallel_threads,
@@ -1104,6 +1114,7 @@ class BgBotAnalyzer:
                 n_trials=n_trials,
                 truncation_depth=truncation_depth,
                 decision_ply=decision_ply,
+                truncation_ply=truncation_ply,
                 n_threads=parallel_threads,
                 seed=seed,
                 late_ply=late_ply,
