@@ -53,11 +53,7 @@ There were 17,535 decisions total. 9,237 were re-evaluated at 3T. 5,944 position
 | Sage 2P | 1.64 | 1.39 | 2.88 | 0.40 | 1.77 | 1.83 | 1.86 | 1.71 |
 | Sage 1P | 2.59 | 2.48 | 3.20 | 0.78 | 2.60 | 2.79 | 3.10 | 2.89 |
 
-Sage 3T is noticeably better than XG Roller ++, though both are very good. 
-
-The Sage 1T and 2T results are disappointing and suggest a bug or configuration issue.
-
-In order of overall PR, the strongest bots are: Sage 3T, XG Roller ++, Sage 4P, XG Roller +, XG Roller, Sage 3P.
+Sage evaluations are stronger than their equivalent XG evaluations in every case except 3-ply, where XG is slightly stronger, but the two are very close.
 
 ### Running the Pipeline
 
