@@ -1858,6 +1858,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         .def_readwrite("n_trials", &RolloutConfig::n_trials)
         .def_readwrite("truncation_depth", &RolloutConfig::truncation_depth)
         .def_readwrite("decision_ply", &RolloutConfig::decision_ply)
+        .def_readwrite("truncation_ply", &RolloutConfig::truncation_ply)
         .def_readwrite("enable_vr", &RolloutConfig::enable_vr)
         .def_readwrite("filter", &RolloutConfig::filter)
         .def_readwrite("n_threads", &RolloutConfig::n_threads)
@@ -5200,7 +5201,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
                                               bool cubeful_trial_moves,
                                               int cubeful_late_threshold,
                                               double target_se,
-                                              int max_batches) {
+                                              int max_batches, int truncation_ply) {
         auto base = make_strategy_from_type(strategy_type, weight_paths, hidden_sizes);
         RolloutConfig rc;
         rc.n_trials = n_trials;
@@ -5222,6 +5223,7 @@ PYBIND11_MODULE(bgbot_cpp, m) {
         rc.cubeful_late_threshold = cubeful_late_threshold;
         rc.target_se = target_se;
         rc.max_batches = max_batches;
+        rc.truncation_ply = truncation_ply;
         return std::make_shared<RolloutStrategy>(base, rc);
     }, "Create RolloutStrategy from any base strategy type",
        py::arg("strategy_type"),
@@ -5246,7 +5248,8 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("cubeful_trial_moves") = true,
        py::arg("cubeful_late_threshold") = 0,
        py::arg("target_se") = 0.0,
-       py::arg("max_batches") = 50);
+       py::arg("max_batches") = 50,
+       py::arg("truncation_ply") = -1);
 
     // --- Unified cubeful_equity_nply (accepts any Strategy via shared_ptr) ---
     m.def("cubeful_equity_nply", [](const std::vector<int>& board_vec,
