@@ -1077,16 +1077,25 @@ class BgBotAnalyzer:
                 cubeful_late_threshold=self._cubeful_late_threshold,
             )
         elif eval_level == "truncated2":
+            # 2T: trunc-7, 360 trials. Checker 2-ply on the first ply then
+            # 1-ply (late_threshold=1); cube 2-ply throughout; 2-ply truncation
+            # eval; no ultra-late 1-ply drop (ultra_late=9999). Beats XG Roller+
+            # (benchmark PR 0.89 -> 0.36). Was: late_threshold=2, ultra_late=2,
+            # 1-ply late cube + 1-ply truncation eval (the ply-drop economies
+            # that cost ~0.5 PR).
             inner = _RolloutAnalyzer(
                 weights,
                 n_trials=360,
                 truncation_depth=7,
                 decision_ply=2,
+                truncation_ply=2,
                 n_threads=parallel_threads,
                 seed=seed,
                 late_ply=1,
-                late_threshold=2,
-                ultra_late_threshold=2,
+                late_threshold=1,
+                cube=bgbot_cpp.TrialEvalConfig(ply=2),
+                cube_late=bgbot_cpp.TrialEvalConfig(ply=2),
+                ultra_late_threshold=9999,
                 cubeful_trial_moves=self._cubeful_trial_moves,
                 cubeful_late_threshold=self._cubeful_late_threshold,
                 prefilter_threshold=self._prefilter_threshold,

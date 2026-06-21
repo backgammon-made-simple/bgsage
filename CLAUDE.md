@@ -1147,7 +1147,10 @@ rollout (child RolloutStrategy).
 **App level names**: `truncated1` is XG-Roller-style but uses **72** trials (2×36),
 not XG's 42 — 42 isn't a multiple of 36, so it over-weights 6 ordered first rolls and
 biases the rollout (benchmark PR 2.23 → 0.50 going 42 → 72). The `XGRoller` row above
-(42) still shows how to replicate XG Roller exactly. `truncated2` = XG Roller+,
+(42) still shows how to replicate XG Roller exactly. `truncated2` is XG-Roller+-style
+but diverges: cube 2-ply throughout, 2-ply truncation eval (`truncation_ply=2`), and
+checker 1-ply only after the first ply (`late_threshold=1`, `ultra_late_threshold=9999`)
+— beats XG Roller+ (benchmark PR 0.89 → 0.36) vs the old `ultra_late=2` 1-ply drop.
 `rollout` = full rollout (1296 trials, play to completion). `truncated3` no longer
 maps to a single XG level: it uses `truncation_depth=7`, `decision_ply=3`,
 `late_ply=2`, `late_threshold=2`, **`ultra_late_threshold=9999`** (3-ply early, then

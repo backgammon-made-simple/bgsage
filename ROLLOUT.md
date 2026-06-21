@@ -94,9 +94,11 @@ the truncation evaluation introduces NN bias.
 | XG Roller++ (3T)  | 360 | 7 | 3 | 2  | 2  |
 | Full Rollout (R)  | 1,296 | 0 | 1 | -1 | 20 |
 
-These are the params to **replicate XG** exactly. Sage's own `truncated1` (1T) uses
-**72** trials (2×36), not 42 — see Standard Configurations (App Levels) below; 42 is
-not a multiple of 36 and mis-weights the first roll.
+These are the params to **replicate XG** exactly. Sage's own app levels diverge from
+these — see Standard Configurations (App Levels) below. `truncated1` (1T) uses **72**
+trials (2×36), not 42 (42 isn't a multiple of 36 and mis-weights the first roll).
+`truncated2` (2T) uses `late_threshold=1`, `ultra_late_threshold=9999`, 2-ply cube
+throughout, and a 2-ply truncation eval (it beats XG Roller+: benchmark PR 0.89 → 0.36).
 
 > **3T note:** 3T also uses `ultra_late_threshold=9999` (3-ply early, then 2-ply for
 > the rest of each trial — no 1-ply drop), which this 5-column table can't show; see
@@ -1429,9 +1431,12 @@ into it.
 | Level | n_trials | trunc_depth | decision_ply | late_ply | late_threshold | ultra_late | prefilter |
 |-------|----------|-------------|-------------|----------|----------------|------------|-----------|
 | 1T (XG Roller) | 72 | 5 | 1 | -1 | 20 | 2 | 0 (off) |
-| 2T (XG Roller+) | 360 | 7 | 2 | 1 | 2 | 2 | 0.15 |
+| 2T (XG Roller+) | 360 | 7 | 2 | 1 | 1 | 9999 | 0.15 |
 | 3T (XG Roller++) | 360 | 7 | 3 | 2 | 2 | 9999 | 0.15 |
 | R (Full Rollout) | 1,296 | 0 | 1 | -1 | 20 | 9999 | 0.15 |
+
+(2T also pins cube at 2-ply early **and** late and uses a 2-ply truncation eval
+(`truncation_ply=2`) — neither is shown as a column above.)
 
 These per-level defaults are defined in one place — the `BgBotAnalyzer.__init__`
 dispatch in [python/bgsage/analyzer.py](python/bgsage/analyzer.py), in the
