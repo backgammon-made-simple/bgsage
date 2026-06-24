@@ -56,6 +56,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -105,6 +106,23 @@ _STAGE3_FILE = _BUILD_SUBDIR / "stage3_rollout.jsonl"  # rollouts, keyed by deci
 _XG_DIR = _DATA_DIR / "xg"                        # XG-import .txt transcripts
 _SCORES_DIR = _DATA_DIR / "scores"                # per-bot scoring caches
 DEFAULT_DATASET = _DATA_DIR / "benchmark.json"
+
+
+def _read_dataset(dataset_path) -> dict:
+    """Load the assembled benchmark, transparently reading a gzip ``.gz`` sibling.
+
+    The full ``benchmark.json`` is ~100 MB (over GitHub's 100 MB file-size limit), so
+    the repo ships ``benchmark.json.gz`` instead. A local uncompressed ``benchmark.json``
+    (e.g. freshly rebuilt) is preferred when present; otherwise the ``.gz`` is read -- so
+    a fresh clone can score a bot against the saved dataset with no rebuild.
+    """
+    p = Path(dataset_path)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    gz = Path(f"{p}.gz")
+    if gz.exists():
+        return json.loads(gzip.decompress(gz.read_bytes()).decode("utf-8"))
+    raise FileNotFoundError(f"Benchmark dataset not found: {p} (or {gz})")
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +949,10 @@ def _assemble_dataset(unique: dict[str, dict], dataset_path: Path, n_games: int,
     tmp = dataset_path.with_suffix(dataset_path.suffix + ".tmp")
     tmp.write_text(json.dumps({"meta": meta, "decisions": decisions}), encoding="utf-8")
     tmp.replace(dataset_path)
-    _log(f"Wrote {len(decisions)} positions ({n_decisions} decisions) to {dataset_path}")
+    # Also emit a gzip sibling: the full JSON exceeds GitHub's 100 MB file limit, so the
+    # repo ships benchmark.json.gz (read transparently by _read_dataset on a fresh clone).
+    Path(f"{dataset_path}.gz").write_bytes(gzip.compress(dataset_path.read_bytes(), compresslevel=9))
+    _log(f"Wrote {len(decisions)} positions ({n_decisions} decisions) to {dataset_path} (+ .gz)")
     _log(f"  checker={n_checker}  cube: {n_cube_decisions} decisions "
          f"(double={n_double}, take={n_take}) over {n_cube_entries} positions  tiers={tier_counts}")
     return meta
@@ -1336,7 +1357,7 @@ def benchmark_pr(
         and ``by_game_plan`` (per-plan PR over checker + cube decisions combined).
     """
     dataset_path = Path(dataset_path)
-    data = json.loads(dataset_path.read_text(encoding="utf-8"))
+    data = _read_dataset(dataset_path)
     all_entries = data["decisions"]
     if max_seed is not None:
         n_all = len(all_entries)

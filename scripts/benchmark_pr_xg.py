@@ -168,8 +168,7 @@ def benchmark_pr(xg_dir: Path | str = _XG_DIR,
     ``unmatched`` / ``n_games`` coverage counts.
     """
     xg_dir = Path(xg_dir)
-    refined_by_key = {d["key"]: d for d in
-                      json.loads(Path(dataset_path).read_text(encoding="utf-8"))["decisions"]}
+    refined_by_key = {d["key"]: d for d in bm._read_dataset(dataset_path)["decisions"]}
 
     seeds = _seeds_with_xg(xg_dir)
     if max_seed is not None:
