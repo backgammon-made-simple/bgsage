@@ -36,7 +36,7 @@ For XG results, we manually ran XG's Batch Analyze on the 500 individual game fi
 
 #### Rollout PR Results
 
-There were 17,535 decisions total. 9,237 were re-evaluated at 3T. 5,944 positions were rolled out. Some rollouts were very quick, while the slowest took well over an hour to roll out on a machine with 16 cores.
+There were 17,535 decisions across 16,889 positions. Of the 16,889 positions, 7,652 were settled at 3-ply; the other 9,237 were re-evaluated at 3T, of which 3,260 settled there and 5,977 were rolled out. Some rollouts were very quick, while the slowest took well over an hour to roll out on a machine with 16 cores.
 
 | Bot | PR | Checker PR | Cube PR| Pure Race | Racing | Attacking | Priming | Anchoring |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
