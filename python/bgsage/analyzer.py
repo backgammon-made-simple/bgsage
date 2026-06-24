@@ -146,6 +146,36 @@ class _CubelessBase:
         return survivors, survivor_set
 
     @staticmethod
+    def _force_include(
+        scored_pool: list,
+        survivors: list,
+        survivor_set: set,
+        force_boards,
+    ) -> None:
+        """Force caller-specified post-move boards into the deep-eval survivor
+        set so they are always evaluated at the full (N-ply / rollout) level,
+        even when the move filter would otherwise drop them.
+
+        Used by the app's expert re-evaluation to guarantee the move a player
+        actually made is scored at the expert level — i.e. apples-to-apples with
+        the best move, instead of carrying only its cheap 1-ply filter equity.
+
+        ``scored_pool`` is the list of ``(cf_eq, cl_eq, board, probs)`` tuples
+        from which survivors are drawn (the 1-ply scored list, or the 2-ply
+        rescored list for the rollout prefilter path). Boards not present in the
+        pool (already a survivor, or not a legal candidate) are skipped. Mutates
+        ``survivors`` / ``survivor_set`` in place.
+        """
+        if not force_boards:
+            return
+        force_set = {tuple(b) for b in force_boards}
+        for item in scored_pool:
+            tb = tuple(item[2])
+            if tb in force_set and tb not in survivor_set:
+                survivors.append(item)
+                survivor_set.add(tb)
+
+    @staticmethod
     def _promote_second_best(results: list, board: list[int], evaluate_fn) -> None:
         results.sort(key=lambda x: -x["equity"])
         while len(results) >= 2 and results[1].get("is_1ply_only"):
@@ -192,7 +222,12 @@ class _OnePlyAnalyzer(_CubelessBase):
         self, board, die1, die2, cube_value=1, cube_owner="centered",
         progress_callback=None,
         away1=0, away2=0, is_crawford=False, jacoby=True, beaver=True,
+        force_boards=None,
     ) -> list[dict]:
+        # ``force_boards`` is a no-op at 1-ply: every candidate is already
+        # evaluated at the full level, so there's nothing to force into a
+        # filtered deep-eval set. Accepted for call-signature symmetry.
+        del force_boards
         candidates = bgbot_cpp.possible_moves(board, die1, die2)
         if not candidates:
             return []
@@ -255,6 +290,7 @@ class _MultiPlyAnalyzer(_CubelessBase):
         self, board, die1, die2, cube_value=1, cube_owner="centered",
         progress_callback=None,
         away1=0, away2=0, is_crawford=False, jacoby=True, beaver=True,
+        force_boards=None,
     ) -> list[dict]:
         candidates = bgbot_cpp.possible_moves(board, die1, die2)
         if not candidates:
@@ -268,6 +304,10 @@ class _MultiPlyAnalyzer(_CubelessBase):
         survivors, survivor_set = self._filter_candidates(
             scored_1ply, self.FILTER_THRESHOLD, self.FILTER_MAX_MOVES
         )
+        # Force-include caller-specified boards (e.g. the move actually played
+        # in an expert re-eval) so they're evaluated at N-ply even when the
+        # filter dropped them.
+        self._force_include(scored_1ply, survivors, survivor_set, force_boards)
 
         results = []
         for feq, cleq, b, p0 in survivors:
@@ -444,6 +484,7 @@ class _RolloutAnalyzer(_CubelessBase):
         self, board, die1, die2, cube_value=1, cube_owner="centered",
         progress_callback=None,
         away1=0, away2=0, is_crawford=False, jacoby=True, beaver=True,
+        force_boards=None,
     ) -> list[dict]:
         candidates = bgbot_cpp.possible_moves(board, die1, die2)
         if not candidates:
@@ -498,6 +539,11 @@ class _RolloutAnalyzer(_CubelessBase):
                     survivor_set.add(tuple(item[2]))
                     if len(survivors) >= 2:
                         break
+        # Force-include caller-specified boards (e.g. the move actually played
+        # in an expert re-eval) so they're rolled out even when the filter
+        # dropped them. Pulls from the same pool survivors are drawn from so the
+        # forced entry is rolled out (not left at its 2-ply / 1-ply fallback).
+        self._force_include(fallback_pool, survivors, survivor_set, force_boards)
         self._check_cancel()
 
         n_trials = self._rollout_config["n_trials"]
@@ -697,6 +743,7 @@ class _CubefulAnalyzer:
         self, board, die1, die2, cube_value=1, cube_owner="centered",
         progress_callback=None,
         away1=0, away2=0, is_crawford=False, jacoby=True, beaver=True,
+        force_boards=None,
     ) -> list[dict]:
         owner = resolve_owner(cube_owner)
         inner = self._inner
@@ -705,6 +752,7 @@ class _CubefulAnalyzer:
         results = inner.checker_play_analytics(
             board, die1, die2, cube_value, cube_owner, progress_callback,
             away1=away1, away2=away2, is_crawford=is_crawford, jacoby=jacoby,
+            force_boards=force_boards,
         )
         if not results:
             return results
@@ -1230,6 +1278,7 @@ class BgBotAnalyzer:
         is_crawford: bool = False,
         jacoby: bool = True,
         beaver: bool = True,
+        force_boards: list[list[int]] | None = None,
     ) -> CheckerPlayResult:
         """Analyze all legal moves for a checker play decision.
 
@@ -1252,6 +1301,11 @@ class BgBotAnalyzer:
                 centered (money games only). Auto-disabled for match play.
             beaver: If True, opponent can beaver after being doubled
                 (money games only). Auto-disabled for match play.
+            force_boards: Optional list of post-move boards (mover's
+                perspective) to always evaluate at the full level, bypassing
+                the move filter. Boards that aren't legal candidates are
+                ignored. Used by the app's expert re-evaluation so the move a
+                player actually made is always scored at the expert level.
         """
         if away1 > 0 or away2 > 0:
             jacoby = False
@@ -1259,7 +1313,7 @@ class BgBotAnalyzer:
         raw = self._analyzer.checker_play_analytics(
             board, die1, die2, cube_value, cube_owner, progress_callback,
             away1=away1, away2=away2, is_crawford=is_crawford, jacoby=jacoby,
-            beaver=beaver,
+            beaver=beaver, force_boards=force_boards,
         )
         moves = [_dict_to_move_analysis(d, include_game_plans) for d in raw]
         eval_level = moves[0].eval_level if moves else self._eval_level
