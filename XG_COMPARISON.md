@@ -13,10 +13,11 @@ Our goal was to compare Open Sage evaluations against XG evaluations at a compar
 * Sage 3P vs XG 3-ply. Both are algorithms that look forward three plies (turns) and average the results over those possible futures. At the end of each path both do a 1-ply calculation - that is, the raw neural network output.
 * Sage 4P vs XG 4-ply. Four-ply lookahead.
 
-We looked at two approaches:
+We looked at three approaches:
 
 * Rollout PR: we simulated money games and match play over many games, rolled out the closest decisions, and scored bot decisions against these rolled out results, and ended up with a Performance Rating (PR) against the rollout truth. We store these benchmark decision results. Then we run each decision by a candidate bot and ask it to give its decision, and score its result against the benchmark equities.
 * Disputed Positions: we simulated money games and match play over many games and found the subset of positions where Sage 3T and XG Roller ++ differed on their decision. We rolled those out to see which bot got closer to the truth.
+* Real-Match PR Agreement: instead of measuring strength against a rollout truth, we ask a practical question — if you analyze a real match in XG and again in Sage, do the two engines report the same Performance Rating? We re-analyzed hundreds of real tournament matches that had already been analyzed in XG, and compared the per-player PRs the two engines produced.
 
 ## Rollout PR Analysis
 
@@ -321,6 +322,45 @@ on a single workstation; the longest part is the per-position rollout phase
 (~10 min each), and that scales linearly with the number of disputes above
 threshold.
 
+## Match PR Agreement on Real Matches
+
+The two analyses above measure *strength* — how close each engine's decisions are to a rolled-out truth. A third, equally practical question matters to anyone who uses an engine to study their own play: **if you analyze a real match in XG, note your Performance Rating, then analyze the same match in Sage, how close are the two PRs?** A player who has spent years building intuition for what a given PR means in XG should get essentially the same number from Sage.
+
+To test this directly, we took a large set of real tournament matches that had already been analyzed in XG, re-analyzed every one from scratch in Sage, and compared the Performance Rating each engine assigned to each player.
+
+### Evaluation Settings
+
+Each match was re-analyzed in Sage at a **3-ply base**, with an **expert 3T pass** (a 360-path truncated rollout) applied to the decisions where the player's actual move disagreed with the 3-ply best. This mirrors how a strong XG analysis works — a base ply for the clear decisions, escalating to a truncated rollout for the close ones — and the two levels are matched in strength: **Sage 3P ≈ XG 3-ply** and **Sage 3T ≈ XG Roller ++** (the same level pairs compared in the studies above). Each engine then computes a PR per player from its own evaluations and its own decision counting — exactly what a user sees in each app.
+
+### The Matches
+
+The match files come from three 2026 tournaments — **UBC Texas**, **UBC Istanbul**, and **UBC Japan** — all 7-point matches, analyzed in XG and generously provided by **Máté Fehér**.
+
+| Event | Matches |
+|---|---:|
+| UBC Texas 2026 | 100 |
+| UBC Istanbul 2026 | 146 |
+| UBC Japan 2026 | 44 |
+| **Total** | **290** |
+
+That is 290 matches and 580 individual player ratings. (One further match was set aside as a corrupted transcription.)
+
+### Results
+
+For each player in each match we have two Performance Ratings — XG's and Sage's — and their difference. Pooling all 580 player ratings:
+
+| Per-player PR | XG | Sage | **Difference (Sage − XG)** |
+|---|---:|---:|---:|
+| Average | 4.36 | 4.36 | **+0.002** |
+| Standard deviation | 2.08 | 2.10 | **0.37** |
+| 95% range | 1.52 – 9.36 | 1.44 – 9.67 | **−0.76 – +0.74** |
+
+The two engines agree almost exactly. The **average difference is +0.002 PR** — statistically indistinguishable from zero (95% confidence interval ±0.03; *p* = 0.90). The standard deviation of the difference (**0.37**) is small next to the spread in PR itself (**2.08**), so the disagreement on any single rating is minor relative to how much PR naturally varies from player to player and match to match. The two engines' per-player ratings correlate at **r = 0.98**.
+
+In practical terms: a player who analyzes a match in Sage will, in the large majority of cases, see essentially the same Performance Rating that XG would give. As a measure of how well a match was played, the two engines are interchangeable.
+
 ## Conclusion
 
 Open Sage 3T evaluations and XG Roller ++ evaluations are roughly comparable. There is some evidence that Sage 3T is slightly stronger than XG Roller ++, especially in match play, but the differences are small, and the relative strength might just be a bias due to using Sage rollouts instead of XG rollouts.
+
+And on real matches, the two engines assign nearly identical Performance Ratings: across 290 tournament matches, the average difference between a player's Sage PR and XG PR is statistically indistinguishable from zero. Whether the test is strength against a rolled-out truth or simple agreement on how a real game was played, Open Sage and XG land in the same place.
