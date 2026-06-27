@@ -43,7 +43,7 @@ There were 17,535 decisions across 16,889 positions. Of the 16,889 positions, 7,
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Sage 3T | 0.21 | 0.18 | 0.36 | 0.02 | 0.24 | 0.17 | 0.31 | 0.28 |
 | XG Roller ++ | 0.32 | 0.31 | 0.38 | 0.04 | 0.40 | 0.24 | 0.41 | 0.44 |
-| Sage 2T | 0.36 | 0.35 | 0.44 | 0.39 | 0.38 | 0.25 | 0.49 | 0.39 |
+| Sage 2T | 0.26 | 0.23 | 0.44 | 0.02 | 0.32 | 0.21 | 0.39 | 0.30 |
 | XG Roller + | 0.41 | 0.41 | 0.39 | 0.05 | 0.59 | 0.31 | 0.47 | 0.54 |
 | Sage 1T | 0.50 | 0.52 | 0.40 | 0.04 | 0.57 | 0.43 | 0.59 | 0.73 |
 | XG Roller | 0.53 | 0.54 | 0.48 | 0.05 | 0.63 | 0.44 | 0.71 | 0.66 |
@@ -56,7 +56,7 @@ There were 17,535 decisions across 16,889 positions. Of the 16,889 positions, 7,
 
 Sage evaluations are stronger than their equivalent XG evaluations in every case except 3-ply, where XG is slightly stronger, but the two are very close.
 
-### Running the Pipeline
+#### Running the Pipeline
 
 The rollout-PR data set is built entirely by `scripts/benchmark_money.py`, run
 from the `bgsage/` repo root — it resolves its Python path and the compiled
@@ -129,6 +129,56 @@ python scripts/benchmark_pr_xg.py
 
 which reads XG's #1 decision per position and scores it against the same saved
 reference equities, printing the same PR breakdown.
+
+### Match Play
+
+We repeated the Rollout PR experiment in match play, where the score on the board changes the value of every decision. A 5-point match is a good test case: the match score materially affects checker and cube decisions through these relatively short matches, so it exercises the engines' match-equity handling, not just their raw position evaluation.
+
+#### Rollout PR Algorithm
+
+We simulated 130 5-point matches of Sage 3P vs Sage 3P (both sides played by Sage at 3-ply). The match state — each player's away-count and the Crawford flag — is threaded through every evaluation, so all decisions, and the rolled-out "truth", are computed in match-equity (MWC) space against the correct score; cube decisions use the Kazaross-XG2 match equity table. Otherwise the method is identical to the money-game build: a first pass capturing 3-ply analytics for every decision, a second pass re-evaluating at Sage 3T any decision within 0.05 equity of its next-best alternative, and a third pass rolling out (1,296-path batches, 3-ply checker and cube decisions, variance reduction, repeated until the 95% equity band is under 0.005 or 20,736 paths) any decision still within 0.02 equity. The strongest tier reached for each decision is its benchmark truth.
+
+For XG, we manually batch-analyzed the 130 match transcripts (3-ply decisions, upgrading to the listed eval level for disputes) — one `.xg` per match, each containing every game of the match — and scored XG's chosen decision against the same saved reference equities.
+
+#### Rollout PR Results
+
+There were 18,292 decisions across 17,892 positions. Of the 17,892 positions, 7,522 were settled at 3-ply; the other 10,370 were re-evaluated at 3T, of which 3,460 settled there and 6,910 were rolled out.
+
+| Bot | PR | Checker PR | Cube PR| Pure Race | Racing | Attacking | Priming | Anchoring |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sage 3T | 0.19 | 0.16 | 0.40 | 0.01 | 0.17 | 0.18 | 0.25 | 0.26 |
+| XG Roller ++ | 0.35 | 0.35 | 0.41 | 0.08 | 0.44 | 0.32 | 0.33 | 0.45 |
+| Sage 2T | 0.26 | 0.24 | 0.44 | 0.02 | 0.36 | 0.18 | 0.34 | 0.33 |
+| XG Roller + | 0.44 | 0.44 | 0.41 | 0.09 | 0.55 | 0.44 | 0.40 | 0.52 |
+| Sage 1T | 0.49 | 0.49 | 0.52 | 0.05 | 0.57 | 0.44 | 0.57 | 0.63 |
+| XG Roller | 0.51 | 0.51 | 0.54 | 0.09 | 0.64 | 0.50 | 0.51 | 0.62 |
+| Sage 4P | 0.42 | 0.42 | 0.48 | 0.05 | 0.52 | 0.38 | 0.45 | 0.55 |
+| XG 4-ply | 0.46 | 0.45 | 0.56 | 0.09 | 0.60 | 0.44 | 0.42 | 0.56 |
+| Sage 3P | 0.57 | 0.56 | 0.67 | 0.05 | 0.74 | 0.56 | 0.58 | 0.68 |
+| XG 3-ply | 0.54 | 0.53 | 0.61 | 0.09 | 0.69 | 0.53 | 0.52 | 0.65 |
+| Sage 2P | 1.30 | 1.26 | 1.60 | 0.39 | 1.59 | 1.23 | 1.50 | 1.41 |
+| Sage 1P | 2.30 | 2.29 | 2.31 | 0.69 | 2.48 | 2.43 | 2.47 | 2.56 |
+
+As in money play, Sage's evaluations are stronger than the equivalent XG evaluation at every matched level except 3-ply, where the two are within noise (XG 0.54, Sage 0.57). The truncated-rollout levels that most users rely on — 3T and 2T — show Sage's clearest edge.
+
+#### Running the Pipeline
+
+The match data set is built by `scripts/benchmark_match.py`, the match-play twin of `benchmark_money.py`; the match length and number of matches are arguments, and the match state is threaded through every decision. The three passes are the same independently-resumable stages, run locally from a fresh `bgsage` checkout:
+
+```bash
+python scripts/benchmark_match.py build --match-length 5 --n-matches 130 --stages pass1 --workers 6   # simulate + capture 3P; one XG-import .txt per match
+python scripts/benchmark_match.py build --match-length 5 --n-matches 130 --stages pass2 --n-threads 16  # re-evaluate close decisions at 3T
+python scripts/benchmark_match.py build --match-length 5 --n-matches 130 --stages pass3 --n-threads 16  # roll out the closest decisions
+```
+
+The assembled benchmark is written to `data/match_benchmark/5pt/benchmark.json` (shipped as `benchmark.json.gz`). Score a bot, or XG, exactly as in the money case:
+
+```bash
+python scripts/benchmark_match.py score --match-length 5 --level truncated3   # Sage 3T
+python scripts/benchmark_pr_xg_match.py --match-length 5                       # XG, from batch-analyzed .xg files
+```
+
+As with the money build, pass 3 is by far the longest stage and fully resumable; the hardest back-game and long-race positions take well over an hour each.
 
 ## Disputed Position Analysis
 
@@ -361,6 +411,6 @@ In practical terms: a player who analyzes a match in Sage will, in the large maj
 
 ## Conclusion
 
-Open Sage 3T evaluations and XG Roller ++ evaluations are roughly comparable. There is some evidence that Sage 3T is slightly stronger than XG Roller ++, especially in match play, but the differences are small, and the relative strength might just be a bias due to using Sage rollouts instead of XG rollouts.
+Open Sage and XG are close at every matched evaluation level. In the Rollout PR study — now run for both money play and 5-point match play — Sage's evaluations score at least as well as the equivalent XG evaluation at every level except 3-ply, where the two are within noise. Sage's edge is clearest at the truncated-rollout levels (3T and 2T) and holds in both money and match play, and the Disputed Positions study — which rolls out only the positions where the two engines actually disagree — points the same way. The differences are small, and some of the apparent edge may be bias from using Sage rollouts instead of XG rollouts as the truth.
 
 And on real matches, the two engines assign nearly identical Performance Ratings: across 290 tournament matches, the average difference between a player's Sage PR and XG PR is statistically indistinguishable from zero. Whether the test is strength against a rolled-out truth or simple agreement on how a real game was played, Open Sage and XG land in the same place.
