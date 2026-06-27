@@ -1362,9 +1362,17 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         // Skip VR at move 0 (stratified) and at ultra-late moves that aren't
         // multiples of 2 (thinned VR). Compute VR at moves 1,2,4,6 only (skip 3,5).
         // Since E[luck] = 0, skipping moves doesn't bias the estimate, just increases
-        // variance slightly.
+        // variance — but that increase is only NEGLIGIBLE when the trial count is
+        // high. At low trial counts (e.g. 1T's 72-path truncated rollouts) the extra
+        // variance dominates the estimate; because PR is one-sided (error >= 0),
+        // higher variance directly INFLATES the measured error (most visibly in match
+        // play, where decisions are sharper). So only thin VR when there are enough
+        // trials for the "negligible variance" assumption to actually hold. (2T/3T
+        // and full rollouts use ultra_late_threshold=9999 and never reach this path.)
+        constexpr int kVrThinningMinTrials = 288;
         bool skip_vr_this_move = (move_num == 0 && config_.n_trials % 36 == 0)
-                               || (move_num >= ultra_late_threshold && (move_num % 2 == 1));
+                               || (move_num >= ultra_late_threshold && (move_num % 2 == 1)
+                                   && config_.n_trials >= kVrThinningMinTrials);
         bool do_vr = vr_enabled && !skip_vr_this_move;
 
         ROLLOUT_TIMER_START;
@@ -2736,6 +2744,41 @@ RolloutStrategy::CubefulPositionResult RolloutStrategy::cubeful_rollout_position
     // SP's cubeful equity is -opp_optimal (perspective flip); cubeless probs
     // come from the same trials, inverted to SP's perspective.
 
+    // Terminal short-circuit: if the post-move board is already decided (the
+    // just-moved player has borne off all 15 checkers), the game is over and the
+    // cube is irrelevant. Mirror the N-ply engine (cube_eval.cpp ~486), which
+    // checks check_game_over at the top of the recursion. Without this guard the
+    // code below flips to the opponent and "plays out" the already-decided game,
+    // so a WON post-move board is scored as -1.0 (the loser bears its checkers off
+    // and "wins" the game back) — a 2.0-equity blunder concentrated in race/bearoff
+    // endings. post_move_board is in SP's perspective and terminal_probs /
+    // cubeless_equity are SP-relative, so NO inversion is needed here.
+    {
+        GameResult gr_term = check_game_over(post_move_board);
+        if (gr_term != GameResult::NOT_OVER) {
+            auto t_probs = terminal_probs(gr_term);
+            CubefulPositionResult tr;
+            if (cube.is_money()) {
+                tr.cubeful_equity = cube.jacoby_active()
+                    ? (2.0 * static_cast<double>(t_probs[0]) - 1.0)
+                    : static_cast<double>(cubeless_equity(t_probs));
+            } else {
+                float mwc = cubeless_mwc(t_probs, cube.match.away1, cube.match.away2,
+                                         cube.cube_value, cube.match.is_crawford);
+                tr.cubeful_equity = static_cast<double>(
+                    mwc2eq(mwc, cube.match.away1, cube.match.away2,
+                           cube.cube_value, cube.match.is_crawford));
+            }
+            tr.cubeful_se = 0.0;
+            tr.cubeless.mean_probs = t_probs;
+            tr.cubeless.equity = static_cast<double>(cubeless_equity(t_probs));
+            tr.cubeless.std_error = 0.0;
+            tr.cubeless.scalar_vr_equity = tr.cubeless.equity;
+            tr.cubeless.scalar_vr_se = 0.0;
+            return tr;
+        }
+    }
+
     // Flip board and cube to opp's perspective. Cube ownership flips because
     // "owner" is relative to the player on roll; in match play the away-score
     // pair also swaps.
@@ -2873,6 +2916,18 @@ RolloutResult RolloutStrategy::rollout_position(
     const Board& board,
     RolloutProgressCallback progress) const
 {
+    // Terminal short-circuit (cubeless analog of the guard in
+    // cubeful_rollout_position): an already-decided board has exact terminal
+    // probs. Without this the trial loop plays out an already-lost game from the
+    // wrong perspective. Probs are SP-relative; no inversion needed.
+    GameResult gr_term = check_game_over(board);
+    if (gr_term != GameResult::NOT_OVER) {
+        RolloutResult tr;
+        tr.mean_probs = terminal_probs(gr_term);
+        tr.equity = static_cast<double>(cubeless_equity(tr.mean_probs));
+        tr.scalar_vr_equity = tr.equity;
+        return tr;
+    }
     rollout_profile::reset();
     auto result = run_trials_parallel(board, std::move(progress));
     rollout_profile::print();
