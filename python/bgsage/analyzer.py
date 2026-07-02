@@ -25,9 +25,11 @@ from typing import Any
 
 import bgbot_cpp
 
+from .luck import roll_luck as _roll_luck
 from .types import (
     CheckerPlayResult,
     CubeActionResult,
+    LuckResult,
     MoveAnalysis,
     PostMoveAnalysis,
     Probabilities,
@@ -1559,6 +1561,39 @@ class BgBotAnalyzer:
             equity_dt_se=raw.get("equity_dt_se"),
             details=raw.get("details"),
         )
+
+    def roll_luck(
+        self,
+        board: list[int],
+        die1: int,
+        die2: int,
+        *,
+        cube_value: int = 1,
+        cube_owner: str = "centered",
+        away1: int = 0,
+        away2: int = 0,
+        is_crawford: bool = False,
+        jacoby: bool = True,
+        beaver: bool = True,
+        is_opening_roll: bool = False,
+    ) -> LuckResult | None:
+        """Compute how lucky ``(die1, die2)`` was from ``board``.
+
+        Convenience wrapper: runs the cube analysis this analyzer's eval level
+        implies (with per-roll details) and computes luck from it. Callers that
+        already hold a ``cube_action(incl_2ply_details=True)`` result should call
+        :func:`bgsage.roll_luck` on it directly to avoid a second evaluation.
+
+        ``is_opening_roll=True`` excludes doubles (an opening roll has 15 rolls,
+        not 21). Returns ``None`` on a degenerate position. See
+        :func:`bgsage.luck.roll_luck` for the meaning of the result.
+        """
+        cube = self.cube_action(
+            board, cube_value, cube_owner,
+            away1=away1, away2=away2, is_crawford=is_crawford,
+            jacoby=jacoby, beaver=beaver, incl_2ply_details=True,
+        )
+        return _roll_luck(cube, die1, die2, is_opening_roll=is_opening_roll)
 
 
 def create_analyzer(

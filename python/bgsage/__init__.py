@@ -41,6 +41,8 @@ from .types import (
     Probabilities,
 )
 from .gnubg import GnuBgAnalyzer
+from .luck import luck_from_equities, roll_luck
+from .types import LuckResult, RollEquity
 from .weights import MODELS, PRODUCTION_MODEL, WeightConfig, WeightConfigPair, default_weights
 
 # Re-export TrialEvalConfig from the C++ bindings for convenient access
@@ -72,6 +74,10 @@ __all__ = [
     "GamePlanResult",
     "GameStats",
     "MatchInfo",
+    "LuckResult",
+    "RollEquity",
+    "luck_from_equities",
+    "roll_luck",
     "PositionEval",
     "STARTING_BOARD",
     "flip_board",

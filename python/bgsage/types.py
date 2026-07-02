@@ -140,6 +140,40 @@ class CubeActionResult:
 
 
 @dataclass
+class RollEquity:
+    """Equity of one dice roll's best checker play, an input to luck.
+
+    ``equity`` is the cubeful equity after the best play for this roll, from the
+    perspective of the player on roll. ``weight`` is 1 for doubles and 2 for
+    non-doubles (each non-double roll happens two ways among the 36 dice
+    combinations), so a weighted average over all rolls is the expected equity.
+    """
+
+    die1: int
+    die2: int
+    equity: float
+    weight: int
+
+
+@dataclass
+class LuckResult:
+    """How lucky an actual roll was, in equity units, from the roller's view.
+
+    ``luck = actual_equity - average_equity``: the equity of the best play with
+    the roll that happened, minus the weight-averaged equity over every possible
+    roll from the same position. Positive means the roll was lucky (it beats an
+    average roll), negative means unlucky; over many rolls luck averages to zero.
+    """
+
+    luck: float
+    actual_equity: float        # Equity of the best play with the roll that happened
+    average_equity: float       # Weight-averaged equity over all possible rolls
+    ply: int                    # Effective ply of the per-roll equities
+    level_label: str            # Human label for ``ply`` (e.g. "2-ply")
+    per_roll: list[RollEquity]  # Rolls considered (doubles excluded for an opening roll)
+
+
+@dataclass
 class PostMoveAnalysis:
     """Result of evaluating a post-move position (right before the opponent's turn).
 

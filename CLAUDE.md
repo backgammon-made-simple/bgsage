@@ -470,6 +470,73 @@ Match play gammonless take points, dead cube take points, and gammon prices.
 All take points are gammonless (assume zero gammon/backgammon probability). For money
 games: take point = 0.22, dead cube take point = 0.25, gammon price = 0.5 (both players).
 
+### 7. Luck (Per-Roll Dice Fortune)
+
+Given a position's cube analytics and the roll that actually happened, return how
+lucky that roll was — a signed equity number.
+
+**What the luck value means.** Luck is measured in **equity units, from the
+perspective of the player who rolled**:
+
+```
+luck = actual_equity - average_equity
+```
+
+- `actual_equity` — cubeful equity after the *best play* with the roll that
+  actually happened.
+- `average_equity` — the weight-averaged equity over *all* possible rolls from
+  the same position (doubles weight 1, non-doubles weight 2; ÷36).
+
+So luck answers "how much did this roll help versus a typical roll here?"
+**Positive = lucky** (the roll's best play beats an average roll), **negative =
+unlucky**. Because it is a deviation from the mean, luck **averages to zero over
+many rolls** — summing per-roll luck across a game isolates dice fortune from
+decision quality (a player with high total luck won the dice, not necessarily the
+game). This is the app-facing per-roll Luck shown in PR breakdowns; it is
+distinct from **VR** (variance-reduction luck used internally to denoise
+rollouts — see the Rollout section).
+
+**This is a pure function over analytics, not a fresh evaluation.** The per-roll
+equities are exactly the **ND (No Double) per-roll cubeful equities** that
+`cube_action(incl_2ply_details=True)` already returns in `details["nd"]`. Luck
+runs **no additional neural-net evaluation** — pass in analytics you already
+have. Cube legality is irrelevant: the ND per-roll details exist whether or not
+the player owns the cube.
+
+**Python** — `python/bgsage/luck.py` (both importable from `bgsage`):
+
+```python
+from bgsage import BgBotAnalyzer, roll_luck
+
+analyzer = BgBotAnalyzer(eval_level="3ply")
+
+# Preferred: reuse analytics you already computed (no extra evaluation).
+cube = analyzer.cube_action(board, cube_value=1, cube_owner="centered",
+                            incl_2ply_details=True)          # the "bot analytics"
+luck = roll_luck(cube, die1=3, die2=1)
+# luck: LuckResult | None
+#   .luck, .actual_equity, .average_equity, .ply, .level_label, .per_roll
+print(f"{luck.luck:+.3f}  ({luck.level_label})")
+
+# One-shot convenience (runs the cube analysis for you, then computes luck):
+luck = analyzer.roll_luck(board, 3, 1)
+
+# Opening roll excludes doubles (15 rolls, not 21):
+luck = analyzer.roll_luck(STARTING_BOARD, 3, 1, is_opening_roll=True)
+```
+
+| Function | Description |
+|----------|-------------|
+| `roll_luck(cube, die1, die2, *, ply=None, level_label=None, is_opening_roll=False)` | Luck from a `CubeActionResult` produced with `incl_2ply_details=True`. `ply`/`level_label` default to being derived from `cube.eval_level` (an N-ply cube analysis gives (N-1)-ply luck). Returns `LuckResult` or `None`. |
+| `luck_from_equities(per_roll, die1, die2, *, ply, level_label, is_opening_roll=False)` | Pure kernel over a sequence of `RollEquity`. Use when the per-roll equities come from somewhere other than `cube_action` (e.g. `batch_checker_play` best-move equities). |
+| `BgBotAnalyzer.roll_luck(board, die1, die2, *, cube_value, cube_owner, away1, away2, is_crawford, jacoby, beaver, is_opening_roll=False)` | Convenience: runs `cube_action(incl_2ply_details=True)` at the analyzer's eval level, then computes luck. Prefer the free `roll_luck` when you already hold the cube analytics. |
+
+**Match play** flows through the same `away1`/`away2`/`is_crawford` cube analysis,
+so luck is expressed in match-equity-derived cubeful units automatically.
+
+**Degenerate positions** (the actual roll missing from the details, or no details
+present) return `None` — the caller decides how to record "no luck computed".
+
 ### Model Selection
 
 All interfaces default to the production model. To use a specific model:
@@ -500,6 +567,8 @@ results = batch_post_move_evaluate(positions, eval_level="1ply", weights=weights
 | `CubeActionResult` | `cube_action()` | `.equity_nd/dt/dp`, `.should_double`, `.should_take`, `.optimal_action`, `.probs`, `.details` (optional dict with `"nd"`/`"dt"` keys, with `incl_2ply_details`) |
 | `PositionEval` | `batch_evaluate()` | `.probs`, `.cubeless_equity`, `.cubeful_equity`, `.equity_nd/dt/dp`, `.optimal_action` |
 | `GamePlanResult` | `classify_game_plans()` | `.player`, `.opponent` |
+| `LuckResult` | `roll_luck()`, `luck_from_equities()`, `BgBotAnalyzer.roll_luck()` | `.luck`, `.actual_equity`, `.average_equity`, `.ply`, `.level_label`, `.per_roll` (list[RollEquity]) |
+| `RollEquity` | In LuckResult; input to `luck_from_equities()` | `.die1`, `.die2`, `.equity`, `.weight` (1 for doubles, 2 otherwise) |
 | `Probabilities` | In all analysis types | `.win`, `.gammon_win`, `.backgammon_win`, `.gammon_loss`, `.backgammon_loss`, `.equity` |
 
 ## Bearoff Database
@@ -1910,7 +1979,8 @@ data noise becomes the limiting factor for further improvement.
 - **TD(0)**: Temporal Difference learning (no eligibility trace)
 - **gpw**: Game plan weight — gradient multiplier for matching positions in SL
 - **TINY filter**: Default move filter (5 moves, 0.08 threshold)
-- **VR**: Variance Reduction — luck-tracking for rollout noise reduction (always 1-ply, decoupled from decision ply)
+- **VR**: Variance Reduction — luck-tracking for rollout noise reduction (always 1-ply, decoupled from decision ply). Internal to rollouts; distinct from the app-facing per-roll **Luck** metric.
+- **Luck** (per-roll): How lucky an actual roll was, in equity units — `actual_equity - average_equity` from the roller's perspective (see Interfaces §7 Luck). Positive = lucky, averages to zero over many rolls. Not the same as VR.
 - **BMI**: Best Move Index — the core function that selects the best move from legal candidates (1-ply score + filter + N-ply rescore)
 - **Move0Cache/Move1Cache**: Pre-computed move decisions for the first/second half-moves of a rollout trial, shared across all trials
 - **SharedPosCache**: Lock-free cross-thread N-ply position evaluation cache for rollout trials
