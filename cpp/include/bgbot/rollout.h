@@ -68,7 +68,8 @@ struct RolloutConfig {
     // cubeful equity for that branch's cube. With multiple branches
     // (cubeful_cube_decision: ND + DT), the ND branch's cube state currently
     // drives selection and all branches share the chosen move — see
-    // CUBEFUL_TRIALS_PLAN.md §6 for the future per-branch-board extension.
+    // ROLLOUT.md "Cube-Aware Selection"; per-branch trial boards are a
+    // possible future extension.
     bool cubeful_trial_moves = true;
 
     // When cubeful_trial_moves is on, stop using cube-aware selection at

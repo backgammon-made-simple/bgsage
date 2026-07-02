@@ -1501,8 +1501,9 @@ RolloutStrategy::TrialResult RolloutStrategy::run_trial_unified(
         // Single-branch case: chosen move is correctly optimal for that branch.
         // Multi-branch case (cube_decision: ND + DT): branches still share the
         // single trial board, so we use branches[0] (ND) as the selection
-        // driver — Option B approximation pending Option A per-branch boards
-        // (see CUBEFUL_TRIALS_PLAN.md §6). The cubeful-multi BMI call
+        // driver — a shared-board approximation; per-branch trial boards are
+        // a possible future extension (see ROLLOUT.md "Cube-Aware Selection").
+        // The cubeful-multi BMI call
         // computes per-branch best indices internally, but only picks[0] is
         // applied to the shared board for now.
         //
