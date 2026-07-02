@@ -394,8 +394,18 @@ class _RolloutAnalyzer(_CubelessBase):
         prefilter_threshold=0.0,
         target_se=0.0,
         max_batches=50,
+        filter_max_moves=None,
+        filter_threshold=None,
     ):
         super().__init__(weights)
+        # Candidate-selection filter for checker_play_analytics: how many of
+        # the top scored moves get rolled out (the rest keep their filter-stage
+        # equity). Instance attrs shadow the TINY class defaults when a wider
+        # search interval is requested.
+        if filter_max_moves is not None:
+            self.FILTER_MAX_MOVES = int(filter_max_moves)
+        if filter_threshold is not None:
+            self.FILTER_THRESHOLD = float(filter_threshold)
         # Two-stage candidate filter for checker_play_analytics: when
         # prefilter_threshold > 0, stage 1 is a loose 1-ply cull at that
         # threshold (no max_moves cap), stage 2 is the standard TINY filter
@@ -1005,8 +1015,13 @@ class BgBotAnalyzer:
         eval_level: ``'1ply'``, ``'2ply'``, ``'3ply'``, ``'4ply'``,
             ``'truncated1'``, ``'truncated2'``, ``'truncated3'``, or ``'rollout'``.
         cubeful: If True, compute cubeful equities via Janowski.
-        filter_max_moves: Max moves to carry through N-ply/rollout.
-        filter_threshold: Equity threshold for move filter.
+        filter_max_moves: Candidate-selection filter width for
+            ``eval_level='rollout'`` checker play — how many of the top
+            scored moves are rolled out (default 5; the rest keep their
+            filter-stage equity). Ignored by other eval levels.
+        filter_threshold: Equity window for the same filter — candidates
+            more than this far below the best are dropped even within the
+            ``filter_max_moves`` cap (default 0.08).
         parallel_threads: Thread count (0 = auto-detect).
         n_trials: Rollout trial count.
         truncation_depth: Rollout truncation (0 = play to completion).
@@ -1077,12 +1092,19 @@ class BgBotAnalyzer:
             is_full_rollout = (
                 eval_level == "rollout" and truncation_depth == 0
             )
-            if eval_level in ("truncated2", "truncated3") or is_full_rollout:
+            if is_full_rollout:
+                # Keep the loose stage-1 cull comfortably wider than the
+                # final candidate filter so a widened filter_threshold
+                # (wide/gigantic search interval) is never strangled by the
+                # prefilter. The default filter (0.08) yields the historical
+                # 0.15.
+                prefilter_threshold = max(0.15, filter_threshold + 0.05)
+            elif eval_level in ("truncated2", "truncated3"):
                 prefilter_threshold = 0.15
             else:
                 prefilter_threshold = 0.0
         self._prefilter_threshold = float(prefilter_threshold)
-        # Flag-gated cube-aware trial moves (CUBEFUL_TRIALS_PLAN.md). Default
+        # Flag-gated cube-aware trial moves (see ROLLOUT.md). Default
         # False keeps existing rollout behavior. When True, all rollout-based
         # eval levels select trial moves by cubeful equity against the trial's
         # cube state instead of cubeless equity.
@@ -1186,6 +1208,8 @@ class BgBotAnalyzer:
                 prefilter_threshold=self._prefilter_threshold,
                 target_se=target_se,
                 max_batches=max_batches,
+                filter_max_moves=filter_max_moves,
+                filter_threshold=filter_threshold,
             )
         else:
             raise ValueError(f"Unknown eval_level: {eval_level!r}")
