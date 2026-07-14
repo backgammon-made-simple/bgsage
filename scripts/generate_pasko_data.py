@@ -197,12 +197,17 @@ def main():
     t0 = time.time()
     with mp.Pool(args.workers, initializer=_init_worker,
                  initargs=(weight_paths, hidden_sizes, args.plies)) as pool:
-        print('Collecting TRAIN positions...')
-        train = collect(pool, 'train', args.train_target, args.workers,
-                        args.games_per_cycle, exclude=frozenset())
-        print('Collecting BENCHMARK positions (disjoint seeds, excluding train)...')
-        benchmark = collect(pool, 'benchmark', args.benchmark_target, args.workers,
-                            args.games_per_cycle, exclude=train)
+        train = set()
+        if args.train_target > 0:
+            print('Collecting TRAIN positions...')
+            train = collect(pool, 'train', args.train_target, args.workers,
+                            args.games_per_cycle, exclude=frozenset())
+        benchmark = set()
+        if args.benchmark_target > 0:
+            note = 'excluding train' if args.train_target > 0 else 'no train set to exclude'
+            print(f'Collecting BENCHMARK positions (disjoint seeds, {note})...')
+            benchmark = collect(pool, 'benchmark', args.benchmark_target, args.workers,
+                                args.games_per_cycle, exclude=train)
 
     # Deterministic shuffle so the on-disk order isn't correlated with game order.
     rng = random.Random(12345)
@@ -218,8 +223,10 @@ def main():
     bench_list = bench_list[:args.benchmark_target]
 
     print(f'\nWriting to {DATA_DIR}:')
-    write_positions(os.path.join(DATA_DIR, 'pasko-train-data'), train_list)
-    write_positions(os.path.join(DATA_DIR, 'pasko-benchmark-data'), bench_list)
+    if args.train_target > 0:
+        write_positions(os.path.join(DATA_DIR, 'pasko-train-data'), train_list)
+    if args.benchmark_target > 0:
+        write_positions(os.path.join(DATA_DIR, 'pasko-benchmark-data'), bench_list)
     print(f'\nTotal time: {time.time() - t0:.1f}s')
     print('\nNext (roll out via Parallelizor, from the PARENT repo):')
     print('  python scripts/rollout_pasko_positions.py pasko-train-data --workers 200')
