@@ -34,7 +34,11 @@ Roll these out next (from the PARENT repo, via Parallelizor):
 Usage:
   python bgsage/scripts/generate_pasko_data.py
   python bgsage/scripts/generate_pasko_data.py --train-target 90000 --benchmark-target 10000
-  python bgsage/scripts/generate_pasko_data.py --train-target 300 --benchmark-target 80 --workers 8  # quick test
+
+  # Two SEPARATE runs, benchmark kept disjoint from a previously-generated train set:
+  python bgsage/scripts/generate_pasko_data.py --train-target 100000 --benchmark-target 0
+  python bgsage/scripts/generate_pasko_data.py --train-target 0 --benchmark-target 20000 \
+      --exclude-file pasko-train-data
 """
 
 import os
@@ -168,6 +172,17 @@ def write_positions(filepath, positions):
     print(f'  {os.path.basename(filepath)}: {len(positions):,} positions')
 
 
+def read_position_set(path):
+    """Load a positions file (26 space-separated ints per line) into a set of tuples."""
+    positions = set()
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 26:
+                positions.add(tuple(int(x) for x in parts[:26]))
+    return positions
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate Paskogammon train/benchmark positions via cubeless self-play')
@@ -181,6 +196,11 @@ def main():
                         help='Games per worker per cycle (default: 100)')
     parser.add_argument('--plies', type=int, default=1,
                         help='Self-play move-selection ply (default: 1)')
+    parser.add_argument('--exclude-file', type=str, default=None,
+                        help='Positions file (name in bgsage/data/, or an absolute '
+                             'path) whose positions are excluded from BOTH splits — '
+                             'e.g. exclude an existing train set from a separately-'
+                             'generated benchmark to keep them disjoint.')
     args = parser.parse_args()
 
     from bgsage.weights import WeightConfigPair
@@ -189,6 +209,17 @@ def main():
     weight_paths, hidden_sizes = w.weight_args
 
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Optional exclusion set (e.g. an existing train file to keep a separately
+    # generated benchmark disjoint from it).
+    base_exclude = frozenset()
+    if args.exclude_file:
+        xpath = args.exclude_file
+        if not os.path.isabs(xpath):
+            xpath = os.path.join(DATA_DIR, xpath)
+        base_exclude = frozenset(read_position_set(xpath))
+        print(f'Excluding {len(base_exclude):,} positions loaded from {os.path.basename(xpath)}')
+
     print(f'Model: production stage9 ({len(weight_paths)} NNs), {args.plies}-ply self-play')
     print(f'Targets: train={args.train_target:,}  benchmark={args.benchmark_target:,}')
     print(f'Workers: {args.workers}, games/worker/cycle: {args.games_per_cycle}')
@@ -201,13 +232,14 @@ def main():
         if args.train_target > 0:
             print('Collecting TRAIN positions...')
             train = collect(pool, 'train', args.train_target, args.workers,
-                            args.games_per_cycle, exclude=frozenset())
+                            args.games_per_cycle, exclude=base_exclude)
         benchmark = set()
         if args.benchmark_target > 0:
-            note = 'excluding train' if args.train_target > 0 else 'no train set to exclude'
-            print(f'Collecting BENCHMARK positions (disjoint seeds, {note})...')
+            excl = base_exclude | train  # disjoint from train and the exclude-file
+            print(f'Collecting BENCHMARK positions (disjoint seeds, '
+                  f'excluding {len(excl):,} train/exclude-file positions)...')
             benchmark = collect(pool, 'benchmark', args.benchmark_target, args.workers,
-                                args.games_per_cycle, exclude=train)
+                                args.games_per_cycle, exclude=excl)
 
     # Deterministic shuffle so the on-disk order isn't correlated with game order.
     rng = random.Random(12345)
