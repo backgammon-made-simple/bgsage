@@ -436,6 +436,55 @@ PYBIND11_MODULE(bgbot_cpp, m) {
        py::arg("resume_from") = "",
        py::arg("scenarios") = std::shared_ptr<ScenarioSet>(nullptr));
 
+    // --- Paskogammon single-NN TD Training (244-input extended contact) ---
+    m.def("td_train_pasko", [](int n_games, float alpha, int n_hidden, float eps,
+                                uint32_t seed, int benchmark_interval,
+                                const std::string& model_name,
+                                const std::string& models_dir,
+                                const std::string& resume_from,
+                                const std::vector<int>& start_board,
+                                const std::vector<std::vector<int>>& bench_boards,
+                                const std::vector<float>& bench_targets) {
+        PaskoTDTrainConfig config;
+        config.n_games = n_games;
+        config.alpha = alpha;
+        config.n_hidden = n_hidden;
+        config.weight_init_eps = eps;
+        config.seed = seed;
+        config.benchmark_interval = benchmark_interval;
+        config.model_name = model_name;
+        config.models_dir = models_dir;
+        config.resume_from = resume_from;
+        config.start_board = list_to_board(start_board);
+
+        if (bench_boards.size() != bench_targets.size()) {
+            throw std::runtime_error(
+                "td_train_pasko: bench_boards and bench_targets size mismatch");
+        }
+        std::vector<EquityBenchmarkEntry> bench;
+        bench.reserve(bench_boards.size());
+        for (size_t i = 0; i < bench_boards.size(); ++i) {
+            bench.push_back({list_to_board(bench_boards[i]), bench_targets[i]});
+        }
+        if (!bench.empty()) config.benchmark = &bench;
+
+        py::gil_scoped_release release;
+        return td_train_pasko(config);
+    }, "Run single-NN (244-input) TD self-play from a fixed start position "
+       "(Paskogammon: positive player always on roll, opening doubles allowed)",
+       py::arg("n_games") = 5000,
+       py::arg("alpha") = 0.1f,
+       py::arg("n_hidden") = 400,
+       py::arg("eps") = 0.1f,
+       py::arg("seed") = 42,
+       py::arg("benchmark_interval") = 10000,
+       py::arg("model_name") = "td_pasko",
+       py::arg("models_dir") = "models",
+       py::arg("resume_from") = "",
+       py::arg("start_board"),
+       py::arg("bench_boards") = std::vector<std::vector<int>>(),
+       py::arg("bench_targets") = std::vector<float>());
+
     // --- Multi-Network TD Training ---
     m.def("td_train_multi", [](int n_games, float alpha,
                                 int n_hidden_contact, int n_hidden_crashed, int n_hidden_race,

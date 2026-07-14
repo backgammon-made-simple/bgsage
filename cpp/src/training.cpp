@@ -1045,4 +1045,181 @@ TDTrainResult td_train_gameplan_pair(const GamePlanPairTDTrainConfig& config)
     return train_result;
 }
 
+// ======================== Paskogammon TD Training (single 244-input NN) ========
+
+// Mean absolute equity error (millipips) of `strat` against a back-game
+// benchmark of (position, target-equity) rows. Each board is evaluated
+// directly (post-move, mover's perspective) to match the rollout target
+// convention in the *-backgame-*-rollout files.
+static double score_equity_benchmark(
+    const NNStrategy& strat,
+    const std::vector<EquityBenchmarkEntry>& bench)
+{
+    if (bench.empty()) return -1.0;
+    double total_err = 0.0;
+    for (const auto& e : bench) {
+        auto probs = strat.evaluate_probs(e.board, false);
+        double eq = NeuralNetwork::compute_equity(probs);
+        total_err += std::abs(eq - static_cast<double>(e.target_equity));
+    }
+    return (total_err / bench.size()) * 1000.0;
+}
+
+TDTrainResult td_train_pasko(const PaskoTDTrainConfig& config)
+{
+    auto t_start = std::chrono::steady_clock::now();
+    std::cout << std::defaultfloat;
+
+    // Extended-contact encoding uses the GNUbg escape lookup tables.
+    init_escape_tables();
+
+    std::cout << "=== Paskogammon TD Training (single 244-input NN) ===" << std::endl;
+    std::cout << "  Hidden:  " << config.n_hidden << ", " << EXTENDED_CONTACT_INPUTS << " inputs" << std::endl;
+    std::cout << "  Alpha:   " << config.alpha << std::endl;
+    std::cout << "  Games:   " << config.n_games << std::endl;
+    std::cout << "  Seed:    " << config.seed << std::endl;
+    if (!config.resume_from.empty())
+        std::cout << "  Resume:  " << config.resume_from << std::endl;
+    std::cout << std::endl;
+
+    auto nn = std::make_shared<NeuralNetwork>(
+        config.n_hidden, EXTENDED_CONTACT_INPUTS, config.weight_init_eps, config.seed);
+
+    if (!config.resume_from.empty()) {
+        if (!nn->load_weights(config.resume_from)) {
+            throw std::runtime_error("Failed to load weights: " + config.resume_from);
+        }
+    }
+
+    NNStrategy strat(nn);
+
+    std::mt19937 rng(config.seed);
+    std::uniform_int_distribution<int> die(1, 6);
+
+    std::string weights_path = config.models_dir + "/" + config.model_name + ".weights";
+    std::string best_path    = weights_path + ".best";
+    std::string history_path = config.models_dir + "/" + config.model_name + ".history.csv";
+
+    double best_bg_score = 1e9;  // lower ER is better
+    TDTrainResult train_result;
+
+    std::vector<Board> candidates;
+    candidates.reserve(32);
+    std::array<float, EXTENDED_CONTACT_INPUTS> flipped_inputs;
+    std::array<float, EXTENDED_CONTACT_INPUTS> post_inputs;
+
+    int interval_singles = 0, interval_gammons = 0, interval_backgammons = 0;
+    int interval_games = 0;
+
+    auto run_benchmark_and_print = [&](int game_idx, bool is_final) {
+        auto t_now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(t_now - t_start).count();
+
+        double bg_score = -1.0;
+        if (config.benchmark != nullptr && !config.benchmark->empty()) {
+            bg_score = score_equity_benchmark(strat, *config.benchmark);
+        }
+
+        train_result.history.push_back({game_idx, bg_score, elapsed});
+
+        std::cout << "Game " << std::setw(7) << game_idx
+                  << std::fixed << std::setprecision(2)
+                  << "  bg=" << bg_score;
+
+        if (interval_games > 0) {
+            std::cout << std::setprecision(1)
+                      << "  out: s=" << (100.0 * interval_singles / interval_games)
+                      << "% g=" << (100.0 * interval_gammons / interval_games)
+                      << "% b=" << (100.0 * interval_backgammons / interval_games) << "%";
+        }
+
+        std::cout << "  time=" << std::setprecision(1) << elapsed << "s";
+        if (is_final) std::cout << "  (final)";
+        std::cout << std::endl;
+
+        interval_singles = interval_gammons = interval_backgammons = interval_games = 0;
+
+        nn->save_weights(weights_path);
+
+        if (bg_score >= 0 && bg_score < best_bg_score && game_idx > 0) {
+            best_bg_score = bg_score;
+            nn->save_weights(best_path);
+            std::cout << "  ** New best (bg=" << std::setprecision(2) << bg_score << ")" << std::endl;
+        }
+
+        save_history_csv(train_result.history, history_path);
+    };
+
+    // ======== Main training loop ========
+    for (int game_idx = 0; game_idx < config.n_games; ++game_idx) {
+
+        if (game_idx % config.benchmark_interval == 0) {
+            run_benchmark_and_print(game_idx, false);
+        }
+
+        // Paskogammon opening: fixed start position, positive player on roll,
+        // doubles allowed on the first roll (no re-roll, no perspective flip).
+        Board board = config.start_board;
+        int d1 = die(rng);
+        int d2 = die(rng);
+
+        bool first_move = true;
+        for (;;) {
+            if (!first_move) {
+                d1 = die(rng);
+                d2 = die(rng);
+            }
+            first_move = false;
+
+            // Step A: pre-roll evaluation from opponent's perspective
+            Board flipped = flip(board);
+            flipped_inputs = compute_extended_contact_inputs(flipped);
+            nn->forward_with_gradients(flipped_inputs.data());
+
+            // Step B: generate moves and pick best
+            possible_boards(board, d1, d2, candidates);
+            if (candidates.size() == 1) {
+                board = candidates[0];
+            } else {
+                int idx = strat.best_move_index(candidates, board);
+                board = candidates[idx];
+            }
+
+            // Step C: check game over and compute TD target
+            GameResult result = check_game_over(board);
+
+            if (result != GameResult::NOT_OVER) {
+                nn->td_update(terminal_targets_flipped(result), config.alpha);
+
+                interval_games++;
+                switch (result) {
+                    case GameResult::WIN_SINGLE:
+                    case GameResult::LOSS_SINGLE:      interval_singles++; break;
+                    case GameResult::WIN_GAMMON:
+                    case GameResult::LOSS_GAMMON:       interval_gammons++; break;
+                    case GameResult::WIN_BACKGAMMON:
+                    case GameResult::LOSS_BACKGAMMON:   interval_backgammons++; break;
+                    default: break;
+                }
+                break;
+            }
+
+            // Non-terminal: evaluate post-move board, flip for TD target
+            post_inputs = compute_extended_contact_inputs(board);
+            auto post_outputs = nn->forward(post_inputs.data());
+            nn->td_update(flip_outputs(post_outputs), config.alpha);
+
+            // Step E: flip for next player
+            board = flip(board);
+        }
+    }
+
+    run_benchmark_and_print(config.n_games, true);
+
+    auto t_end = std::chrono::steady_clock::now();
+    train_result.games_played = config.n_games;
+    train_result.total_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    return train_result;
+}
+
 } // namespace bgbot

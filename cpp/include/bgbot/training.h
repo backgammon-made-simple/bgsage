@@ -44,6 +44,46 @@ struct TDTrainResult {
 // Run TD(0) self-play training with a single 196-input network.
 TDTrainResult td_train(const TDTrainConfig& config);
 
+// One (position, target-equity) row of a back-game equity benchmark. The
+// target is the cubeless post-move equity from the perspective of the player
+// whose checkers are positive (as stored in the *-backgame-*-rollout files).
+struct EquityBenchmarkEntry {
+    Board board;
+    float target_equity;
+};
+
+// Configuration for td_train_pasko(): a single extended-contact network
+// (244 inputs) trained by self-play from an arbitrary fixed start position.
+// Intended for the "Paskogammon" side project — games always start from
+// start_board with the positive player on roll, and the opening roll may be
+// doubles (both differ from standard backgammon). Progress is tracked with a
+// back-game equity benchmark (mean |equity - target| * 1000) rather than the
+// GNUbg .bm best-move benchmarks used by the other trainers.
+struct PaskoTDTrainConfig {
+    int n_games             = 5000;
+    float alpha             = 0.1f;
+    int n_hidden            = 400;
+    float weight_init_eps   = 0.1f;
+    uint32_t seed           = 42;
+    int benchmark_interval  = 10000;
+    std::string model_name  = "td_pasko";
+    std::string models_dir  = "models";
+    std::string resume_from = "";
+
+    // Fixed opening position; positive player is always on roll.
+    Board start_board = STARTING_BOARD;
+
+    // Back-game equity benchmark scored during training. If nullptr/empty, no
+    // benchmarking is done.
+    const std::vector<EquityBenchmarkEntry>* benchmark = nullptr;
+};
+
+// Run TD(0) self-play training with a single 244-input extended-contact
+// network, starting every game from config.start_board (positive player on
+// roll, opening doubles allowed). Saves {model_name}.weights, .weights.best
+// (best benchmark ER), and .history.csv.
+TDTrainResult td_train_pasko(const PaskoTDTrainConfig& config);
+
 // Configuration for multi-network TD training
 struct MultiTDTrainConfig {
     int n_games             = 5000;
