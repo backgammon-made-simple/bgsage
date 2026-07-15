@@ -90,6 +90,8 @@ def main():
     parser.add_argument('--out', default='sl_pasko',
                         help='Output model name in bgsage/models (default: sl_pasko -> sl_pasko.weights[.best])')
     parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--max-steps', type=int, default=0,
+                        help='Cap total SL steps (0 = full schedule; use a small value to smoke-test).')
     args = parser.parse_args()
 
     train_path = os.path.join(DATA_DIR, args.train)
@@ -133,6 +135,10 @@ def main():
     t_start = time.time()
     total_steps = 0
     for phase, n_steps, alpha in SCHEDULE:
+        if args.max_steps:  # smoke-test / early-stop cap
+            if total_steps >= args.max_steps:
+                break
+            n_steps = min(n_steps, args.max_steps - total_steps)
         # Resume each phase from the best weights so far.
         if os.path.exists(best_path):
             shutil.copy2(best_path, wpath)
