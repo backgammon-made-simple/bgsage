@@ -247,6 +247,23 @@ _DA_EQU_DP = 96
 _DA_LEVEL_REQUEST = 100
 _DA_EVAL_DT = 104          # 7 x float32, Double/Take line
 
+# --- additional offsets used when *writing* synthetic games (see build_* below).
+# XG rebuilds every position by replaying the stored moves from each game's start,
+# so all of these must be set or the moves show "Cannot Move".
+_MOVE_POSITION_END = 35    # tsMove: post-move board, mover frame (26 int8)
+_MOVE_PLAYED = 68          # tsMove: the played move XG replays -- 8 int32 = 4 (from,to)
+                           #   pairs in mover-frame XG move codes, from == -1 terminates
+_BM_BOARD = 0              # DataMoves' own copy of the pre-move board, mover frame
+_BM_DIE1 = 28              # DataMoves' own dice + level (XG reads these, not the outer)
+_BM_DIE2 = 32
+_BM_LEVEL = 36
+_HG_POSINIT = 21           # tsHeaderGame: the game's initial position, P1 frame (26 int8)
+_FG_SCORE1 = 12            # tsFooterGame
+_FG_SCORE2 = 16
+_FG_WINNER = 24            # +1 = player1 wins, -1 = player2
+_FG_POINTS = 28
+_FG_TERMINATION = 32       # 0 drop / 1 single / 2 gammon / 3 backgammon; +100 = resign
+
 
 def iter_records(data: bytes | bytearray):
     """Yield ``(offset, record_type)`` for each TSaveRec in a temp.xg stream."""
@@ -389,6 +406,104 @@ def set_cube_timedelay(data: bytearray, off: int, marked: bool = True,
                        done: bool = False) -> None:
     data[off + _CUBE_TIMEDELAY] = 1 if marked else 0
     data[off + _CUBE_TIMEDELAY_DONE] = 1 if done else 0
+
+
+# ---------------------------------------------------------------------------
+# Record construction (writing synthetic games for XG to Batch-Analyze)
+# ---------------------------------------------------------------------------
+# XG stores boards signed by owner (P2 bar cell <= 0, P1/own bar cell >= 0) and
+# numbers points 0..23 with bar=24 / off=-1. bgsage stores both bars as counts
+# and points 1..24 with bar=25 / off=0. The helpers below convert. A record is
+# built by cloning a real one of the same type (`template`, a 2560-byte slice)
+# and overwriting the fields; all analysis fields are cleared so XG re-analyzes.
+
+
+def sign_bars(board) -> list[int]:
+    """bgsage board (bars as +counts) -> XG signed frame (idx0 <= 0, idx25 >= 0)."""
+    b = list(board)
+    b[0] = -abs(b[0])
+    b[25] = abs(b[25])
+    return b
+
+
+def bg_point_to_xg(p: int) -> int:
+    """bgsage point -> XG move code: point-1; bar(25) -> 24; off(0) -> -1."""
+    return -1 if p == 0 else 24 if p == 25 else p - 1
+
+
+def encode_played_move(half_moves) -> list[int]:
+    """``half_moves`` = up to 4 (from, to) pairs in bgsage points (mover frame) ->
+    8 ints for the _MOVE_PLAYED field (XG codes; unused slots are (-1, -1))."""
+    out: list[int] = []
+    for i in range(4):
+        if i < len(half_moves):
+            f, t = half_moves[i]
+            out += [bg_point_to_xg(f), bg_point_to_xg(t)]
+        else:
+            out += [-1, -1]
+    return out
+
+
+def build_move_record(template: bytes, board_mover, post_mover, die1: int, die2: int,
+                      half_moves, actif: int = 1) -> bytes:
+    """A tsMove record playing ``board_mover --(die1,die2)--> post_mover`` (both in
+    the mover's frame), unanalyzed. ``half_moves`` are the per-die (from,to) steps
+    (bgsage points) that reproduce it. ``actif`` = 1 (player-1 on roll) or -1."""
+    raw = board_mover if actif == 1 else flip_board(list(board_mover))
+    rec = bytearray(template)
+    struct.pack_into('<26b', rec, _MOVE_POSITION_I, *sign_bars(raw))          # pre, P1 frame
+    struct.pack_into('<26b', rec, _MOVE_POSITION_END, *sign_bars(post_mover))  # post, mover frame
+    struct.pack_into('<i', rec, _MOVE_ACTIF, actif)
+    struct.pack_into('<8i', rec, _MOVE_PLAYED, *encode_played_move(half_moves))
+    struct.pack_into('<2i', rec, _MOVE_DICE, die1, die2)
+    dm = _MOVE_DATAMOVES
+    struct.pack_into('<26b', rec, dm + _BM_BOARD, *sign_bars(board_mover))    # DataMoves board
+    struct.pack_into('<i', rec, dm + _BM_DIE1, die1)
+    struct.pack_into('<i', rec, dm + _BM_DIE2, die2)
+    struct.pack_into('<i', rec, dm + _BM_LEVEL, -1)
+    struct.pack_into('<i', rec, dm + _BM_NMOVES, 0)                           # unanalyzed
+    struct.pack_into('<i', rec, _MOVE_ANALYZE_M, -1)
+    struct.pack_into('<32i', rec, _MOVE_ROLLOUT_INDEX, *([-1] * 32))
+    struct.pack_into('<8i', rec, _MOVE_ERR_MOVE, *([0] * 8))
+    set_move_timedelay(rec, 0, 0, 0)
+    return bytes(rec)
+
+
+def build_cube_record(template: bytes, board_mover, actif: int = 1) -> bytes:
+    """A tsCube record (no-cube decision) at ``board_mover`` (mover frame), unanalyzed."""
+    raw = board_mover if actif == 1 else flip_board(list(board_mover))
+    rec = bytearray(template)
+    struct.pack_into('<26b', rec, _CUBE_POSITION, *sign_bars(raw))
+    struct.pack_into('<i', rec, _CUBE_ACTIF, actif)
+    struct.pack_into('<i', rec, _CUBE_ANALYZE_C, -1)
+    struct.pack_into('<i', rec, _CUBE_ANALYZE_CR, -1)
+    struct.pack_into('<i', rec, _CUBE_ROLLOUT_INDEX, -1)
+    set_cube_timedelay(rec, 0, marked=False, done=False)
+    return bytes(rec)
+
+
+def build_game_header(template: bytes, posinit_p1frame, game_number: int,
+                      score1: int = 0, score2: int = 0) -> bytes:
+    """A tsHeaderGame with the game's initial position + scores. ``posinit_p1frame``
+    is the start board in P1 frame (bgsage bars-as-counts)."""
+    rec = bytearray(template)
+    struct.pack_into('<i', rec, _GAME_SCORE1, score1)
+    struct.pack_into('<i', rec, _GAME_SCORE2, score2)
+    struct.pack_into('<26b', rec, _HG_POSINIT, *sign_bars(posinit_p1frame))
+    struct.pack_into('<i', rec, _GAME_NUMBER, game_number)
+    return bytes(rec)
+
+
+def build_game_footer(template: bytes, score1: int, score2: int, winner: int,
+                      points: int, termination: int) -> bytes:
+    """A tsFooterGame (game result). ``winner`` +1/-1, ``termination`` per _FG_TERMINATION."""
+    rec = bytearray(template)
+    struct.pack_into('<i', rec, _FG_SCORE1, score1)
+    struct.pack_into('<i', rec, _FG_SCORE2, score2)
+    struct.pack_into('<i', rec, _FG_WINNER, winner)
+    struct.pack_into('<i', rec, _FG_POINTS, points)
+    struct.pack_into('<i', rec, _FG_TERMINATION, termination)
+    return bytes(rec)
 
 
 # --- temp.xgi --------------------------------------------------------------
