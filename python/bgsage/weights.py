@@ -21,6 +21,23 @@ from typing import Any
 # (purerace, racing, attacking, priming, anchoring).
 
 MODELS: dict[str, dict[str, Any]] = {
+    "stage10": {
+        # Blended backgame hybrid (21 NNs): Stage 9's full 19-NN model carried
+        # UNCHANGED (indices 0-18, including sl_s9_player_bg/opponent_bg at
+        # 17/18), plus two extra Paskogammon-trained backgame NNs at 19/20. In a
+        # detected backgame the C++ evaluator runs BOTH backgame NNs and mixes
+        # their probs with a weight on the pasko NN that ramps with the backgame
+        # side's pip count (0.20 below 170 pips -> 0.85 above 230; see the
+        # BACKGAME_BLEND_* constants in neural_net.h). The committee beats both
+        # pure models on both the standard and Paskogammon backgame benchmarks.
+        # Every non-backgame position is byte-identical to Stage 9.
+        "hidden": (100,) + (400,) * 20,   # 19 base + 2 extra backgame NNs = 21
+        "pattern": "sl_s9_{plan}.weights.best",   # all 19 base NNs are Stage 9's
+        "plans": "backgame_pair",
+        "canonical_map": [0,1,2,3,4,5,6,7,8,9,10,12,12,13,14,12,12,17,18],
+        "extra_backgame": ["sl_s10_player_bg.weights.best",
+                           "sl_s10_opponent_bg.weights.best"],
+    },
     "stage9": {
         "hidden": (100,) + (400,) * 18,  # 1 purerace + 18 contact (incl 2 backgame)
         "pattern": "sl_s9_{plan}.weights.best",
@@ -81,6 +98,10 @@ _PAIR_PLANS = (
 
 # 19-NN backgame-aware pair plan names (17 standard + 2 backgame)
 _BACKGAME_PAIR_PLANS = _PAIR_PLANS + ("player_bg", "opponent_bg")
+# Stage 10 pip-routed hybrid: the 19 base NNs plus two extra Paskogammon-trained
+# backgame NNs, used only when the backgame side's pip count is high (see the
+# C++ BackgameAwarePairStrategy pip routing).
+_BACKGAME_PAIR_PLANS_HYBRID = _BACKGAME_PAIR_PLANS + ("player_bg_pasko", "opponent_bg_pasko")
 
 # Bearoff database filename (stored in data/ directory)
 BEAROFF_DB_FILENAME = "bearoff_1sided.db"
@@ -331,7 +352,10 @@ class WeightConfigPair:
     @property
     def plan_names(self) -> tuple[str, ...]:
         """Tuple of plan names matching this config's length."""
-        return _BACKGAME_PAIR_PLANS if len(self.paths) == 19 else _PAIR_PLANS
+        n = len(self.paths)
+        if n == 21:
+            return _BACKGAME_PAIR_PLANS_HYBRID
+        return _BACKGAME_PAIR_PLANS if n == 19 else _PAIR_PLANS
 
     @property
     def weight_paths(self) -> dict[str, str]:
@@ -356,10 +380,17 @@ class WeightConfigPair:
         pattern = cfg["pattern"]
         models_dir = _models_dir()
         canonical_map = cfg.get("canonical_map", list(range(len(plan_names))))
+        overrides = cfg.get("overrides", {})  # plan name -> explicit weight filename
         paths = []
         for i, plan in enumerate(plan_names):
-            canonical_plan = plan_names[canonical_map[i]]
-            paths.append(os.path.join(models_dir, pattern.format(plan=canonical_plan)))
+            if plan in overrides:
+                paths.append(os.path.join(models_dir, overrides[plan]))
+            else:
+                canonical_plan = plan_names[canonical_map[i]]
+                paths.append(os.path.join(models_dir, pattern.format(plan=canonical_plan)))
+        # Pip-routed hybrid models append extra backgame NNs (indices 19, 20).
+        for extra in cfg.get("extra_backgame", []):
+            paths.append(os.path.join(models_dir, extra))
         return cls(paths=paths, hiddens=hidden, strategy_type=plans_type)
 
     def validate(self) -> None:

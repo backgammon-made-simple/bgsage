@@ -2354,16 +2354,20 @@ BackgameAwarePairStrategy::BackgameAwarePairStrategy(
     const std::vector<std::string>& weight_paths,
     const std::vector<int>& hidden_sizes)
 {
-    if (weight_paths.size() != NUM_BACKGAME_PAIR_NNS ||
-        hidden_sizes.size() != NUM_BACKGAME_PAIR_NNS) {
+    const int n = static_cast<int>(weight_paths.size());
+    if ((n != NUM_BACKGAME_PAIR_NNS && n != NUM_BACKGAME_PAIR_NNS_HYBRID) ||
+        static_cast<int>(hidden_sizes.size()) != n) {
         throw std::runtime_error(
-            "BackgameAwarePairStrategy requires exactly " +
-            std::to_string(NUM_BACKGAME_PAIR_NNS) +
-            " weight paths and hidden sizes, got " +
+            "BackgameAwarePairStrategy requires " +
+            std::to_string(NUM_BACKGAME_PAIR_NNS) + " or " +
+            std::to_string(NUM_BACKGAME_PAIR_NNS_HYBRID) +
+            " weight paths and matching hidden sizes, got " +
             std::to_string(weight_paths.size()) + "/" +
             std::to_string(hidden_sizes.size()));
     }
-    for (int i = 0; i < NUM_BACKGAME_PAIR_NNS; ++i) {
+    blended_backgame_ = (n == NUM_BACKGAME_PAIR_NNS_HYBRID);
+    nns_.resize(n);
+    for (int i = 0; i < n; ++i) {
         int n_inputs = (i == 0) ? TESAURO_INPUTS : EXTENDED_CONTACT_INPUTS;
         nns_[i] = std::make_shared<NeuralNetwork>(hidden_sizes[i], n_inputs);
         if (!nns_[i]->load_weights(weight_paths[i]))
@@ -2390,7 +2394,8 @@ int BackgameAwarePairStrategy::select_nn_idx(const Board& board) const {
             for (int pt = 19; pt <= 24; ++pt) {
                 if (board[pt] >= 2) ++anchors;
             }
-            if (anchors >= 2) return 17;  // player backgame NN
+            if (anchors >= 2)
+                return blended_backgame_ ? BLENDED_PLAYER_BG_IDX : 17;
         }
     }
 
@@ -2402,14 +2407,45 @@ int BackgameAwarePairStrategy::select_nn_idx(const Board& board) const {
             for (int pt = 1; pt <= 6; ++pt) {
                 if (board[pt] <= -2) ++opp_anchors;
             }
-            if (opp_anchors >= 2) return 18;  // opponent backgame NN
+            if (opp_anchors >= 2)
+                return blended_backgame_ ? BLENDED_OPPONENT_BG_IDX : 18;
         }
     }
 
     return 1 + game_plan_pair_index(player_gp, opponent_gp);
 }
 
+namespace {
+// Extra-NN weight for the blended backgame eval: ramps linearly with the
+// backgame side's pip count between the LO and HI knots.
+inline float backgame_blend_weight(int bg_pips) {
+    if (bg_pips <= BACKGAME_BLEND_PIP_LO) return BACKGAME_BLEND_W_LO;
+    if (bg_pips >= BACKGAME_BLEND_PIP_HI) return BACKGAME_BLEND_W_HI;
+    return BACKGAME_BLEND_W_LO +
+           (BACKGAME_BLEND_W_HI - BACKGAME_BLEND_W_LO) *
+               static_cast<float>(bg_pips - BACKGAME_BLEND_PIP_LO) /
+               static_cast<float>(BACKGAME_BLEND_PIP_HI - BACKGAME_BLEND_PIP_LO);
+}
+}  // namespace
+
+std::array<float, NN_OUTPUTS> BackgameAwarePairStrategy::blended_backgame_probs(
+    const Board& board, bool player_bg) const
+{
+    auto inputs = compute_extended_contact_inputs(board);
+    auto base = nns_[player_bg ? 17 : 18]->forward(inputs.data());
+    auto extra = nns_[player_bg ? 19 : 20]->forward(inputs.data());
+    auto [player_pips, opp_pips] = pip_counts(board);
+    const float w = backgame_blend_weight(player_bg ? player_pips : opp_pips);
+    std::array<float, NN_OUTPUTS> out;
+    for (int i = 0; i < NN_OUTPUTS; ++i)
+        out[i] = (1.0f - w) * base[i] + w * extra[i];
+    return out;
+}
+
 double BackgameAwarePairStrategy::evaluate_with_nn(const Board& board, int nn_idx) const {
+    if (nn_idx >= NUM_BACKGAME_PAIR_NNS_HYBRID)
+        return NeuralNetwork::compute_equity(
+            blended_backgame_probs(board, nn_idx == BLENDED_PLAYER_BG_IDX));
     const auto& nn = *nns_[nn_idx];
     if (nn_idx == 0) {
         auto inputs = compute_tesauro_inputs(board);
@@ -2425,6 +2461,8 @@ double BackgameAwarePairStrategy::evaluate_with_nn(const Board& board, int nn_id
 std::array<float, NN_OUTPUTS> BackgameAwarePairStrategy::probs_with_nn(
     const Board& board, int nn_idx) const
 {
+    if (nn_idx >= NUM_BACKGAME_PAIR_NNS_HYBRID)
+        return blended_backgame_probs(board, nn_idx == BLENDED_PLAYER_BG_IDX);
     const auto& nn = *nns_[nn_idx];
     if (nn_idx == 0) {
         auto inputs = compute_tesauro_inputs(board);
@@ -2528,6 +2566,11 @@ int BackgameAwarePairStrategy::batch_evaluate_candidates_equity(
     }
 
     int nn_idx = select_nn_idx(pre_move_board);
+    if (nn_idx >= NUM_BACKGAME_PAIR_NNS_HYBRID) {
+        // Blended backgame: candidates cannot share a delta-eval base (each
+        // gets its own pip-ramped mix), so use the plain per-candidate loop.
+        return evaluate_candidates_equity(candidates, pre_move_board, equities);
+    }
     const auto& nn = *nns_[nn_idx];
     const int ni = nn.n_inputs();
     const int nh = nn.n_hidden();
@@ -2606,6 +2649,23 @@ int BackgameAwarePairStrategy::batch_evaluate_candidates_equity_probs(
     }
 
     int nn_idx = select_nn_idx(pre_move_board);
+    if (nn_idx >= NUM_BACKGAME_PAIR_NNS_HYBRID) {
+        // Blended backgame: no shared delta-eval base; plain per-candidate loop.
+        double bv = -1e30;
+        int bi = 0;
+        for (int i = 0; i < n; ++i) {
+            GameResult result = check_game_over(candidates[i]);
+            if (result != GameResult::NOT_OVER) {
+                probs_out[i] = terminal_probs(result);
+                equities[i] = terminal_equity(result);
+            } else {
+                probs_out[i] = probs_with_nn(candidates[i], nn_idx);
+                equities[i] = NeuralNetwork::compute_equity(probs_out[i]);
+            }
+            if (equities[i] > bv) { bv = equities[i]; bi = i; }
+        }
+        return bi;
+    }
     const auto& nn = *nns_[nn_idx];
     const int ni = nn.n_inputs();
     const int nh = nn.n_hidden();
@@ -2690,6 +2750,28 @@ int BackgameAwarePairStrategy::batch_evaluate_candidates_best_prob(
     }
 
     int nn_idx = select_nn_idx(pre_move_board);
+    if (nn_idx >= NUM_BACKGAME_PAIR_NNS_HYBRID) {
+        // Blended backgame: no shared delta-eval base; plain per-candidate loop.
+        double bv = -1e30;
+        int bi = 0;
+        std::array<float, NUM_OUTPUTS> bp{};
+        for (int i = 0; i < n; ++i) {
+            GameResult result = check_game_over(candidates[i]);
+            std::array<float, NUM_OUTPUTS> p;
+            double val;
+            if (result != GameResult::NOT_OVER) {
+                p = terminal_probs(result);
+                val = terminal_equity(result);
+            } else {
+                p = probs_with_nn(candidates[i], nn_idx);
+                val = NeuralNetwork::compute_equity(p);
+            }
+            if (equities) equities[i] = val;
+            if (val > bv) { bv = val; bi = i; bp = p; }
+        }
+        if (best_probs_out) *best_probs_out = bp;
+        return bi;
+    }
     const auto& nn = *nns_[nn_idx];
     const int ni = nn.n_inputs();
     const int nh = nn.n_hidden();

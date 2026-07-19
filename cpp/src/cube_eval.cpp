@@ -251,10 +251,16 @@ void eval_groups_pair(const S& s, const std::vector<Board>& cands,
     thread_local std::vector<float> saved_base, saved_inputs;
 
     nn_idx_of.resize(n);
+    done.assign(n, 0);
     for (int j = 0; j < n; ++j) {
         nn_idx_of[j] = s.nn_index_for(cands[idxs[j]]);
+        if (nn_idx_of[j] >= NUM_BACKGAME_PAIR_NNS_HYBRID) {
+            // Blended backgame sentinel (21-NN hybrid): no shared delta-eval
+            // base, evaluate directly via the strategy's blend-aware probs.
+            out[idxs[j]] = s.probs_with_nn(cands[idxs[j]], nn_idx_of[j]);
+            done[j] = 1;
+        }
     }
-    done.assign(n, 0);
 
     for (int j = 0; j < n; ++j) {
         if (done[j]) continue;

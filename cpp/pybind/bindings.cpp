@@ -5067,40 +5067,12 @@ PYBIND11_MODULE(bgbot_cpp, m) {
            py::arg("board"), py::arg("pre_move_board"))
         .def("select_nn_idx", [](BackgameAwarePairStrategy& self,
                                   const std::vector<int>& board) {
-            // Expose select_nn_idx for testing/verification
-            auto b = list_to_board(board);
-            // Call evaluate_probs to exercise the logic, but we want the index.
-            // Since select_nn_idx is private, we replicate the logic here.
-            GamePlan player_gp = classify_game_plan(b);
-            if (player_gp == GamePlan::PURERACE) return 0;
-            Board flipped = flip(b);
-            GamePlan opponent_gp = classify_game_plan(flipped);
-            if (opponent_gp == GamePlan::PURERACE)
-                opponent_gp = GamePlan::RACING;
-
-            // Player back game check
-            if (player_gp == GamePlan::ANCHORING && opponent_gp == GamePlan::RACING) {
-                auto [pp, op] = pip_counts(b);
-                if (pp > op) {
-                    int anchors = 0;
-                    for (int pt = 19; pt <= 24; ++pt)
-                        if (b[pt] >= 2) ++anchors;
-                    if (anchors >= 2) return 17;
-                }
-            }
-            // Opponent back game check
-            if (player_gp == GamePlan::RACING && opponent_gp == GamePlan::ANCHORING) {
-                auto [pp, op] = pip_counts(b);
-                if (op > pp) {
-                    int opp_anchors = 0;
-                    for (int pt = 1; pt <= 6; ++pt)
-                        if (b[pt] <= -2) ++opp_anchors;
-                    if (opp_anchors >= 2) return 18;
-                }
-            }
-            return 1 + game_plan_pair_index(player_gp, opponent_gp);
-        }, "Return NN index (0-18) for a board position. "
-           "17=player backgame, 18=opponent backgame.",
+            // Delegate to the real routing (public accessor) so this never
+            // drifts from evaluate_*. Returns 0-16 contact, 17/18 backgame; on
+            // 21-NN hybrids, the blend sentinels 21 (player BG) / 22 (opp BG).
+            return self.nn_index_for(list_to_board(board));
+        }, "Return the NN index the strategy uses for a board position "
+           "(17/18 = backgame; 21/22 = blended backgame on hybrid models).",
            py::arg("board"));
 
     // --- Stage 9 scoring ---

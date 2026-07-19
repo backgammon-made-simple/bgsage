@@ -399,6 +399,11 @@ public:
     // evaluation engine's batched candidate kernel to group candidates by NN).
     int nn_index_for(const Board& board) const { return select_nn_idx(board); }
 
+    // Raw-NN probs for a board given an NN index. Public for symmetry with
+    // BackgameAwarePairStrategy so the cubeful engine's templated kernel
+    // compiles against both classes (its blend-sentinel branch is dead here).
+    std::array<float, NN_OUTPUTS> probs_with_nn(const Board& board, int nn_idx) const;
+
 private:
     std::array<std::shared_ptr<NeuralNetwork>, NUM_PAIR_NNS> nns_;
 
@@ -407,7 +412,6 @@ private:
     int select_nn_idx(const Board& board) const;
 
     double evaluate_with_nn(const Board& board, int nn_idx) const;
-    std::array<float, NN_OUTPUTS> probs_with_nn(const Board& board, int nn_idx) const;
     bool is_purerace_nn(int nn_idx) const { return nn_idx == 0; }
 };
 
@@ -423,14 +427,37 @@ private:
 //   player has >= 2 anchors in opponent's home board (points 19-24)
 // - Opponent BG: pair is (racing, anchoring), opponent pips > player pips,
 //   opponent has >= 2 anchors in player's home board (points 1-6)
+//
+// Optional blended hybrid (21 NNs, e.g. Stage 10): two extra backgame NNs at
+// indices 19 (player) and 20 (opponent), trained on Paskogammon backgame
+// rollouts. When 21 NNs are loaded, a detected backgame is evaluated by BOTH
+// backgame NNs and their output probs are mixed with a weight that ramps with
+// the backgame side's pip count:
+//   w = W_LO                          for pips <= PIP_LO
+//   w = W_HI                          for pips >= PIP_HI
+//   linear in between,
+// probs = (1-w)*base(17/18) + w*extra(19/20). The blend beats hard routing on
+// both the standard and Paskogammon backgame benchmarks because the two nets'
+// errors are only ~0.4-correlated (opposite-signed on ~36% of positions), so
+// the committee cancels error neither net can remove alone. select_nn_idx
+// reports blended positions via the sentinel indices 21/22 (>= the NN count).
+// With 19 NNs the blend is disabled and behaviour is identical to before.
 
 constexpr int NUM_BACKGAME_PAIR_NNS = 19;
+constexpr int NUM_BACKGAME_PAIR_NNS_HYBRID = 21;  // 19 base + 2 extra backgame NNs
+constexpr int BLENDED_PLAYER_BG_IDX = 21;    // sentinel: blended player backgame
+constexpr int BLENDED_OPPONENT_BG_IDX = 22;  // sentinel: blended opponent backgame
+constexpr float BACKGAME_BLEND_W_LO = 0.20f; // extra-NN weight at/below PIP_LO
+constexpr float BACKGAME_BLEND_W_HI = 0.85f; // extra-NN weight at/above PIP_HI
+constexpr int BACKGAME_BLEND_PIP_LO = 170;
+constexpr int BACKGAME_BLEND_PIP_HI = 230;
 
 class BackgameAwarePairStrategy : public Strategy {
 public:
-    // Construct from vectors of weight paths and hidden sizes (length 19 each).
-    // Index 0 = PureRace, indices 1-16 = contact pairs,
-    // index 17 = player backgame, index 18 = opponent backgame.
+    // Construct from vectors of weight paths and hidden sizes (length 19 or 21).
+    // Index 0 = PureRace, indices 1-16 = contact pairs, index 17 = player
+    // backgame, index 18 = opponent backgame. When length 21, indices 19/20 are
+    // the extra pip-routed player/opponent backgame NNs.
     BackgameAwarePairStrategy(const std::vector<std::string>& weight_paths,
                               const std::vector<int>& hidden_sizes);
 
@@ -472,17 +499,27 @@ public:
 
     // Public accessor for the per-board NN selection (used by the cubeful
     // evaluation engine's batched candidate kernel to group candidates by NN).
+    // May return the blend sentinels 21/22 on hybrid models.
     int nn_index_for(const Board& board) const { return select_nn_idx(board); }
 
+    // Raw-NN probs for a board given an NN index; handles the blend sentinels
+    // (21/22) by evaluating both backgame NNs and mixing by pip-ramped weight.
+    // Public so the cubeful engine's batched kernel can evaluate blended
+    // candidates (which cannot share a delta-eval base).
+    std::array<float, NN_OUTPUTS> probs_with_nn(const Board& board, int nn_idx) const;
+
 private:
-    std::array<std::shared_ptr<NeuralNetwork>, NUM_BACKGAME_PAIR_NNS> nns_;
+    std::vector<std::shared_ptr<NeuralNetwork>> nns_;  // 19 (base) or 21 (hybrid)
+    bool blended_backgame_ = false;  // true when 21 NNs are loaded
 
     // Determine which NN to use. Returns 0 for purerace, 1-16 for standard
-    // contact pairs, 17 for player backgame, 18 for opponent backgame.
+    // contact pairs, 17 for player backgame, 18 for opponent backgame; on
+    // hybrid models, the blend sentinels 21/22 for detected backgames.
     int select_nn_idx(const Board& board) const;
 
     double evaluate_with_nn(const Board& board, int nn_idx) const;
-    std::array<float, NN_OUTPUTS> probs_with_nn(const Board& board, int nn_idx) const;
+    std::array<float, NN_OUTPUTS> blended_backgame_probs(const Board& board,
+                                                         bool player_bg) const;
     bool is_purerace_nn(int nn_idx) const { return nn_idx == 0; }
 };
 
