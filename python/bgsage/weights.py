@@ -22,15 +22,17 @@ from typing import Any
 
 MODELS: dict[str, dict[str, Any]] = {
     "stage10": {
-        # Blended backgame hybrid (21 NNs): Stage 9's full 19-NN model carried
-        # UNCHANGED (indices 0-18, including sl_s9_player_bg/opponent_bg at
-        # 17/18), plus two extra Paskogammon-trained backgame NNs at 19/20. In a
-        # detected backgame the C++ evaluator runs BOTH backgame NNs and mixes
-        # their probs with a weight on the pasko NN that ramps with the backgame
-        # side's pip count (0.20 below 170 pips -> 0.85 above 230; see the
-        # BACKGAME_BLEND_* constants in neural_net.h). The committee beats both
-        # pure models on both the standard and Paskogammon backgame benchmarks.
-        # Every non-backgame position is byte-identical to Stage 9.
+        # Gated blended backgame hybrid (21 NNs): Stage 9's full 19-NN model
+        # carried UNCHANGED (indices 0-18, including sl_s9_player_bg/opponent_bg
+        # at 17/18), plus two extra Paskogammon-trained backgame NNs at 19/20.
+        # A detected backgame is checked against a precision gate (3+ anchors,
+        # or 2 anchors with >=7 back checkers and >=200 pips); OUTSIDE the gate
+        # the eval is bit-identical to Stage 9. Inside, both backgame NNs run
+        # and their probs are mixed with an anchor-zone weight (0.8/0.7/0.6)
+        # scaled by a pip ramp — see the BACKGAME_GATE_*/BACKGAME_BLEND_*
+        # constants in neural_net.h. Keeps standard play byte-equal to Stage 9
+        # outside rare deep backgames while upgrading exactly the positions the
+        # Paskogammon nets are provably better at.
         "hidden": (100,) + (400,) * 20,   # 19 base + 2 extra backgame NNs = 21
         "pattern": "sl_s9_{plan}.weights.best",   # all 19 base NNs are Stage 9's
         "plans": "backgame_pair",

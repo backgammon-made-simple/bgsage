@@ -1970,48 +1970,53 @@ noise on back game positions (measured by comparing S8 vs S9 rollouts on 10
 random positions). Once the model's back game ER drops below ~20, the training
 data noise becomes the limiting factor for further improvement.
 
-### Stage 10 (S10) — Blended Paskogammon Backgame Hybrid
+### Stage 10 (S10) — Gated Paskogammon Backgame Hybrid
 
-Stage 10 is Stage 9 with a **second pair of backgame NNs blended in by pip
-count**. It is the full Stage 9 19-NN model **carried unchanged**, plus two
-extra backgame NNs trained on Paskogammon-game backgame rollouts. It is a
-general-purpose production candidate: better than S9 on backgames in **both**
-standard and Paskogammon games, and byte-identical to S9 everywhere else.
+Stage 10 is Stage 9 plus a **precision-gated committee of a second backgame NN
+pair**. It is the full Stage 9 19-NN model **carried unchanged**, plus two extra
+backgame NNs trained on Paskogammon-game backgame rollouts, used ONLY inside a
+tight structural gate. Outside the gate — including every non-backgame position
+and all ordinary (shallow) backgames — S10 is **bit-identical to Stage 9**.
 
 **Architecture (21 NNs).** Indices 0-18 are exactly Stage 9's NNs (including
 `sl_s9_player_bg`/`sl_s9_opponent_bg` at 17/18). Indices 19/20 are the extra
 Paskogammon-trained backgame NNs (`sl_s10_player_bg`/`sl_s10_opponent_bg`, 400h).
 
-**Blended eval.** `BackgameAwarePairStrategy` accepts 19 **or** 21 NNs. With 21,
-inside a *detected* backgame (same detection as S9 — game-plan pair + behind in
-the race + ≥2 anchors) it evaluates **both** backgame NNs on the same inputs and
-mixes the output probs: `probs = (1-w)·base + w·pasko`, where `w` ramps linearly
-with the backgame side's pip count from **0.20 (≤170 pips) to 0.85 (≥230 pips)**
-(`BACKGAME_BLEND_*` constants in `neural_net.h`). `select_nn_idx` reports these
-positions via sentinel indices 21 (player BG) / 22 (opponent BG); the batch
-delta-eval kernels fall back to plain per-candidate evaluation for them (blended
-positions can't share a delta base). With 19 NNs the blend is off (pure S9).
+**Gate + blended eval.** `BackgameAwarePairStrategy` accepts 19 **or** 21 NNs.
+With 21, a *detected* backgame (same detection as S9) is routed to the committee
+only when the backgame side has
 
-**Why a blend (not hard routing).** Two findings drove this design. (1) The
-pasko nets are stronger on *early, heavy* backgames — the S10-vs-S9 error gap is
-cleanly monotone in the backgame side's pip count — but hard-routing by pips
-could not protect the standard-game benchmark (no board feature separates
-standard-game from pasko-game backgames; the frontier never reached "no regular
-regression + full pasko gain"). (2) The two nets' errors are only ~0.4-correlated
-and oppositely signed on ~36% of positions, so a weighted **committee cancels
-error neither net can remove alone** — even a 20% pasko voice *improves* the
-standard benchmark. **Verified 1-ply ER: standard backgame benchmark (20,837
-posns) S9 23.10 → blend 22.91 (z≈+2 better); Paskogammon backgame benchmark
-(39,863 posns) S9 43.24, pasko-nets-everywhere 32.37, blend 30.43 (z≈+16 vs the
-better pure model).** The blend also cuts the p95 error tail (79 vs S9's 108).
-Cost: backgame-classified positions take two NN forwards instead of one
-delta-eval; all other positions are unaffected.
+```
+anchors >= 3   OR   (anchors == 2  AND  back checkers >= 7  AND  pips >= 200)
+```
 
-**Where it lives.** `select_nn_idx` + `blended_backgame_probs` + the
-`BACKGAME_BLEND_*` constants in `cpp/src/neural_net.cpp` / `neural_net.h`
-(sentinel handling in the batch methods and in `cube_eval.cpp`'s
-`eval_groups_pair`); the `stage10` registry entry (`extra_backgame` list) and
-21-length `plan_names` in `python/bgsage/weights.py`. Weight files:
+Inside the gate both backgame NNs evaluate the same inputs and the probs are
+mixed, `probs = (1-w)·base + w·pasko`, with an anchor-zone weight (**0.80** for
+4+ anchors, **0.70** for 3, **0.60** for the massive-2-anchor arm) scaled by a
+pip ramp (×0.5 at ≤170 pips → ×1.0 at ≥230). Constants: `BACKGAME_GATE_*` /
+`BACKGAME_BLEND_*` in `neural_net.h`. `select_nn_idx` reports gated positions
+via sentinels 21/22; the batch delta-eval kernels evaluate those per-candidate
+(no shared delta base). Non-gated backgames return 17/18 and keep the fast
+paths. With 19 NNs everything is off (pure S9).
+
+**Why a gate.** The pasko nets are decisively better on *deep/massive*
+backgames but indistinguishable-to-worse on ordinary ones, and no board feature
+separates standard-game from pasko-game shallow backgames — an ungated blend
+improved the neutral backgame benchmarks but leaked small divergences from S9
+into full-game rollout-PR scores everywhere. The gate confines the pasko nets
+to the region where they provably win (verified on 60.7k rolled-out backgame
+positions): **1-ply ER, Paskogammon backgame benchmark: S9 43.24 → S10 35.5**
+(gated slices: 3-anchor 46.98→30.65, 4+-anchor 92.38→48.71, massive-2-anchor
+50.58→31.62); **standard backgame benchmark: S9 23.10 → S10 23.05** (the gated
+regular slices improve slightly too; both even/odd halves ≤ 23.06). Gate
+footprint: ~43% of pasko-game backgame evals, ~9% of standard-game ones — so
+standard-game play is byte-equal to S9 outside rare deep backgames.
+
+**Where it lives.** `backgame_gate` + `backgame_blend_weight` +
+`blended_backgame_probs` + `select_nn_idx` in `cpp/src/neural_net.cpp` (sentinel
+handling in the batch methods and in `cube_eval.cpp`'s `eval_groups_pair`);
+constants in `neural_net.h`; the `stage10` registry entry (`extra_backgame`
+list) and 21-length `plan_names` in `python/bgsage/weights.py`. Weight files:
 `sl_s10_player_bg.weights.best`, `sl_s10_opponent_bg.weights.best`.
 
 ## Glossary

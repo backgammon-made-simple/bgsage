@@ -2350,6 +2350,35 @@ int GamePlanPairStrategy::batch_evaluate_candidates_best_prob(
 // BackgameAwarePairStrategy implementation
 // ===========================================================================
 
+namespace {
+// Precision gate for the extra Paskogammon backgame NNs: deep (3+ anchor)
+// backgames, or massive 2-anchor ones (big back mass, high pips). Everything
+// outside the gate evaluates bit-identically to the 19-NN model.
+inline bool backgame_gate(int anchors, int back_checkers, int bg_pips) {
+    return anchors >= BACKGAME_GATE_MIN_ANCHORS ||
+           (anchors == 2 && back_checkers >= BACKGAME_GATE_ARM2_BC &&
+            bg_pips >= BACKGAME_GATE_ARM2_PIPS);
+}
+
+// Extra-NN weight inside the gate: zone base by anchor depth, scaled by a pip
+// ramp (half weight at/below PIP_LO, full at/above PIP_HI).
+inline float backgame_blend_weight(int anchors, int bg_pips) {
+    const float base = (anchors >= 4)   ? BACKGAME_BLEND_W_A4
+                       : (anchors == 3) ? BACKGAME_BLEND_W_A3
+                                        : BACKGAME_BLEND_W_ARM2;
+    float ramp;
+    if (bg_pips <= BACKGAME_BLEND_PIP_LO) {
+        ramp = 0.0f;
+    } else if (bg_pips >= BACKGAME_BLEND_PIP_HI) {
+        ramp = 1.0f;
+    } else {
+        ramp = static_cast<float>(bg_pips - BACKGAME_BLEND_PIP_LO) /
+               static_cast<float>(BACKGAME_BLEND_PIP_HI - BACKGAME_BLEND_PIP_LO);
+    }
+    return base * (0.5f + 0.5f * ramp);
+}
+}  // namespace
+
 BackgameAwarePairStrategy::BackgameAwarePairStrategy(
     const std::vector<std::string>& weight_paths,
     const std::vector<int>& hidden_sizes)
@@ -2390,12 +2419,17 @@ int BackgameAwarePairStrategy::select_nn_idx(const Board& board) const {
     if (player_gp == GamePlan::ANCHORING && opponent_gp == GamePlan::RACING) {
         auto [player_pips, opp_pips] = pip_counts(board);
         if (player_pips > opp_pips) {
-            int anchors = 0;
+            int anchors = 0, back = board[25];
             for (int pt = 19; pt <= 24; ++pt) {
                 if (board[pt] >= 2) ++anchors;
+                if (board[pt] > 0) back += board[pt];
             }
-            if (anchors >= 2)
-                return blended_backgame_ ? BLENDED_PLAYER_BG_IDX : 17;
+            if (anchors >= 2) {
+                if (blended_backgame_ &&
+                    backgame_gate(anchors, back, player_pips))
+                    return BLENDED_PLAYER_BG_IDX;
+                return 17;
+            }
         }
     }
 
@@ -2403,30 +2437,22 @@ int BackgameAwarePairStrategy::select_nn_idx(const Board& board) const {
     if (player_gp == GamePlan::RACING && opponent_gp == GamePlan::ANCHORING) {
         auto [player_pips, opp_pips] = pip_counts(board);
         if (opp_pips > player_pips) {
-            int opp_anchors = 0;
+            int opp_anchors = 0, opp_back = board[0];
             for (int pt = 1; pt <= 6; ++pt) {
                 if (board[pt] <= -2) ++opp_anchors;
+                if (board[pt] < 0) opp_back -= board[pt];
             }
-            if (opp_anchors >= 2)
-                return blended_backgame_ ? BLENDED_OPPONENT_BG_IDX : 18;
+            if (opp_anchors >= 2) {
+                if (blended_backgame_ &&
+                    backgame_gate(opp_anchors, opp_back, opp_pips))
+                    return BLENDED_OPPONENT_BG_IDX;
+                return 18;
+            }
         }
     }
 
     return 1 + game_plan_pair_index(player_gp, opponent_gp);
 }
-
-namespace {
-// Extra-NN weight for the blended backgame eval: ramps linearly with the
-// backgame side's pip count between the LO and HI knots.
-inline float backgame_blend_weight(int bg_pips) {
-    if (bg_pips <= BACKGAME_BLEND_PIP_LO) return BACKGAME_BLEND_W_LO;
-    if (bg_pips >= BACKGAME_BLEND_PIP_HI) return BACKGAME_BLEND_W_HI;
-    return BACKGAME_BLEND_W_LO +
-           (BACKGAME_BLEND_W_HI - BACKGAME_BLEND_W_LO) *
-               static_cast<float>(bg_pips - BACKGAME_BLEND_PIP_LO) /
-               static_cast<float>(BACKGAME_BLEND_PIP_HI - BACKGAME_BLEND_PIP_LO);
-}
-}  // namespace
 
 std::array<float, NN_OUTPUTS> BackgameAwarePairStrategy::blended_backgame_probs(
     const Board& board, bool player_bg) const
@@ -2435,7 +2461,16 @@ std::array<float, NN_OUTPUTS> BackgameAwarePairStrategy::blended_backgame_probs(
     auto base = nns_[player_bg ? 17 : 18]->forward(inputs.data());
     auto extra = nns_[player_bg ? 19 : 20]->forward(inputs.data());
     auto [player_pips, opp_pips] = pip_counts(board);
-    const float w = backgame_blend_weight(player_bg ? player_pips : opp_pips);
+    int anchors = 0;
+    if (player_bg) {
+        for (int pt = 19; pt <= 24; ++pt)
+            if (board[pt] >= 2) ++anchors;
+    } else {
+        for (int pt = 1; pt <= 6; ++pt)
+            if (board[pt] <= -2) ++anchors;
+    }
+    const float w = backgame_blend_weight(anchors,
+                                          player_bg ? player_pips : opp_pips);
     std::array<float, NN_OUTPUTS> out;
     for (int i = 0; i < NN_OUTPUTS; ++i)
         out[i] = (1.0f - w) * base[i] + w * extra[i];

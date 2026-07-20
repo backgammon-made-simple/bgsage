@@ -428,27 +428,34 @@ private:
 // - Opponent BG: pair is (racing, anchoring), opponent pips > player pips,
 //   opponent has >= 2 anchors in player's home board (points 1-6)
 //
-// Optional blended hybrid (21 NNs, e.g. Stage 10): two extra backgame NNs at
-// indices 19 (player) and 20 (opponent), trained on Paskogammon backgame
-// rollouts. When 21 NNs are loaded, a detected backgame is evaluated by BOTH
-// backgame NNs and their output probs are mixed with a weight that ramps with
-// the backgame side's pip count:
-//   w = W_LO                          for pips <= PIP_LO
-//   w = W_HI                          for pips >= PIP_HI
-//   linear in between,
-// probs = (1-w)*base(17/18) + w*extra(19/20). The blend beats hard routing on
-// both the standard and Paskogammon backgame benchmarks because the two nets'
-// errors are only ~0.4-correlated (opposite-signed on ~36% of positions), so
-// the committee cancels error neither net can remove alone. select_nn_idx
-// reports blended positions via the sentinel indices 21/22 (>= the NN count).
-// With 19 NNs the blend is disabled and behaviour is identical to before.
+// Optional gated blended hybrid (21 NNs, e.g. Stage 10): two extra backgame
+// NNs at indices 19 (player) and 20 (opponent), trained on Paskogammon
+// backgame rollouts. When 21 NNs are loaded, a detected backgame is checked
+// against a precision GATE that isolates the deep/massive backgames where the
+// Paskogammon nets are demonstrably stronger:
+//   gate = anchors >= 3
+//          OR (anchors == 2 AND back checkers >= ARM2_BC AND pips >= ARM2_PIPS)
+// (anchors/back checkers/pips are the backgame side's). OUTSIDE the gate the
+// eval is bit-identical to Stage 9 (base 17/18 NN, delta-eval fast paths
+// intact). INSIDE the gate both backgame NNs run and their probs are mixed,
+//   probs = (1-w)*base(17/18) + w*extra(19/20),
+// with a zone weight by anchor depth (W_A4 / W_A3 / W_ARM2) scaled by a pip
+// ramp: w = base_w * (0.5 + 0.5*clip((pips-PIP_LO)/(PIP_HI-PIP_LO), 0, 1)).
+// The committee exploits the two nets' weakly correlated errors; the tight
+// gate keeps standard-game play byte-equal to S9 outside rare deep backgames.
+// select_nn_idx reports gated positions via sentinels 21/22 (>= the NN count).
+// With 19 NNs everything is disabled and behaviour is identical to before.
 
 constexpr int NUM_BACKGAME_PAIR_NNS = 19;
 constexpr int NUM_BACKGAME_PAIR_NNS_HYBRID = 21;  // 19 base + 2 extra backgame NNs
-constexpr int BLENDED_PLAYER_BG_IDX = 21;    // sentinel: blended player backgame
-constexpr int BLENDED_OPPONENT_BG_IDX = 22;  // sentinel: blended opponent backgame
-constexpr float BACKGAME_BLEND_W_LO = 0.20f; // extra-NN weight at/below PIP_LO
-constexpr float BACKGAME_BLEND_W_HI = 0.85f; // extra-NN weight at/above PIP_HI
+constexpr int BLENDED_PLAYER_BG_IDX = 21;    // sentinel: gated player backgame
+constexpr int BLENDED_OPPONENT_BG_IDX = 22;  // sentinel: gated opponent backgame
+constexpr int BACKGAME_GATE_MIN_ANCHORS = 3; // gate arm 1: 3+ anchors
+constexpr int BACKGAME_GATE_ARM2_BC = 7;     // gate arm 2: 2 anchors + big back mass
+constexpr int BACKGAME_GATE_ARM2_PIPS = 200;
+constexpr float BACKGAME_BLEND_W_A4 = 0.80f;   // zone weight: anchors >= 4
+constexpr float BACKGAME_BLEND_W_A3 = 0.70f;   // zone weight: anchors == 3
+constexpr float BACKGAME_BLEND_W_ARM2 = 0.60f; // zone weight: gate arm 2
 constexpr int BACKGAME_BLEND_PIP_LO = 170;
 constexpr int BACKGAME_BLEND_PIP_HI = 230;
 
